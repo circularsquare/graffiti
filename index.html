@@ -1,0 +1,132 @@
+<!DOCTYPE html>
+<html lang="en">
+<head>
+  <meta charset="UTF-8">
+  <title>Graffiti NYC</title>
+  <style>
+    * { margin: 0; padding: 0; box-sizing: border-box; }
+    body { overflow: hidden; background: #1a1a2e; }
+    canvas { display: block; }
+
+    #overlay {
+      position: fixed;
+      inset: 0;
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      justify-content: center;
+      color: white;
+      font-family: monospace;
+      font-size: 20px;
+      text-align: center;
+      gap: 12px;
+      background: rgba(0,0,0,0.4);
+      cursor: pointer;
+    }
+    #overlay small { font-size: 13px; opacity: 0.6; }
+    #overlay.hidden { display: none; }
+    #overlay.loading { cursor: default; }
+    #overlay.loading #overlay-prompt { opacity: 0.35; }
+
+    #minimap-wrap {
+      position: fixed;
+      top: 28px; right: 16px;
+      width: 180px; height: 180px;
+      overflow: hidden;
+      box-shadow: 0 0 0 2px rgba(255,255,255,0.25), 0 2px 8px rgba(0,0,0,0.6);
+      pointer-events: none;
+      z-index: 10;
+    }
+    #minimap-wrap canvas { display: block; }
+    #minimap-attr {
+      position: fixed;
+      top: 16px; right: 16px;
+      font-family: sans-serif; font-size: 9px;
+      color: rgba(255,255,255,0.5);
+      pointer-events: none; z-index: 10; text-align: right;
+    }
+
+    #crosshair {
+      position: fixed;
+      top: 50%; left: 50%;
+      transform: translate(-50%, -50%);
+      width: 6px; height: 6px;
+      background: white;
+      border-radius: 50%;
+      box-shadow: 0 0 4px rgba(0,0,0,0.8);
+      display: none;
+    }
+    #crosshair.visible { display: block; }
+
+    #hud {
+      position: fixed;
+      bottom: 16px;
+      left: 50%;
+      transform: translateX(-50%);
+      color: rgba(255,255,255,0.5);
+      font-family: monospace;
+      font-size: 12px;
+      pointer-events: none;
+    }
+
+    #status {
+      position: fixed;
+      top: 16px;
+      left: 56px;
+      color: rgba(255,255,255,0.7);
+      font-family: monospace;
+      font-size: 12px;
+      pointer-events: none;
+    }
+
+    #colorbar {
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      z-index: 10;
+      pointer-events: none;
+    }
+    #colorbar.pick-mode {
+      pointer-events: auto;
+    }
+    .color-swatch {
+      width: 28px;
+      height: 28px;
+      border: 2px solid rgba(255,255,255,0.25);
+      border-radius: 4px;
+      cursor: pointer;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-size: 15px;
+      color: #aaa;
+      flex-shrink: 0;
+    }
+    .color-swatch.active {
+      border: 2px solid #fff;
+      box-shadow: 0 0 0 1px rgba(0,0,0,0.8), 0 1px 3px rgba(0,0,0,0.6);
+    }
+  </style>
+</head>
+<body>
+  <div id="overlay" class="loading">
+    <div>Financial District, NYC</div>
+    <div id="overlay-prompt">Click to explore</div>
+    <small>WASD · mouse look · Shift to sprint · ESC to exit</small>
+    <small>Tab to cycle colors · C to pick color</small>
+  </div>
+  <div id="crosshair"></div>
+  <div id="colorbar"></div>
+  <div id="hud">Financial District, NYC</div>
+  <div id="status">Loading buildings...</div>
+  <div id="minimap-wrap">
+    <canvas id="minimap" width="180" height="180"></canvas>
+  </div>
+  <div id="minimap-attr">© OpenStreetMap contributors</div>
+  <script type="module" src="/src/main.js"></script>
+</body>
+</html>

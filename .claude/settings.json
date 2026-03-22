@@ -1,0 +1,18 @@
+{
+  "permissions": {
+    "allow": [
+      "Bash(npm --version)",
+      "Bash(npm install:*)",
+      "Bash(pip install:*)",
+      "Bash(python -c \":*)",
+      "Bash(python scripts/convert_citygml.py data/DA_WISE_GMLs/DA12_3D_Buildings_Merged.gml --out public/buildings_da12.json)",
+      "Bash(python scripts/convert_citygml.py data/DA_WISE_GMLs/DA19_3D_Buildings_Merged.gml --out public/buildings_da19.json)",
+      "Bash(curl -s -o /dev/null -w \"%{http_code}\" http://localhost:5173/buildings.json)",
+      "Bash(ls -la c:/Users/anita/projects/graffiti/public/tiles/*.json)",
+      "Bash(sort -k5 -n)",
+      "Read(//c/Users/anita/projects/graffiti/{printf \"\"\"\"\"\"\"\"%s %s MB/n\"\"\"\"\"\"\"\", $9, int\\($5/1024/**)",
+      "Bash(python3 -c \":*)",
+      "Bash(py -c \":*)"
+    ]
+  }
+}

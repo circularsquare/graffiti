@@ -1,0 +1,4 @@
+lxml
+pyproj
+numpy
+mapbox-earcut

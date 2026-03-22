@@ -1,0 +1,26 @@
+meoww!
+
+- undo 10% default colored tiles
+- i think exiting the window (via alt tab or something) and reentering it, the keys we held down continue being read as held down... we should check that they are actively being held
+- add random travel button? or fast travel
+- painting tile freezes too long, this should be in parallel
+
+
+loading lag:
+done:
+  - chunk buildMeshFromBuilding across frames (3 buildings/frame, requestIdleCallback yields)
+  - O(1) paint cull lookup via buildingPaintMeshByBuilding secondary map
+  - load/unload radii tuned to 200/250
+  - removed shadow map (was re-rendering 2048×2048 every frame)
+  - paint meshes now inherit srcMesh.visible on creation (no flash for far tiles)
+  - building meshes added with visible=false before updateCulling runs
+tried, didn't help / reverted:
+  - incremental scene-add per building (caused player to outrun tile load)
+  - flatShading on materials + skip computeVertexNormals (looked worse)
+  - requestIdleCallback for seeding yields (minimal visible improvement)
+still to try:
+  - GPU upload stall: all tile meshes upload to GPU on first render — merging tile geometry into fewer meshes would reduce this (big refactor)
+  - defer/skip seedTileCells for tiles outside cull radius
+  - allow 2–3 concurrent tile fetches instead of strict serial queue
+  - tick() iterates entire manifest every frame — spatial-index tile bounds
+  - _unload() splice(0,Infinity,...filter()) — replace with in-place filter loop
