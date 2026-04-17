@@ -12,7 +12,11 @@
       "Bash(sort -k5 -n)",
       "Read(//c/Users/anita/projects/graffiti/{printf \"\"\"\"\"\"\"\"%s %s MB/n\"\"\"\"\"\"\"\", $9, int\\($5/1024/**)",
       "Bash(python3 -c \":*)",
-      "Bash(py -c \":*)"
+      "Bash(py -c \":*)",
+      "Read(//c/Users/anita/.claude/**)"
+    ],
+    "additionalDirectories": [
+      "C:\\Users\\anita\\.claude"
     ]
   }
 }

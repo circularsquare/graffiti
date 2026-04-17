@@ -23,11 +23,16 @@ import sys, os, json, math, glob as _glob
 sys.path.insert(0, os.path.dirname(__file__))
 from convert_citygml import parse_buildings
 
+# Windows' default cp1252 stdout can't encode the box-drawing chars we print
+# for progress headings. Force UTF-8 so `npm run build-tiles` works there too.
+if sys.stdout.encoding and sys.stdout.encoding.lower() != 'utf-8':
+    sys.stdout.reconfigure(encoding='utf-8')
+
 DATA_DIR   = os.path.join(os.path.dirname(__file__), '..', 'data', 'DA_WISE_GMLs')
 OUTPUT_DIR = os.path.join(os.path.dirname(__file__), '..', 'public', 'tiles')
 
 DA_COUNT  = 20
-GRID_SIZE = 250  # metres per cell side
+GRID_SIZE = 125  # metres per cell side — roughly one Manhattan long-block / 1.5 short blocks
 
 
 def building_centroid_and_bounds(b):
@@ -58,13 +63,15 @@ def grid_key(cx, cz):
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
 
-    # Clean up old DA-level tiles from the previous pipeline.
+    # Clean up every tile from a previous run so stale grids (different
+    # GRID_SIZE, old da*.json format, etc.) don't linger on disk.
     removed = 0
-    for path in _glob.glob(os.path.join(OUTPUT_DIR, 'da*.json')):
-        os.remove(path)
-        removed += 1
+    for pattern in ('da*.json', 'cell_*.json'):
+        for path in _glob.glob(os.path.join(OUTPUT_DIR, pattern)):
+            os.remove(path)
+            removed += 1
     if removed:
-        print(f'Removed {removed} old da*.json tiles\n')
+        print(f'Removed {removed} old tile files\n')
 
     # cell_data accumulates buildings across all DAs before any file is written,
     # so buildings from different DAs in the same geographic cell are merged.

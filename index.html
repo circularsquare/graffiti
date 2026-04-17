@@ -45,6 +45,29 @@
       color: rgba(255,255,255,0.5);
       pointer-events: none; z-index: 10; text-align: right;
     }
+    #minimap-random {
+      position: fixed;
+      top: 214px; right: 16px;
+      width: 180px;
+      padding: 6px 8px;
+      font-family: monospace;
+      font-size: 12px;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.55);
+      border: 2px solid rgba(255,255,255,0.25);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+      cursor: pointer;
+      pointer-events: auto;
+      z-index: 10;
+    }
+    #minimap-random:hover {
+      background: rgba(0,0,0,0.8);
+      border-color: rgba(255,255,255,0.5);
+    }
+    #minimap-random:disabled {
+      opacity: 0.35;
+      cursor: default;
+    }
 
     #crosshair {
       position: fixed;
@@ -87,9 +110,6 @@
       flex-direction: column;
       gap: 3px;
       z-index: 10;
-      pointer-events: none;
-    }
-    #colorbar.pick-mode {
       pointer-events: auto;
     }
     .color-swatch {
@@ -127,6 +147,7 @@
     <canvas id="minimap" width="180" height="180"></canvas>
   </div>
   <div id="minimap-attr">© OpenStreetMap contributors</div>
+  <button id="minimap-random" disabled>Random location</button>
   <script type="module" src="/src/main.js"></script>
 </body>
 </html>

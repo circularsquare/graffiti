@@ -1,10 +1,10 @@
 meoww!
 
 - undo 10% default colored tiles
-- i think exiting the window (via alt tab or something) and reentering it, the keys we held down continue being read as held down... we should check that they are actively being held
 - add random travel button? or fast travel
-- painting tile freezes too long, this should be in parallel
-
+- walk up really shallow cliffs
+- add minimap to floor visually (and tile borders? on ctrl d)
+- gradual acceleration
 
 loading lag:
 done:

@@ -2,6 +2,7 @@ import * as THREE from 'three';
 import { PointerLockControls } from 'three/addons/controls/PointerLockControls.js';
 import { GRID_SIZE } from './loadCityGML.js';
 import { TileManager } from './TileManager.js';
+import { OsmManager } from './OsmManager.js';
 import { paintStore } from './paintStore.js';
 import { initMinimap, updateMinimap } from './minimap.js';
 
@@ -109,10 +110,37 @@ let velY = 0;
 
 const controls = new PointerLockControls(camera, renderer.domElement);
 
-const overlay   = document.getElementById('overlay');
-const crosshair = document.getElementById('crosshair');
-const hud       = document.getElementById('hud');
+const overlay     = document.getElementById('overlay');
+const crosshair   = document.getElementById('crosshair');
+const hud         = document.getElementById('hud');
+const randomBtn   = document.getElementById('minimap-random');
 initMinimap();
+
+randomBtn.addEventListener('click', () => {
+  if (!firstTileLoaded || teleporting) return;
+  const loc = tileManager.randomLocation();
+  if (!loc) return;
+  camera.position.set(loc.x, WALK_HEIGHT, loc.z);
+  velY = 0;
+  updateCulling();
+
+  // Mirror the first-page-load experience: unlock pointer, show the dimmed
+  // "loading" overlay, and wait for nearby tiles to finish loading before
+  // letting the user click in.
+  teleporting = true;
+  overlay.classList.add('loading');
+  status.textContent = 'Loading tiles…';
+  randomBtn.disabled = true;
+  colorPickMode = false;
+  if (controls.isLocked) controls.unlock();
+  else overlay.classList.remove('hidden');
+
+  // Kick the tile manager now so any fresh loads are in-flight before the
+  // next frame, and so we can detect the "nothing new to load" case (e.g.
+  // teleport landed inside an already-loaded tile) and clear immediately.
+  tileManager.tick(loc.x, loc.z);
+  if (tileManager.allNearbyTilesLoaded(loc.x, loc.z)) finishTeleportLoad();
+});
 
 renderer.domElement.addEventListener('mousedown', e => {
   if (!controls.isLocked) { if (e.button === 0 && firstTileLoaded) { colorPickMode = false; controls.lock(); } return; }
@@ -120,27 +148,28 @@ renderer.domElement.addEventListener('mousedown', e => {
   if (e.button === 2) tryErase();
 });
 renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
-overlay.addEventListener('click', () => { if (firstTileLoaded) controls.lock(); });
+overlay.addEventListener('click', () => { if (firstTileLoaded && !teleporting) controls.lock(); });
 
 controls.addEventListener('lock', () => {
   overlay.classList.add('hidden');
   crosshair.classList.add('visible');
-  colorBar.classList.remove('pick-mode');
 });
 controls.addEventListener('unlock', () => {
   crosshair.classList.remove('visible');
-  if (colorPickMode) {
-    colorBar.classList.add('pick-mode');
-  } else {
-    overlay.classList.remove('hidden');
-  }
+  // Press-C flow hides the overlay so only the colorbar is visible. ESC leaves
+  // colorPickMode false and shows the full overlay, but the colorbar + minimap
+  // button remain clickable above it either way.
+  if (!colorPickMode) overlay.classList.remove('hidden');
 });
 
 const keys = {};
 
 document.addEventListener('keydown', e => {
-  // Block browser shortcuts that would navigate away while playing.
-  if (e.ctrlKey && (e.code === 'KeyW' || e.code === 'KeyR')) e.preventDefault();
+  // Let Ctrl/Cmd combos pass through untouched — close tab, reload, copy,
+  // devtools, etc. We don't use Ctrl or Meta for any in-game action, so
+  // short-circuiting here is safe. Keyup still processes normally, otherwise
+  // a key pressed before Ctrl would get stuck when released while Ctrl holds.
+  if (e.ctrlKey || e.metaKey) return;
 
   const wasDown = keys[e.code];
   keys[e.code] = true;
@@ -225,6 +254,7 @@ const COLORS = [
   { name: 'brown',       hex: 0x885522,   css: '#885522'                  },
 ];
 const SEED_COLORS = COLORS.filter(c => !c.isErase);
+const SEED_COLOR_HEX = SEED_COLORS.map(c => c.hex); // flat hex array forwarded to the tile worker
 
 let activeColorIdx = 4; // start on red
 let colorPickMode  = false;
@@ -269,11 +299,13 @@ function schedulePaintRebuild(buildingKey) {
 }
 
 function flushPaintRebuilds() {
+  const t = performance.now();
   for (const bk of pendingRebuild) {
     const srcMesh = buildingMeshMap.get(bk);
     if (srcMesh) rebuildBuildingPaint(srcMesh);
   }
   pendingRebuild.clear();
+  performance.measure('paint:rebuild', { start: t, end: performance.now() });
 }
 
 // ── Geometry helpers (plain arrays, no THREE allocation) ──────────────────────
@@ -382,7 +414,8 @@ function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD) {
 // for user-painted cells. Rebuilds just concatenate cached arrays — no triangle
 // scan needed after initial load, so paint/erase is instant.
 
-const cellGeomCache = new Map(); // cellKey → Float32Array
+const cellGeomCache     = new Map(); // cellKey → Float32Array
+const cellGeomByBuilding = new Map(); // buildingKey → Set<cellKey> — so unloads don't scan the whole cache
 
 function rebuildBuildingPaint(srcMesh) {
   const { buildingId, meshType } = srcMesh.userData;
@@ -402,17 +435,23 @@ function rebuildBuildingPaint(srcMesh) {
   }
   buildingPaintMeshByBuilding.delete(buildingKey);
 
-  // Group cell geometry arrays by color
+  // Group cell geometry arrays by color. Iterate only this building's cells
+  // via the paintStore index — avoids a full map scan when tens of thousands
+  // of cells are seeded across other buildings.
   const byColor = new Map(); // colorHex → Float32Array[]
 
-  for (const [k, v] of paintStore.cells) {
-    if (!k.startsWith(prefix)) continue;
+  for (const k of paintStore.cellsForBuilding(buildingKey)) {
+    const v = paintStore.cells.get(k);
+    if (!v) continue;
 
     if (!cellGeomCache.has(k)) {
       const parts = k.slice(prefix.length).split(':');
       const cu = parseInt(parts[0]), cv = parseInt(parts[1]);
       const verts = buildCellGeometry(srcMesh, cu, cv, new THREE.Vector3(...v.normal), v.planeD);
       cellGeomCache.set(k, new Float32Array(verts));
+      let geomSet = cellGeomByBuilding.get(buildingKey);
+      if (!geomSet) { geomSet = new Set(); cellGeomByBuilding.set(buildingKey, geomSet); }
+      geomSet.add(k);
     }
 
     const arr = cellGeomCache.get(k);
@@ -433,8 +472,10 @@ function rebuildBuildingPaint(srcMesh) {
     geo.setAttribute('position', new THREE.Float32BufferAttribute(allVerts, 3));
     const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: colorHex, side: THREE.DoubleSide }));
     mesh.visible = srcMesh.visible;
+    const pmKey = `${buildingKey}|${colorHex}`;
+    mesh.userData.paintMeshKey = pmKey; // stashed so TileManager._unload can delete by lookup
     paintGroup.add(mesh);
-    buildingPaintMeshes.set(`${buildingKey}|${colorHex}`, mesh);
+    buildingPaintMeshes.set(pmKey, mesh);
     if (!buildingPaintMeshByBuilding.has(buildingKey)) buildingPaintMeshByBuilding.set(buildingKey, new Set());
     buildingPaintMeshByBuilding.get(buildingKey).add(mesh);
   }
@@ -447,99 +488,61 @@ paintStore.subscribe((cellKey) => {
   schedulePaintRebuild(parts.join(':'));
 });
 
-const SEED_FRACTION = 0.2; // fraction of cells to randomly seed on load
+const SEED_FRACTION = 0.2; // fraction of cells to randomly seed on load (applied in tileWorker.js)
 
-// Single-pass scan over a tile's meshes: discovers all UV cells, clips geometry
-// into cellGeomCache, then randomly seeds SEED_FRACTION of them into paintStore
-// (memory only, no localStorage). User-painted cells are never overwritten.
-// Runs asynchronously — yields to the render loop every SEED_CHUNK meshes so the
-// game stays interactive during seeding of large tiles.
+// Apply the worker's pre-computed cell data to paint caches. The triangle scan
+// + clipping + seed dice roll all happened off-thread; this pass just copies
+// Float32Arrays into cellGeomCache and calls paintStore.seed for cells that
+// aren't already user-painted. Still chunked so a giant tile doesn't push
+// rebuildBuildingPaint calls into one frame.
 async function seedTileCells(meshes) {
-  const SEED_CHUNK   = 20; // meshes processed per animation frame
-  const now          = Date.now();
-  const OFFSET       = 0.025;
-  const COPLANAR_TOL = 0.15;
+  const SEED_CHUNK = 50;
+  const now        = Date.now();
+  const tSeed      = performance.now();
 
   for (let start = 0; start < meshes.length; start += SEED_CHUNK) {
     const end = Math.min(start + SEED_CHUNK, meshes.length);
 
     for (let mi = start; mi < end; mi++) {
       const srcMesh = meshes[mi];
-      if (!srcMesh.parent) continue; // tile was unloaded while seeding
+      if (!srcMesh.parent) continue; // tile was unloaded before we got here
+
+      const cellData = srcMesh.userData.cellData;
+      if (!cellData) continue; // already applied, or wrapped without worker data
 
       const { buildingId, meshType } = srcMesh.userData;
-      const pos = srcMesh.geometry.attributes.position.array;
-      const uv  = srcMesh.geometry.attributes.uv.array;
+      const bk = `${buildingId}:${meshType}`;
 
-      // cellKey → { normal, planeD, verts[] }
-      const discovered = new Map();
+      let geomSet = cellGeomByBuilding.get(bk);
+      if (!geomSet) { geomSet = new Set(); cellGeomByBuilding.set(bk, geomSet); }
 
-      for (let ti = 0; ti < pos.length / 9; ti++) {
-        const pi = ti * 9, ui = ti * 6;
-        const tri = [
-          { pos: [pos[pi],   pos[pi+1], pos[pi+2]], uv: [uv[ui],   uv[ui+1]] },
-          { pos: [pos[pi+3], pos[pi+4], pos[pi+5]], uv: [uv[ui+2], uv[ui+3]] },
-          { pos: [pos[pi+6], pos[pi+7], pos[pi+8]], uv: [uv[ui+4], uv[ui+5]] },
-        ];
-        const triNorm  = norm3(cross3(sub3(tri[1].pos, tri[0].pos), sub3(tri[2].pos, tri[0].pos)));
-        const cx = (tri[0].pos[0]+tri[1].pos[0]+tri[2].pos[0])/3;
-        const cy = (tri[0].pos[1]+tri[1].pos[1]+tri[2].pos[1])/3;
-        const cz = (tri[0].pos[2]+tri[1].pos[2]+tri[2].pos[2])/3;
-        const triPlaneD = cx*triNorm[0] + cy*triNorm[1] + cz*triNorm[2];
-        const triPdKey  = Math.round(triPlaneD * 2);
-
-        const us   = [tri[0].uv[0], tri[1].uv[0], tri[2].uv[0]];
-        const vs   = [tri[0].uv[1], tri[1].uv[1], tri[2].uv[1]];
-        const uMin = Math.floor(Math.min(...us)), uMax = Math.floor(Math.max(...us));
-        const vMin = Math.floor(Math.min(...vs)), vMax = Math.floor(Math.max(...vs));
-
-        for (let cu = uMin; cu <= uMax; cu++) {
-          for (let cv = vMin; cv <= vMax; cv++) {
-            const cellKey = `${buildingId}:${meshType}:${cu}:${cv}:${triPdKey}`;
-
-            if (!discovered.has(cellKey)) {
-              discovered.set(cellKey, { normal: triNorm, planeD: triPlaneD, verts: [] });
-            }
-            const entry = discovered.get(cellKey);
-
-            // Reject triangles inconsistent with this cell's stored face
-            if (dot3(triNorm, entry.normal) < 0.7) continue;
-            if (Math.abs(triPlaneD - entry.planeD) > COPLANAR_TOL) continue;
-
-            let poly = tri;
-            poly = clipHalfPlane(poly, 0, cu,     +1);
-            poly = clipHalfPlane(poly, 0, cu + 1, -1);
-            poly = clipHalfPlane(poly, 1, cv,     +1);
-            poly = clipHalfPlane(poly, 1, cv + 1, -1);
-            if (poly.length < 3) continue;
-
-            const cn = triNorm;
-            for (let k = 1; k < poly.length - 1; k++) {
-              for (const v of [poly[0], poly[k], poly[k+1]]) {
-                entry.verts.push(v.pos[0]+cn[0]*OFFSET, v.pos[1]+cn[1]*OFFSET, v.pos[2]+cn[2]*OFFSET);
-              }
-            }
-          }
-        }
+      const { cellKeys, cellGeoms, seeds } = cellData;
+      for (let i = 0; i < cellKeys.length; i++) {
+        cellGeomCache.set(cellKeys[i], cellGeoms[i]);
+        geomSet.add(cellKeys[i]);
       }
 
-      // Randomly seed SEED_FRACTION of discovered cells; cache geometry for all.
-      for (const [cellKey, entry] of discovered) {
-        const arr = new Float32Array(entry.verts);
-        cellGeomCache.set(cellKey, arr);
-        if (paintStore.cells.has(cellKey)) continue; // preserve user-painted state
-        if (Math.random() < SEED_FRACTION) {
-          const color = SEED_COLORS[Math.floor(Math.random() * SEED_COLORS.length)].hex;
-          paintStore.cells.set(cellKey, { color, normal: entry.normal, planeD: entry.planeD, paintedAt: now });
-        }
+      for (const s of seeds) {
+        const cellKey = cellKeys[s.idx];
+        if (paintStore.cells.has(cellKey)) continue; // preserve existing (user or prior-session seed)
+        paintStore.seed(cellKey, {
+          color:     s.color,
+          normal:    s.normal,
+          planeD:    s.planeD,
+          paintedAt: now,
+        });
       }
+
+      // Free the bundle — its Float32Arrays now live in cellGeomCache.
+      srcMesh.userData.cellData = null;
 
       rebuildBuildingPaint(srcMesh);
     }
 
-    // Yield during idle time — seeding is low priority and shouldn't compete with rendering.
-    await new Promise(r => requestIdleCallback(r, { timeout: 2000 }));
+    if (end < meshes.length) await new Promise(r => requestIdleCallback(r, { timeout: 2000 }));
   }
+
+  performance.measure('tile:seed', { start: tSeed, end: performance.now() });
 }
 
 // ── Paint / erase actions ─────────────────────────────────────────────────────
@@ -846,25 +849,51 @@ let firstTileLoaded = false;
 let tilesLoadedCount = 0;
 const TILES_NEEDED = 4;
 
+// Teleport loading state — the random-location button re-enters the same
+// "Loading tiles…" overlay as the initial page load, cleared when every
+// tile in load range of the new position has finished loading.
+let teleporting = false;
+
+function finishTeleportLoad() {
+  if (!teleporting) return;
+  teleporting = false;
+  overlay.classList.remove('loading');
+  randomBtn.disabled = false;
+  snapToSafeStart();
+  setTimeout(() => { status.textContent = ''; }, 3000);
+}
+
 const tileManager = new TileManager({
   scene,
   buildingMeshes,
   collidables,
   buildingMeshMap,
   cellGeomCache,
+  cellGeomByBuilding,
   buildingPaintMeshes,
   buildingPaintMeshByBuilding,
   paintGroup,
+  seedConfig: { fraction: SEED_FRACTION, colors: SEED_COLOR_HEX },
   onTileLoaded(meshes) {
+    // Phase 1 — buildings are visible now. The spawn gate opens here so the
+    // player can start interacting before the seed scan (phase 2) finishes.
     updateCulling();
-    seedTileCells(meshes);
     tilesLoadedCount++;
     if (!firstTileLoaded && tilesLoadedCount >= TILES_NEEDED) {
       firstTileLoaded = true;
       overlay.classList.remove('loading');
+      randomBtn.disabled = false;
       snapToSafeStart();
       setTimeout(() => { status.textContent = ''; }, 3000);
     }
+    if (teleporting && tileManager.allNearbyTilesLoaded(camera.position.x, camera.position.z)) {
+      finishTeleportLoad();
+    }
+  },
+  onTileCellData(meshes) {
+    // Phase 2 — worker's seed scan result is now on mesh.userData.cellData.
+    // Populate cellGeomCache and apply seeded paint.
+    seedTileCells(meshes);
   },
   onTileUnloaded() {
     updateCulling();
@@ -874,6 +903,11 @@ const tileManager = new TileManager({
 status.textContent = 'Loading buildings…';
 tileManager.init('/tiles/manifest.json');
 
+// OSM overlay — streets, water, and green spaces rendered as flat meshes on
+// the ground. Loads its own tiles on the same 250 m grid as building tiles.
+const osmManager = new OsmManager({ scene });
+osmManager.init('/osm/manifest.json');
+
 // ─── Render loop ──────────────────────────────────────────────────────────────
 
 const _minimapDir = new THREE.Vector3();
@@ -881,6 +915,7 @@ const _minimapDir = new THREE.Vector3();
 function animate() {
   requestAnimationFrame(animate);
   tileManager.tick(camera.position.x, camera.position.z);
+  osmManager.tick(camera.position.x, camera.position.z);
   maybeCull();
   updateMovement();
   camera.getWorldDirection(_minimapDir);

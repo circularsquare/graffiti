@@ -7,3 +7,4 @@ __pycache__/
 data/
 public/buildings.json
 public/tiles/
+public/osm/
