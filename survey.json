@@ -1,0 +1,279 @@
+{
+  "total_buildings": 1083436,
+  "total_cells_est": 176803237.89220303,
+  "elapsed_seconds": 156.50025272369385,
+  "histogram": [
+    {
+      "lo": 0,
+      "hi": 10,
+      "count": 75
+    },
+    {
+      "lo": 10,
+      "hi": 25,
+      "count": 94764
+    },
+    {
+      "lo": 25,
+      "hi": 50,
+      "count": 118821
+    },
+    {
+      "lo": 50,
+      "hi": 100,
+      "count": 246668
+    },
+    {
+      "lo": 100,
+      "hi": 250,
+      "count": 531758
+    },
+    {
+      "lo": 250,
+      "hi": 500,
+      "count": 49838
+    },
+    {
+      "lo": 500,
+      "hi": 1000,
+      "count": 21014
+    },
+    {
+      "lo": 1000,
+      "hi": 2500,
+      "count": 16071
+    },
+    {
+      "lo": 2500,
+      "hi": 5000,
+      "count": 3217
+    },
+    {
+      "lo": 5000,
+      "hi": 10000,
+      "count": 988
+    },
+    {
+      "lo": 10000,
+      "hi": 25000,
+      "count": 213
+    },
+    {
+      "lo": 25000,
+      "hi": null,
+      "count": 9
+    }
+  ],
+  "top": [
+    {
+      "cells": 45318.97225183644,
+      "id": "gml_L6VRKBP7ZFMXPEOEXNZDWGGVGKX0DXBZP0K2",
+      "tile": "cell_37_-108",
+      "roof_cells": 33710.109820508864,
+      "wall_cells": 11608.86243132758
+    },
+    {
+      "cells": 36627.162405184616,
+      "id": "gml_GN8NMRP1EO7N7IUN84E2PKUDRNZNNH8K3W36",
+      "tile": "cell_155_57",
+      "roof_cells": 16891.626058968235,
+      "wall_cells": 19735.53634621638
+    },
+    {
+      "cells": 27969.09343106376,
+      "id": "gml_YWCZOSSCJEZTP9O5D03WA620TE5X27BULA37",
+      "tile": "cell_57_-112",
+      "roof_cells": 13757.036936726015,
+      "wall_cells": 14212.056494337745
+    },
+    {
+      "cells": 27574.775303586037,
+      "id": "gml_JYH0SMXYHPV4HEBUVLYC9X1030L37X47FB0O",
+      "tile": "cell_-1_-8",
+      "roof_cells": 9367.479610827946,
+      "wall_cells": 18207.295692758093
+    },
+    {
+      "cells": 27190.846169202843,
+      "id": "gml_GUF715BE9IUGYG5378045522GVRDWCSGO74U",
+      "tile": "cell_32_-67",
+      "roof_cells": 13215.46419155604,
+      "wall_cells": 13975.3819776468
+    },
+    {
+      "cells": 26369.705637368712,
+      "id": "gml_OIXXYQIVUCB560HUSB0GVIDZC9J6ORITTMFB",
+      "tile": "cell_6_-48",
+      "roof_cells": 16579.83058388028,
+      "wall_cells": 9789.875053488431
+    },
+    {
+      "cells": 26097.702825261913,
+      "id": "gml_XDJV1FEVFKMTXUYBOY4XV0M6L963YZZHDWWD",
+      "tile": "cell_61_84",
+      "roof_cells": 18661.992625764142,
+      "wall_cells": 7435.710199497769
+    },
+    {
+      "cells": 26065.52954376014,
+      "id": "gml_5NZ48D9E1OZ7FMCXKKL7K1BB5CQTKW7G6HVP",
+      "tile": "cell_19_-57",
+      "roof_cells": 3482.1253248790595,
+      "wall_cells": 22583.40421888108
+    },
+    {
+      "cells": 25300.358783304822,
+      "id": "gml_BF3I33RTK3KKPUJPXSN0V462G0GBFM1O85EQ",
+      "tile": "cell_88_-79",
+      "roof_cells": 9189.03220338784,
+      "wall_cells": 16111.326579916982
+    },
+    {
+      "cells": 24862.789249918096,
+      "id": "gml_U1ZER9NPJ4AL6VY0IX1XW8XXF7V6ZMPQPKEW",
+      "tile": "cell_83_-78",
+      "roof_cells": 10114.266138206503,
+      "wall_cells": 14748.523111711593
+    },
+    {
+      "cells": 24124.881755291295,
+      "id": "gml_3KRIUGY6STPLF365ORLR3PIJGYUD5FM57NAB",
+      "tile": "cell_17_-39",
+      "roof_cells": 3115.5447172998897,
+      "wall_cells": 21009.337037991405
+    },
+    {
+      "cells": 23711.625658992354,
+      "id": "gml_7TUM3R9TJ1GUT4S63310RTDTVLT3U4YHOH9Q",
+      "tile": "cell_-9_54",
+      "roof_cells": 11410.718375582741,
+      "wall_cells": 12300.907283409613
+    },
+    {
+      "cells": 22996.74708066006,
+      "id": "gml_1VXF6J4M2PYV6KVRKBWJYU7Q6JVR12PQ18QZ",
+      "tile": "cell_24_-31",
+      "roof_cells": 4954.670113020203,
+      "wall_cells": 18042.07696763986
+    },
+    {
+      "cells": 22810.313105672263,
+      "id": "gml_CVT5FKYWR5958DJ095T1PMLUMMYMRWF4HB21",
+      "tile": "cell_121_28",
+      "roof_cells": 11854.386758183733,
+      "wall_cells": 10955.92634748853
+    },
+    {
+      "cells": 22658.155731508537,
+      "id": "gml_KHDVNSECCLANAL7S1GUK776AH0UF7OL0RQIO",
+      "tile": "cell_112_-47",
+      "roof_cells": 9621.186532508802,
+      "wall_cells": 13036.969198999737
+    },
+    {
+      "cells": 22363.587480928196,
+      "id": "gml_BNZR5CYVAL52GJQ6S7IGNSLE3Z9MN1FBWRUT",
+      "tile": "cell_1_1",
+      "roof_cells": 3404.37870348491,
+      "wall_cells": 18959.208777443288
+    },
+    {
+      "cells": 21971.26439743949,
+      "id": "gml_D8CMRPOVLNUD5I68M3JUQ2RJ8ZF7MSMPPCFZ",
+      "tile": "cell_21_-49",
+      "roof_cells": 2578.167203322347,
+      "wall_cells": 19393.09719411714
+    },
+    {
+      "cells": 21734.492330969682,
+      "id": "gml_VVJNPWKAA4JHS3JIWB83UAZNC90DMS82JI2S",
+      "tile": "cell_159_52",
+      "roof_cells": 12321.595789285026,
+      "wall_cells": 9412.896541684657
+    },
+    {
+      "cells": 21598.304164373432,
+      "id": "gml_C965XRU72KE1OFY60VTG6X5DGL1D8TOW3UG3",
+      "tile": "cell_87_-76",
+      "roof_cells": 7986.768968543776,
+      "wall_cells": 13611.535195829654
+    },
+    {
+      "cells": 21109.00487704071,
+      "id": "gml_T9ELO1V87ZJC8ARVAJ9RSPUZJJL8FRRDSH4M",
+      "tile": "cell_-3_-7",
+      "roof_cells": 5918.789159208207,
+      "wall_cells": 15190.215717832503
+    },
+    {
+      "cells": 20757.168979049755,
+      "id": "gml_CWC2GGWQ4OOFU8XOF27B5SDBCOAQ0MFL2DZM",
+      "tile": "cell_94_-63",
+      "roof_cells": 9795.674543714873,
+      "wall_cells": 10961.494435334882
+    },
+    {
+      "cells": 20307.187690774925,
+      "id": "gml_M072A584N81GAKWF0U4LGQ68AQN8PWAAMJMF",
+      "tile": "cell_124_-143",
+      "roof_cells": 12323.121117564591,
+      "wall_cells": 7984.066573210332
+    },
+    {
+      "cells": 19914.83524589935,
+      "id": "gml_24VIINACHNTXSSKRMI8T5VAVBF8HZGVT9R3F",
+      "tile": "cell_84_-80",
+      "roof_cells": 9097.005101156565,
+      "wall_cells": 10817.830144742786
+    },
+    {
+      "cells": 19895.550260256103,
+      "id": "gml_KZK3M12R989OVFP9KOC3FZRPBAYN45JXT5MW",
+      "tile": "cell_46_4",
+      "roof_cells": 4682.155818994697,
+      "wall_cells": 15213.394441261407
+    },
+    {
+      "cells": 19852.099061695288,
+      "id": "gml_8SQ55YW6OME4HDDFVPB4IM6QDUQN0NHGH1OD",
+      "tile": "cell_23_-44",
+      "roof_cells": 3008.79055867899,
+      "wall_cells": 16843.3085030163
+    },
+    {
+      "cells": 19479.80913269024,
+      "id": "gml_JZ6DAQSJSYM1DLHJ93ZB7JUYF42Y7QR80GV1",
+      "tile": "cell_18_-46",
+      "roof_cells": 6107.741645769816,
+      "wall_cells": 13372.067486920423
+    },
+    {
+      "cells": 19342.93766851427,
+      "id": "gml_SFB9RAWHEM43LOKFNY1FN299K8QAVRJ0ZKAL",
+      "tile": "cell_136_47",
+      "roof_cells": 12910.319145908026,
+      "wall_cells": 6432.618522606245
+    },
+    {
+      "cells": 19335.879076115347,
+      "id": "gml_SKP1ZS05WGY7RE8WXBJL5E93I7IC2P9396PU",
+      "tile": "cell_64_-145",
+      "roof_cells": 10420.48069889729,
+      "wall_cells": 8915.398377218056
+    },
+    {
+      "cells": 19097.748673070266,
+      "id": "gml_S02AE7DJGPLLCM0FFY854PBN82BU4QU6ZTN3",
+      "tile": "cell_93_-76",
+      "roof_cells": 6447.937408544568,
+      "wall_cells": 12649.811264525699
+    },
+    {
+      "cells": 19009.011830647796,
+      "id": "gml_R0QMAP9D6G2QKHZVW3U97ZV2E0LG7PH5T1QI",
+      "tile": "cell_-1_-22",
+      "roof_cells": 14426.43608972972,
+      "wall_cells": 4582.575740918078
+    }
+  ]
+}

@@ -1,26 +1,49 @@
 meoww!
 
-- undo 10% default colored tiles
 - add random travel button? or fast travel
 - walk up really shallow cliffs
 - add minimap to floor visually (and tile borders? on ctrl d)
 - gradual acceleration
+- glitching between narrow gap
+- draw on floor 
+- cylinder / thin ffaces?
+- map mode
+- mouse keeps snapping in random direction
+have random location put u in a loading screen, also spawn u facing horizontally
+- increase load dist if theres like no buildings nearby
+- add bridges...
+  - statue of liberty
+  - see if there are any  huge buildings in the data? break them up? merge small ones?
+- fps display 
+
+
+file size
+bldng tile 0.2mb - 10mb, osm 0.03mb - 8mb (??)
+
+
 
 loading lag:
 done:
-  - chunk buildMeshFromBuilding across frames (3 buildings/frame, requestIdleCallback yields)
   - O(1) paint cull lookup via buildingPaintMeshByBuilding secondary map
-  - load/unload radii tuned to 200/250
+  - load/unload radii 200/250; tile grid shrunk 250m → 125m
   - removed shadow map (was re-rendering 2048×2048 every frame)
-  - paint meshes now inherit srcMesh.visible on creation (no flash for far tiles)
+  - paint meshes inherit srcMesh.visible on creation (no flash for far tiles)
   - building meshes added with visible=false before updateCulling runs
+  - TileManager spatial index (500m coarse grid, 5×5 neighbourhood in tick()); no more full-manifest scan per frame
+  - 3 concurrent tile fetches (MAX_CONCURRENT_LOADS=3)
+  - load queue drains nearest-to-player first; stale entries pruned on tick
+  - fixed init() that was ticking at (0,0) while spawn is at Times Square
+  - full tile pipeline moved off-thread to tileWorker.js (fetch, JSON.parse, mesh build, face clustering, seed scan)
+  - two-phase worker response: 'loaded' opens spawn gate, 'cellData' arrives later with seed results so the gate doesn't wait on the scan
+  - paintStore._byBuilding index → rebuildBuildingPaint is O(building cells), not O(all cells)
+  - paintStore debounced save + _persistedKeys (seeds stay in-memory) → killed 200–400ms paint-action spikes
+  - cellGeomByBuilding + paintMeshKey indexes → _unload scales with this-tile's buildings only (was scanning the full cellGeomCache)
+  - perf.mark/measure at every pipeline stage (tile:fetch/parse/build/scan/wait/wrap/unload, paint:rebuild/save) — visible in DevTools Timings track
 tried, didn't help / reverted:
-  - incremental scene-add per building (caused player to outrun tile load)
-  - flatShading on materials + skip computeVertexNormals (looked worse)
-  - requestIdleCallback for seeding yields (minimal visible improvement)
+  - incremental scene-add per building (player outran tile load)
+  - flatShading material property + skip computeVertexNormals (looked worse)
 still to try:
-  - GPU upload stall: all tile meshes upload to GPU on first render — merging tile geometry into fewer meshes would reduce this (big refactor)
-  - defer/skip seedTileCells for tiles outside cull radius
-  - allow 2–3 concurrent tile fetches instead of strict serial queue
-  - tick() iterates entire manifest every frame — spatial-index tile bounds
-  - _unload() splice(0,Infinity,...filter()) — replace with in-place filter loop
+  - worker pool (N workers for true CPU parallelism) — biggest remaining win on slower machines; single worker is still CPU-bound for per-tile seed scan
+  - Three.js Group per tile so `group.visible=false` short-circuits scene traversal for off-range tiles (prior trace showed WebGLRenderer.render ~40% self time — likely from walking thousands of invisible meshes every frame)
+  - GPU upload stall: first-render of each new tile's meshes still uploads on main thread — pre-warm via hidden render, or trickle across frames
+  - _unload() splice(0,Infinity,...filter()) → in-place filter loop (minor; dominant _unload cost already fixed)

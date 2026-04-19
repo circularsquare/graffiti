@@ -2,18 +2,40 @@ import { localToLngLat } from './geo.js';
 
 const ZOOM      = 16;   // OSM zoom level — ~325m visible across 180px canvas
 const TILE_SIZE = 256;  // OSM tile pixel size
-const SIZE      = 180;  // canvas size in px (must match HTML attribute)
-const INTERVAL  = 100;  // ms between redraws (~10 fps)
+// Redraw every animation frame. drawImage on cached tile textures is a few
+// GPU composites — cheap enough that 60 fps is fine even for the big map,
+// and keeps rotation visually smooth while mouse-looking.
+const INTERVAL  = 0;
 
 // Tile image cache: "z/tx/ty" → HTMLImageElement
 const _cache = new Map();
 
 let _ctx      = null;
 let _lastTime = -Infinity;
+let _size     = 180;   // current canvas side in px — mutable via setMinimapSize
 
 export function initMinimap() {
   const canvas = document.getElementById('minimap');
-  _ctx = canvas.getContext('2d');
+  _ctx  = canvas.getContext('2d');
+  _size = canvas.width;
+}
+
+/**
+ * Resize the minimap canvas in-place. Updates the wrapper div so its drop
+ * shadow/border tracks the new size, and forces a redraw on the next tick
+ * (throttled _draw would otherwise skip the immediate call after a toggle).
+ */
+export function setMinimapSize(px) {
+  _size = px;
+  const canvas = document.getElementById('minimap');
+  canvas.width  = px;
+  canvas.height = px;
+  const wrap = document.getElementById('minimap-wrap');
+  if (wrap) {
+    wrap.style.width  = px + 'px';
+    wrap.style.height = px + 'px';
+  }
+  _lastTime = -Infinity;
 }
 
 /**
@@ -54,17 +76,19 @@ function _draw(x, z, yaw) {
   const [lng, lat] = localToLngLat(x, z);
   const [ftx, fty] = latLngToTileFrac(lat, lng);
   const maxTile    = 2 ** ZOOM - 1;
-  const cx = SIZE / 2, cy = SIZE / 2;
+  const cx = _size / 2, cy = _size / 2;
 
-  _ctx.clearRect(0, 0, SIZE, SIZE);
+  _ctx.clearRect(0, 0, _size, _size);
 
-  // Rotate map so player heading = canvas up.
+  // Map is drawn north-up (unrotated). Only the player arrow below rotates.
   _ctx.save();
   _ctx.translate(cx, cy);
-  _ctx.rotate(-yaw);
 
-  for (let dy = -1; dy <= 1; dy++) {
-    for (let dx = -1; dx <= 1; dx++) {
+  // Axis-aligned map: reach = enough tiles to cover half the canvas side,
+  // plus one for fractional offsets. No √2 slack needed without rotation.
+  const reach = Math.max(1, Math.ceil(_size / (2 * TILE_SIZE)) + 1);
+  for (let dy = -reach; dy <= reach; dy++) {
+    for (let dx = -reach; dx <= reach; dx++) {
       const tx = Math.floor(ftx) + dx;
       const ty = Math.floor(fty) + dy;
       if (tx < 0 || ty < 0 || tx > maxTile || ty > maxTile) continue;
@@ -79,17 +103,20 @@ function _draw(x, z, yaw) {
 
   _ctx.restore();
 
-  // Player marker — always at canvas centre (drawn after rotation is undone).
-  // Shadow triangle for contrast against any map colour.
+  // Player marker — rotates with yaw so the arrow tip tracks the player's
+  // heading on a north-up map. Drawn at canvas centre.
   _ctx.save();
   _ctx.translate(cx, cy);
+  _ctx.rotate(yaw);
+
+  // Shadow triangle for contrast against any map colour.
   _ctx.beginPath();
   _ctx.moveTo(0, -9); _ctx.lineTo(-6, 5); _ctx.lineTo(6, 5);
   _ctx.closePath();
   _ctx.fillStyle = 'rgba(0,0,0,0.5)';
   _ctx.fill();
 
-  // Main red triangle — tip points up = player's heading.
+  // Main red triangle — tip points in the direction the player is facing.
   _ctx.beginPath();
   _ctx.moveTo(0, -8); _ctx.lineTo(-5, 4); _ctx.lineTo(5, 4);
   _ctx.closePath();

@@ -1,4 +1,6 @@
 import * as THREE from 'three';
+import { Font } from 'three/addons/loaders/FontLoader.js';
+import fontData from 'three/examples/fonts/helvetiker_bold.typeface.json';
 
 // Loaded when the player is within this distance of a tile's AABB edge.
 const LOAD_RADIUS   = 300;
@@ -31,26 +33,69 @@ const TYPE_WIDTH = {
 };
 const DEFAULT_WIDTH = 5;
 
-// Tiny Y stagger so layers don't z-fight. Ground is at y = 0.
-const Y_WATER   = 0.02;
-const Y_GREEN   = 0.03;
-const Y_STREET  = 0.05;
+// Y stagger so layers don't z-fight. Ground is at y = 0; each overlay is a
+// clear 5 cm above the previous so GPU depth precision at the horizon is
+// still enough to keep them stacked correctly.
+const Y_WATER        = 0.05;
+const Y_GREEN        = 0.10;
+const Y_STREET       = 0.15;
+const Y_STREET_LABEL = 0.20;
 
-// Shared materials — unlit so they read as "map paint" against the cel-shaded buildings.
+// Street-label tuning. Labels are built from real font glyph outlines via
+// ShapeGeometry so they stay crisp at any viewing distance — no texture,
+// no resolution ceiling.
+const LABEL_HEIGHT_M        = 2.5;
+const MIN_LABELED_STREET_M  = 40;   // don't bother labelling tiny service stubs
+const MIN_LABEL_SCALE       = 0.45; // drop labels that would shrink below this to fit
+
+const _font = new Font(fontData);
+
+// Shared material for every label — depthWrite off + polygonOffset biases
+// labels camera-ward so they reliably win over the street layer.
+const LABEL_MAT = new THREE.MeshBasicMaterial({
+  color:               0x6a6a6a,
+  side:                THREE.DoubleSide,
+  depthWrite:          false,
+  polygonOffset:       true,
+  polygonOffsetFactor: -2,
+  polygonOffsetUnits:  -8,
+});
+
+// Cached per-name label geometry, shared across all tiles. Keyed by street name
+// so two "Water Street" segments reuse one ShapeGeometry. Never disposed —
+// unique-name count is O(few hundred) in FiDi, memory is bounded.
+const _labelCache = new Map();      // name → { geometry, width, height }
+
+// Shared materials — unlit so they read as "map paint" against the cel-shaded
+// buildings. We keep depthWrite on: without it, the overlays sort
+// unpredictably against the ground/building pass and flicker on/off for a
+// frame as the player moves.
+//
+// polygonOffset biases each overlay's depth values toward the camera during
+// rasterization so they reliably win the depth test against the ground plane
+// even at far distances where perspective-depth precision collapses Y=0 and
+// Y=0.15 into the same bucket. Larger offsets for layers further up the
+// stack so water < green < streets stays consistent too.
 const WATER_MAT = new THREE.MeshBasicMaterial({
-  color:       0x7fb3d9,
-  side:        THREE.DoubleSide,
-  depthWrite:  false,
+  color:               0x7fb3d9,
+  side:                THREE.DoubleSide,
+  polygonOffset:       true,
+  polygonOffsetFactor: -1,
+  polygonOffsetUnits:  -2,
 });
 const GREEN_MAT = new THREE.MeshBasicMaterial({
-  color:       0xbcd69c,
-  side:        THREE.DoubleSide,
-  depthWrite:  false,
+  color:               0xbcd69c,
+  side:                THREE.DoubleSide,
+  polygonOffset:       true,
+  polygonOffsetFactor: -1,
+  polygonOffsetUnits:  -4,
 });
 const STREET_MAT = new THREE.MeshBasicMaterial({
-  color:       0xe8dfc2,
-  side:        THREE.DoubleSide,
-  depthWrite:  false,
+  color:               0xefe6cc,
+  side:                THREE.DoubleSide,
+  polygonOffset:       true,
+  polygonOffsetFactor: -1,
+  polygonOffsetUnits:  -6,
 });
 
 /**
@@ -78,6 +123,10 @@ export class OsmManager {
     this._activeLoads  = 0;
     this._lastPx       = 0;
     this._lastPz       = 0;
+
+    // Raw streets cache for random-spawn sampling. Stores the in-flight Promise
+    // so two concurrent callers share one fetch; resolved value replaces it.
+    this._streetsCache = new Map();           // tileId → Array<street> | Promise
   }
 
   async init(manifestUrl = '/osm/manifest.json') {
@@ -93,17 +142,52 @@ export class OsmManager {
 
     for (const entry of entries) {
       const tile = {
-        id:     entry.id,
-        file:   entry.file,
-        bounds: entry.bounds,
-        status: 'unloaded',
-        group:  null, // THREE.Group of per-type meshes, added to _group on load
+        id:          entry.id,
+        file:        entry.file,
+        bounds:      entry.bounds,
+        streetCount: entry.streetCount ?? 0,
+        status:      'unloaded',
+        group:       null, // THREE.Group of per-type meshes, added to _group on load
       };
       this._tiles.set(tile.id, tile);
       this._indexTile(tile);
     }
 
     this.tick(0, 0);
+  }
+
+  /** Manifest tiles that report at least one street. Used by the random-spawn picker. */
+  tilesWithStreets() {
+    const out = [];
+    for (const tile of this._tiles.values()) {
+      if (tile.streetCount > 0) out.push(tile);
+    }
+    return out;
+  }
+
+  /**
+   * Resolves to the `streets` array for the given manifest tile. Caches the
+   * result (and dedupes concurrent fetches) so repeat calls are free. Returns
+   * [] if the tile is unknown or has no streets; throws if the fetch fails.
+   */
+  async fetchStreets(tileId) {
+    const cached = this._streetsCache.get(tileId);
+    if (cached !== undefined) return cached;
+    const tile = this._tiles.get(tileId);
+    if (!tile) return [];
+    const promise = (async () => {
+      const res = await fetch(tile.file);
+      if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      const data = await res.json();
+      const streets = data.streets || [];
+      this._streetsCache.set(tileId, streets);
+      return streets;
+    })().catch(e => {
+      this._streetsCache.delete(tileId);
+      throw e;
+    });
+    this._streetsCache.set(tileId, promise);
+    return promise;
   }
 
   _indexTile(tile) {
@@ -173,14 +257,16 @@ export class OsmManager {
 
       const group = new THREE.Group();
 
-      const waterMesh = _buildPolygonMesh(data.water || [], Y_WATER, WATER_MAT);
+      const waterMesh = _buildPolygonMesh(data.water || [], Y_WATER, WATER_MAT, 1);
       if (waterMesh) group.add(waterMesh);
 
-      const greenMesh = _buildPolygonMesh(data.green || [], Y_GREEN, GREEN_MAT);
+      const greenMesh = _buildPolygonMesh(data.green || [], Y_GREEN, GREEN_MAT, 2);
       if (greenMesh) group.add(greenMesh);
 
-      const streetMesh = _buildStreetMesh(data.streets || [], Y_STREET, STREET_MAT);
+      const streetMesh = _buildStreetMesh(data.streets || [], Y_STREET, STREET_MAT, 3);
       if (streetMesh) group.add(streetMesh);
+
+      _buildStreetLabels(data.streets || [], group);
 
       this._group.add(group);
       tile.group  = group;
@@ -212,7 +298,8 @@ export class OsmManager {
   _unload(tile) {
     if (tile.group) {
       for (const child of tile.group.children) {
-        if (child.geometry) child.geometry.dispose();
+        // Label geometry is shared across tiles via _labelCache — skip it.
+        if (child.geometry && !child.userData.sharedGeometry) child.geometry.dispose();
       }
       this._group.remove(tile.group);
       tile.group = null;
@@ -230,8 +317,9 @@ function _closestDist2(px, pz, b) {
 }
 
 // Flat XZ triangle lists (each entry is [x,z,x,z,x,z,...] for one polygon) →
-// one BufferGeometry + Mesh at the given Y plane.
-function _buildPolygonMesh(polygons, y, material) {
+// one BufferGeometry + Mesh at the given Y plane. `renderOrder` ensures the
+// overlays always draw after the ground / buildings pass so they don't flicker.
+function _buildPolygonMesh(polygons, y, material, renderOrder) {
   if (!polygons.length) return null;
   let total = 0;
   for (const tri of polygons) total += tri.length / 2;
@@ -249,59 +337,214 @@ function _buildPolygonMesh(polygons, y, material) {
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const mesh = new THREE.Mesh(geo, material);
-  mesh.renderOrder = 0;
+  mesh.renderOrder = renderOrder;
   return mesh;
 }
 
-// Street polylines → extruded ribbon quads at the given Y plane.
-function _buildStreetMesh(streets, y, material) {
+// Street polylines → extruded ribbon with miter joins at each interior vertex.
+// Without joins, adjacent rectangles leave V-shaped gaps on the outside of a
+// turn — very visible on curved roads approximated by short straight segments.
+function _buildStreetMesh(streets, y, material, renderOrder) {
   if (!streets.length) return null;
 
-  // Count segments up front so we can size a typed array.
   let segCount = 0;
   for (const s of streets) if (s.points && s.points.length >= 2) segCount += s.points.length - 1;
   if (segCount === 0) return null;
 
-  // 6 verts × 3 floats per segment (two triangles per ribbon rect).
-  const positions = new Float32Array(segCount * 6 * 3);
+  // 2 triangles × 3 verts × 3 floats per segment. Miter joins still produce
+  // exactly 2 tris per segment — they just shift the shared vertex outward.
+  const positions = new Float32Array(segCount * 18);
   let o = 0;
 
+  // Scratch arrays for per-vertex miter offsets; reused across streets.
+  const offX = [];
+  const offZ = [];
+
   for (const s of streets) {
-    const half = (TYPE_WIDTH[s.type] ?? DEFAULT_WIDTH) * 0.5;
+    const width = TYPE_WIDTH[s.type] ?? DEFAULT_WIDTH;
+    const half  = width * 0.5;
+    // Each polyline's first/last vertex is pushed this far along the adjacent
+    // segment so independent OSM ways meeting at an intersection overlap and
+    // cover the butt-cap triangular gap at the corners.
+    const endExtend = width * 0.1;
     const pts  = s.points;
     if (!pts || pts.length < 2) continue;
+    const N = pts.length;
+    offX.length = N;
+    offZ.length = N;
 
-    for (let i = 0; i < pts.length - 1; i++) {
-      const x0 = pts[i][0],   z0 = pts[i][1];
-      const x1 = pts[i + 1][0], z1 = pts[i + 1][1];
-      const dx = x1 - x0, dz = z1 - z0;
-      const len = Math.hypot(dx, dz);
-      if (len === 0) {
-        // Zero-length segment — write degenerate triangles so we don't
-        // shift the offset out of sync with segCount. Harmless to render.
-        for (let k = 0; k < 18; k++) positions[o++] = 0;
-        continue;
+    // Compute the miter offset (perpendicular × miter-length) at each vertex.
+    // Tangent = normalized bisector of incoming+outgoing edges; miter length
+    // = half / cos(bend/2) so the outer edge of the ribbon stays a consistent
+    // width through the turn.
+    for (let i = 0; i < N; i++) {
+      let inX = 0,  inZ = 0;
+      let outX = 0, outZ = 0;
+      let hasIn = false, hasOut = false;
+      if (i > 0) {
+        const dx = pts[i][0] - pts[i - 1][0];
+        const dz = pts[i][1] - pts[i - 1][1];
+        const len = Math.hypot(dx, dz);
+        if (len > 1e-6) { inX = dx / len; inZ = dz / len; hasIn = true; }
       }
-      // Perpendicular in XZ plane × half-width.
-      const nx = (-dz / len) * half;
-      const nz = ( dx / len) * half;
+      if (i < N - 1) {
+        const dx = pts[i + 1][0] - pts[i][0];
+        const dz = pts[i + 1][1] - pts[i][1];
+        const len = Math.hypot(dx, dz);
+        if (len > 1e-6) { outX = dx / len; outZ = dz / len; hasOut = true; }
+      }
 
-      // Two triangles (v0, v1, v3) and (v0, v3, v2).
-      //   v0 = p0 + n, v1 = p0 - n, v2 = p1 + n, v3 = p1 - n
-      // Write tri 1
-      positions[o++] = x0 + nx; positions[o++] = y; positions[o++] = z0 + nz;
-      positions[o++] = x0 - nx; positions[o++] = y; positions[o++] = z0 - nz;
-      positions[o++] = x1 - nx; positions[o++] = y; positions[o++] = z1 - nz;
-      // Write tri 2
-      positions[o++] = x0 + nx; positions[o++] = y; positions[o++] = z0 + nz;
-      positions[o++] = x1 - nx; positions[o++] = y; positions[o++] = z1 - nz;
-      positions[o++] = x1 + nx; positions[o++] = y; positions[o++] = z1 + nz;
+      // Bisector. At endpoints fall back to the single available direction.
+      let tx, tz;
+      if (hasIn && hasOut) { tx = inX + outX; tz = inZ + outZ; }
+      else if (hasIn)      { tx = inX;        tz = inZ; }
+      else                 { tx = outX;       tz = outZ; }
+      const tlen = Math.hypot(tx, tz);
+      if (tlen < 1e-6) {
+        // 180° reversal (or degenerate) — fall back to outgoing perpendicular.
+        tx = hasOut ? outX : inX;
+        tz = hasOut ? outZ : inZ;
+      } else {
+        tx /= tlen; tz /= tlen;
+      }
+      // Left-hand perpendicular (90° CCW in XZ).
+      const px = -tz, pz = tx;
+
+      // Miter length scales with 1/cos(half_bend). Clamp to 4× half-width so
+      // a near-180° turn doesn't produce a spike off to infinity.
+      let miter = half;
+      if (hasIn && hasOut) {
+        const inPx = -inZ, inPz = inX;   // perpendicular of incoming edge
+        const c = px * inPx + pz * inPz; // cos(half_bend); sign = which side
+        if (Math.abs(c) > 0.2) miter = half / c;
+        else                   miter = (c >= 0 ? 4 : -4) * half;
+      }
+      const maxMiter = 4 * half;
+      if (miter >  maxMiter) miter =  maxMiter;
+      if (miter < -maxMiter) miter = -maxMiter;
+
+      offX[i] = px * miter;
+      offZ[i] = pz * miter;
+    }
+
+    // Emit two triangles per segment using the shared miter offsets at both ends.
+    for (let i = 0; i < N - 1; i++) {
+      let x0 = pts[i][0],     z0 = pts[i][1];
+      let x1 = pts[i + 1][0], z1 = pts[i + 1][1];
+      // Extend the first vertex backward along its outgoing segment, and the
+      // last vertex forward along its incoming segment. Offsets are unchanged
+      // because they depend only on direction, not position.
+      if (i === 0) {
+        const dx = pts[1][0] - pts[0][0], dz = pts[1][1] - pts[0][1];
+        const len = Math.hypot(dx, dz);
+        if (len > 1e-6) {
+          x0 -= (dx / len) * endExtend;
+          z0 -= (dz / len) * endExtend;
+        }
+      }
+      if (i + 1 === N - 1) {
+        const dx = pts[N - 1][0] - pts[N - 2][0], dz = pts[N - 1][1] - pts[N - 2][1];
+        const len = Math.hypot(dx, dz);
+        if (len > 1e-6) {
+          x1 += (dx / len) * endExtend;
+          z1 += (dz / len) * endExtend;
+        }
+      }
+      const o0x = offX[i],     o0z = offZ[i];
+      const o1x = offX[i + 1], o1z = offZ[i + 1];
+
+      // tri 1: (p0 + o0), (p0 − o0), (p1 − o1)
+      positions[o++] = x0 + o0x; positions[o++] = y; positions[o++] = z0 + o0z;
+      positions[o++] = x0 - o0x; positions[o++] = y; positions[o++] = z0 - o0z;
+      positions[o++] = x1 - o1x; positions[o++] = y; positions[o++] = z1 - o1z;
+
+      // tri 2: (p0 + o0), (p1 − o1), (p1 + o1)
+      positions[o++] = x0 + o0x; positions[o++] = y; positions[o++] = z0 + o0z;
+      positions[o++] = x1 - o1x; positions[o++] = y; positions[o++] = z1 - o1z;
+      positions[o++] = x1 + o1x; positions[o++] = y; positions[o++] = z1 + o1z;
     }
   }
 
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const mesh = new THREE.Mesh(geo, material);
-  mesh.renderOrder = 1; // after water/green
+  mesh.renderOrder = renderOrder;
   return mesh;
+}
+
+// Build (or fetch cached) flat ShapeGeometry for a street name. Glyphs come
+// from the bundled typeface font so text stays sharp at any zoom — unlike a
+// CanvasTexture, which ceilings out at its rasterized resolution.
+function _getLabelAsset(name) {
+  let entry = _labelCache.get(name);
+  if (entry) return entry;
+
+  const shapes = _font.generateShapes(name, 1.0);
+  const geometry = new THREE.ShapeGeometry(shapes);
+  geometry.computeBoundingBox();
+  const bb = geometry.boundingBox;
+  // Capture extents in the glyph-native XY plane *before* transforming —
+  // translate/rotate update boundingBox in place, and after rotateX the Y
+  // extent collapses to the (zero) thickness of the flat shape.
+  const width  = bb.max.x - bb.min.x;
+  const height = bb.max.y - bb.min.y;
+  const cx = (bb.min.x + bb.max.x) * 0.5;
+  const cy = (bb.min.y + bb.max.y) * 0.5;
+  // Center the glyph run on origin, then lay it flat on XZ so +X runs along
+  // the street direction and the label reads correctly when viewed top-down.
+  geometry.translate(-cx, -cy, 0);
+  geometry.rotateX(-Math.PI / 2);
+
+  entry = { geometry, width, height };
+  _labelCache.set(name, entry);
+  return entry;
+}
+
+// For each named street, pick its longest segment and lay a flat label plane
+// along it. One mesh per street — the material/texture come from the shared
+// _labelCache, so repeat names across tiles add only geometry cost.
+function _buildStreetLabels(streets, parentGroup) {
+  for (const s of streets) {
+    if (!s.name) continue;
+    const pts = s.points;
+    if (!pts || pts.length < 2) continue;
+
+    // Longest segment — we anchor the label on the straightest-looking piece
+    // so the baseline lines up with the street rather than cutting a corner.
+    let bestLen2 = 0;
+    let bestIdx  = -1;
+    for (let i = 0; i < pts.length - 1; i++) {
+      const dx = pts[i + 1][0] - pts[i][0];
+      const dz = pts[i + 1][1] - pts[i][1];
+      const len2 = dx * dx + dz * dz;
+      if (len2 > bestLen2) { bestLen2 = len2; bestIdx = i; }
+    }
+    if (bestIdx < 0 || bestLen2 < MIN_LABELED_STREET_M * MIN_LABELED_STREET_M) continue;
+
+    const p0  = pts[bestIdx];
+    const p1  = pts[bestIdx + 1];
+    const len = Math.sqrt(bestLen2);
+    let dx = (p1[0] - p0[0]) / len;
+    let dz = (p1[1] - p0[1]) / len;
+    // Flip direction so text reads right (+X side). Without this, half the
+    // labels in every tile would render upside-down when viewed north-up.
+    if (dx < 0 || (dx === 0 && dz < 0)) { dx = -dx; dz = -dz; }
+
+    const { geometry, width, height } = _getLabelAsset(s.name);
+    // Target "LABEL_HEIGHT_M tall" as a base scale; shrink further if the
+    // resulting run would overflow the segment.
+    const baseScale = LABEL_HEIGHT_M / height;
+    let scale = baseScale;
+    const worldW = width * scale;
+    if (worldW > len * 0.85) scale *= (len * 0.85) / worldW;
+    if (scale / baseScale < MIN_LABEL_SCALE) continue;
+
+    const mesh = new THREE.Mesh(geometry, LABEL_MAT);
+    mesh.position.set((p0[0] + p1[0]) * 0.5, Y_STREET_LABEL, (p0[1] + p1[1]) * 0.5);
+    mesh.rotation.y  = Math.atan2(-dz, dx);
+    mesh.scale.set(scale, scale, scale);
+    mesh.renderOrder = 4;
+    mesh.userData.sharedGeometry = true;
+    parentGroup.add(mesh);
+  }
 }

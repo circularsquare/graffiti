@@ -92,16 +92,6 @@
       pointer-events: none;
     }
 
-    #status {
-      position: fixed;
-      top: 16px;
-      left: 56px;
-      color: rgba(255,255,255,0.7);
-      font-family: monospace;
-      font-size: 12px;
-      pointer-events: none;
-    }
-
     #colorbar {
       position: fixed;
       top: 16px;
@@ -134,15 +124,14 @@
 </head>
 <body>
   <div id="overlay" class="loading">
-    <div>Financial District, NYC</div>
-    <div id="overlay-prompt">Click to explore</div>
+    <div>Graffiti NYC</div>
+    <div id="overlay-prompt">Loading data...</div>
     <small>WASD · mouse look · Shift to sprint · ESC to exit</small>
     <small>Tab to cycle colors · C to pick color</small>
   </div>
   <div id="crosshair"></div>
   <div id="colorbar"></div>
-  <div id="hud">Financial District, NYC</div>
-  <div id="status">Loading buildings...</div>
+  <div id="hud">Graffiti NYC</div>
   <div id="minimap-wrap">
     <canvas id="minimap" width="180" height="180"></canvas>
   </div>

@@ -4,7 +4,7 @@ import { GRID_SIZE } from './loadCityGML.js';
 import { TileManager } from './TileManager.js';
 import { OsmManager } from './OsmManager.js';
 import { paintStore } from './paintStore.js';
-import { initMinimap, updateMinimap } from './minimap.js';
+import { initMinimap, updateMinimap, setMinimapSize } from './minimap.js';
 
 // ─── Scene ───────────────────────────────────────────────────────────────────
 
@@ -21,7 +21,50 @@ scene.background = new THREE.Color(0x9ab8d4);
 scene.fog = new THREE.FogExp2(0x9ab8d4, 0.003);
 
 const camera = new THREE.PerspectiveCamera(100, window.innerWidth / window.innerHeight, 0.5, 2000);
-camera.position.set(2215, 1.7, -5928); // Times Square (42nd St & 7th Ave)
+camera.position.set(2215, 1.7, -5928); // Times Square (42nd St & 7th Ave) — default spawn
+
+// ─── Player state persistence ─────────────────────────────────────────────────
+//
+// Position, view rotation, and fly-mode are saved to localStorage on unload
+// so a soft reload (Ctrl+R / F5) drops you back where you were. Ctrl+Shift+R
+// flips a sessionStorage flag in the keydown handler before the browser
+// handles the reload; we check that flag here and clear the save, so hard
+// reload returns to the default spawn.
+
+const PLAYER_STATE_KEY = 'graffiti_player_state_v1';
+const PLAYER_RESET_KEY = 'graffiti_player_reset';
+
+if (sessionStorage.getItem(PLAYER_RESET_KEY) === '1') {
+  sessionStorage.removeItem(PLAYER_RESET_KEY);
+  localStorage.removeItem(PLAYER_STATE_KEY);
+}
+
+const _savedPlayer = (() => {
+  try {
+    const raw = localStorage.getItem(PLAYER_STATE_KEY);
+    return raw ? JSON.parse(raw) : null;
+  } catch { return null; }
+})();
+
+if (_savedPlayer) {
+  camera.position.set(_savedPlayer.px, _savedPlayer.py, _savedPlayer.pz);
+  camera.quaternion.set(_savedPlayer.qx, _savedPlayer.qy, _savedPlayer.qz, _savedPlayer.qw);
+}
+
+function savePlayerState() {
+  try {
+    localStorage.setItem(PLAYER_STATE_KEY, JSON.stringify({
+      px: camera.position.x, py: camera.position.y, pz: camera.position.z,
+      qx: camera.quaternion.x, qy: camera.quaternion.y, qz: camera.quaternion.z, qw: camera.quaternion.w,
+      flying: isFlying,
+    }));
+  } catch {}
+}
+
+window.addEventListener('beforeunload', savePlayerState);
+document.addEventListener('visibilitychange', () => {
+  if (document.visibilityState === 'hidden') savePlayerState();
+});
 
 window.addEventListener('resize', () => {
   camera.aspect = window.innerWidth / window.innerHeight;
@@ -40,12 +83,15 @@ scene.add(sun);
 
 // ─── Ground ───────────────────────────────────────────────────────────────────
 
+// The ground plane follows the player every frame — cheaper and more robust
+// than making it arena-sized (which runs into depth precision issues at the
+// horizon) and guarantees a floor exists wherever the random-teleport drops us.
 const ground = new THREE.Mesh(
   new THREE.PlaneGeometry(20000, 20000),
-  new THREE.MeshLambertMaterial({ color: 0x444440 }),
+  new THREE.MeshLambertMaterial({ color: 0xb0b0ac }),
 );
 ground.rotation.x = -Math.PI / 2;
-ground.position.set(2215, 0, -5928); // centered on spawn area
+ground.position.set(0, 0, 0);
 ground.receiveShadow = false;
 scene.add(ground);
 
@@ -70,15 +116,32 @@ function updateCulling() {
   _cullX = px; _cullZ = pz;
   const r2 = CULL_RADIUS * CULL_RADIUS;
   nearBuildingMeshes = [];
-  for (const mesh of buildingMeshes) {
-    const c = mesh.userData.center;
-    const near = (c.x - px) ** 2 + (c.z - pz) ** 2 < r2;
-    mesh.visible = near;
-    if (near) nearBuildingMeshes.push(mesh);
 
-    // Cull paint overlay meshes for this building.
-    const paintSet = buildingPaintMeshByBuilding.get(`${mesh.userData.buildingId}:${mesh.userData.meshType}`);
-    if (paintSet) for (const paintMesh of paintSet) paintMesh.visible = near;
+  // Per-tile short-circuit: hide the tile's group when its AABB is entirely
+  // outside CULL_RADIUS so the renderer doesn't walk each invisible mesh every
+  // frame. Inside in-range tiles we still do per-building culling for the
+  // partial-overlap case at the boundary.
+  for (const tile of tileManager.tiles()) {
+    const b = tile.bounds;
+    const bx = Math.max(b.minX, Math.min(px, b.maxX));
+    const bz = Math.max(b.minZ, Math.min(pz, b.maxZ));
+    const tileInRange = (px - bx) ** 2 + (pz - bz) ** 2 < r2;
+    tile.group.visible = tileInRange;
+    if (!tileInRange) continue;
+
+    for (const mesh of tile.meshes) {
+      const c = mesh.userData.center;
+      const near = (c.x - px) ** 2 + (c.z - pz) ** 2 < r2;
+      mesh.visible = near;
+      if (near) nearBuildingMeshes.push(mesh);
+
+      // Each merged mesh covers both meshTypes; toggle paint overlays for all
+      // buildingKeys it owns.
+      for (const bk of mesh.userData.buildingKeys) {
+        const paintSet = buildingPaintMeshByBuilding.get(bk);
+        if (paintSet) for (const paintMesh of paintSet) paintMesh.visible = near;
+      }
+    }
   }
   nearCollidables = [ground, ...nearBuildingMeshes];
 }
@@ -91,7 +154,7 @@ function maybeCull() {
   if (dx * dx + dz * dz >= CULL_HYSTERESIS ** 2) updateCulling();
 }
 
-let isFlying    = false;
+let isFlying    = _savedPlayer ? !!_savedPlayer.flying : false;
 let lastSpaceTap = 0;
 const DOUBLE_TAP_MS = 280;
 
@@ -100,7 +163,7 @@ const WALK_SPEED    = 8;
 const SPRINT_SPEED  = 24;
 const FLY_SPEED     = 22;
 const FLY_VERT      = 14;
-const PLAYER_RADIUS = 1.8;  // keep walls this far out so tilted view doesn't clip in
+const PLAYER_RADIUS = 1.5;  // body collision radius; also used as spawn clearance
 const GRAVITY       = 22;   // m/s²
 const TERMINAL_VEL  = -50;
 
@@ -110,16 +173,86 @@ let velY = 0;
 
 const controls = new PointerLockControls(camera, renderer.domElement);
 
-const overlay     = document.getElementById('overlay');
-const crosshair   = document.getElementById('crosshair');
-const hud         = document.getElementById('hud');
+const overlay       = document.getElementById('overlay');
+const overlayPrompt = document.getElementById('overlay-prompt');
+const crosshair     = document.getElementById('crosshair');
+const hud           = document.getElementById('hud');
 const randomBtn   = document.getElementById('minimap-random');
+const minimapWrap = document.getElementById('minimap-wrap');
 initMinimap();
 
-randomBtn.addEventListener('click', () => {
+// Small vs. big minimap. 180 px mirrors the initial HTML canvas size; big mode
+// fills half the shorter viewport axis (so it's ~a quarter of the screen's
+// area, always square, never overflows on portrait windows).
+const MINIMAP_SIZE_SMALL = 180;
+function minimapBigSize() {
+  return Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.5);
+}
+let minimapBig = false;
+function applyMinimapLayout() {
+  const px = minimapBig ? minimapBigSize() : MINIMAP_SIZE_SMALL;
+  setMinimapSize(px);
+  // Keep the random-location button anchored just below the map so the big
+  // map doesn't visually swallow it. The wrap sits at top: 28px; the button
+  // follows at (28 + size + 6)px.
+  const btn = document.getElementById('minimap-random');
+  if (btn) btn.style.top = (28 + px + 6) + 'px';
+}
+function toggleMinimapBig() {
+  minimapBig = !minimapBig;
+  minimapWrap.classList.toggle('big', minimapBig);
+  applyMinimapLayout();
+}
+window.addEventListener('resize', () => {
+  if (minimapBig) applyMinimapLayout();
+});
+
+// Max distance from a spawn point to the nearest building tile AABB. Keeps
+// the random-teleport button from dropping the player in open water / parks /
+// the middle of the FDR where there's nothing to paint.
+const STREET_SPAWN_MAX_BUILDING_DIST = 50; // metres
+
+/**
+ * Try to pick a spawn on an actual OSM street that's within
+ * STREET_SPAWN_MAX_BUILDING_DIST of a building. Returns null if no street
+ * data is available (OSM manifest missing) or every tried point was far from
+ * buildings — the caller should fall back to the plain random picker.
+ *
+ * Why sample OSM tiles rather than the loaded street meshes: the street
+ * meshes only cover the ~300 m around the player; we want teleport targets
+ * anywhere on the map. So we hit the manifest and fetch street polylines on
+ * demand, cached in OsmManager for repeat clicks.
+ */
+async function pickStreetSpawn(maxTileTries = 20, pointsPerTile = 4) {
+  const candidates = osmManager.tilesWithStreets();
+  if (candidates.length === 0) return null;
+  for (let i = 0; i < maxTileTries; i++) {
+    const tile = candidates[Math.floor(Math.random() * candidates.length)];
+    let streets;
+    try { streets = await osmManager.fetchStreets(tile.id); }
+    catch { continue; }
+    if (!streets || streets.length === 0) continue;
+    for (let j = 0; j < pointsPerTile; j++) {
+      const s = streets[Math.floor(Math.random() * streets.length)];
+      if (!s.points || s.points.length < 2) continue;
+      const segIdx = Math.floor(Math.random() * (s.points.length - 1));
+      const p0 = s.points[segIdx], p1 = s.points[segIdx + 1];
+      const t = Math.random();
+      const x = p0[0] + (p1[0] - p0[0]) * t;
+      const z = p0[1] + (p1[1] - p0[1]) * t;
+      if (tileManager.distanceToNearestBuildingTile(x, z) <= STREET_SPAWN_MAX_BUILDING_DIST) {
+        return { x, z };
+      }
+    }
+  }
+  return null;
+}
+
+randomBtn.addEventListener('click', async () => {
   if (!firstTileLoaded || teleporting) return;
-  const loc = tileManager.randomLocation();
-  if (!loc) return;
+  randomBtn.disabled = true;
+  const loc = (await pickStreetSpawn()) ?? tileManager.randomLocation();
+  if (!loc) { randomBtn.disabled = false; return; }
   camera.position.set(loc.x, WALK_HEIGHT, loc.z);
   velY = 0;
   updateCulling();
@@ -129,7 +262,7 @@ randomBtn.addEventListener('click', () => {
   // letting the user click in.
   teleporting = true;
   overlay.classList.add('loading');
-  status.textContent = 'Loading tiles…';
+  overlayPrompt.textContent = 'Loading data...';
   randomBtn.disabled = true;
   colorPickMode = false;
   if (controls.isLocked) controls.unlock();
@@ -169,7 +302,23 @@ document.addEventListener('keydown', e => {
   // devtools, etc. We don't use Ctrl or Meta for any in-game action, so
   // short-circuiting here is safe. Keyup still processes normally, otherwise
   // a key pressed before Ctrl would get stuck when released while Ctrl holds.
-  if (e.ctrlKey || e.metaKey) return;
+  if (e.ctrlKey || e.metaKey) {
+    // Ctrl+Shift+R / Cmd+Shift+R: flag reset so next page load clears the
+    // saved player state and spawns at the default. sessionStorage survives
+    // the reload; the flag is consumed at startup (see PLAYER_RESET_KEY).
+    if (e.shiftKey && e.code === 'KeyR') {
+      sessionStorage.setItem(PLAYER_RESET_KEY, '1');
+    }
+    return;
+  }
+
+  // F3: toggle the debug HUD. Prevent the browser's default search action.
+  if (e.code === 'F3') {
+    e.preventDefault();
+    debugHudOn = !debugHudOn;
+    debugHud.style.display = debugHudOn ? 'block' : 'none';
+    return;
+  }
 
   const wasDown = keys[e.code];
   keys[e.code] = true;
@@ -194,6 +343,10 @@ document.addEventListener('keydown', e => {
     colorPickMode = true;
     controls.unlock();
   }
+
+  if (e.code === 'KeyM' && !e.repeat) {
+    toggleMinimapBig();
+  }
 });
 
 document.addEventListener('keyup', e => { keys[e.code] = false; });
@@ -203,25 +356,58 @@ window.addEventListener('blur', () => { for (const k in keys) keys[k] = false; }
 // ─── Collision helpers ────────────────────────────────────────────────────────
 
 const snapRay  = new THREE.Raycaster(); // reusable ray for safe-start checks
-const wallRay  = new THREE.Raycaster();
 const downRay  = new THREE.Raycaster();
 const DOWN     = new THREE.Vector3(0, -1, 0);
 
-// Returns true if moving `dist` m along `dir` from `origin` is clear of walls.
-function wallClear(origin, dir, dist) {
-  wallRay.set(origin, dir);
-  wallRay.far = dist + PLAYER_RADIUS;
-  const hits = wallRay.intersectObjects(nearBuildingMeshes, false);
-  return hits.length === 0 || hits[0].distance > PLAYER_RADIUS;
-}
+// Closest point on triangle (a,b,c) to point p — written into `out`.
+// Ericson, Real-Time Collision Detection §5.1.5. Pre-allocated temps below.
+const _cptAB = new THREE.Vector3();
+const _cptAC = new THREE.Vector3();
+const _cptAP = new THREE.Vector3();
+const _cptBP = new THREE.Vector3();
+const _cptCP = new THREE.Vector3();
+const _cptBC = new THREE.Vector3();
+function closestPointOnTriangle(p, a, b, c, out) {
+  _cptAB.subVectors(b, a);
+  _cptAC.subVectors(c, a);
+  _cptAP.subVectors(p, a);
+  const d1 = _cptAB.dot(_cptAP);
+  const d2 = _cptAC.dot(_cptAP);
+  if (d1 <= 0 && d2 <= 0) return out.copy(a);
 
-// Check across the full body height so short ledges are caught too.
-function canMoveAxis(pos, dir, dist) {
-  for (let i = 0; i < WALL_Y_OFFSETS.length; i++) {
-    _wallOrigins[i].set(pos.x, pos.y + WALL_Y_OFFSETS[i], pos.z);
-    if (!wallClear(_wallOrigins[i], dir, dist)) return false;
+  _cptBP.subVectors(p, b);
+  const d3 = _cptAB.dot(_cptBP);
+  const d4 = _cptAC.dot(_cptBP);
+  if (d3 >= 0 && d4 <= d3) return out.copy(b);
+
+  const vc = d1 * d4 - d3 * d2;
+  if (vc <= 0 && d1 >= 0 && d3 <= 0) {
+    const v = d1 / (d1 - d3);
+    return out.copy(a).addScaledVector(_cptAB, v);
   }
-  return true;
+
+  _cptCP.subVectors(p, c);
+  const d5 = _cptAB.dot(_cptCP);
+  const d6 = _cptAC.dot(_cptCP);
+  if (d6 >= 0 && d5 <= d6) return out.copy(c);
+
+  const vb = d5 * d2 - d1 * d6;
+  if (vb <= 0 && d2 >= 0 && d6 <= 0) {
+    const w = d2 / (d2 - d6);
+    return out.copy(a).addScaledVector(_cptAC, w);
+  }
+
+  const va = d3 * d6 - d5 * d4;
+  if (va <= 0 && (d4 - d3) >= 0 && (d5 - d6) >= 0) {
+    _cptBC.subVectors(c, b);
+    const w = (d4 - d3) / ((d4 - d3) + (d5 - d6));
+    return out.copy(b).addScaledVector(_cptBC, w);
+  }
+
+  const denom = 1 / (va + vb + vc);
+  const v = vb * denom;
+  const w = vc * denom;
+  return out.copy(a).addScaledVector(_cptAB, v).addScaledVector(_cptAC, w);
 }
 
 // Cast a ray straight down from just above the player's feet.
@@ -284,10 +470,112 @@ function setActiveColor(i) {
 // ─── Paint ────────────────────────────────────────────────────────────────────
 
 const PAINT_DIST = 15;    // max reach in metres
-const SMALL_CELL_AREA = GRID_SIZE ** 2  * 0.15;  // 1/10 of a cell — slivers smaller than this merge with their largest neighbor
+const SMALL_CELL_AREA = GRID_SIZE ** 2 * 0.5; // 2.0 m² — matches tileWorker SLIVER_AREA, used only by the debug HUD's SLIVER label
 
 const paintRay          = new THREE.Raycaster();
 const paintGroup        = new THREE.Group();
+
+// ─── Debug HUD ────────────────────────────────────────────────────────────────
+//
+// Toggle with F3. Shows what the crosshair is hitting: building id, mesh type,
+// triangle index, face id (which face the triangle belongs to), cell coords,
+// planeD + key, face normal, hit distance. Useful for diagnosing face
+// boundaries ("why is there a green line between these two faces?" — if both
+// sides show the same face id, it's a T-junction; if different, the face
+// extraction criteria rejected the merge).
+
+const debugRay = new THREE.Raycaster();
+let debugHudOn = false;
+
+// FPS tracking — rolled over a ~500 ms window so the number updates smoothly
+// instead of jittering frame-to-frame. Only displayed when debugHudOn.
+let _fpsValue = 0;
+let _fpsFrameCount = 0;
+let _fpsWindowStart = 0;
+
+function tickFps(now) {
+  if (_fpsWindowStart === 0) _fpsWindowStart = now;
+  _fpsFrameCount++;
+  const elapsed = now - _fpsWindowStart;
+  if (elapsed >= 500) {
+    _fpsValue = (_fpsFrameCount * 1000) / elapsed;
+    _fpsFrameCount = 0;
+    _fpsWindowStart = now;
+  }
+}
+
+const debugHud = document.createElement('div');
+debugHud.id = 'debug-hud';
+debugHud.style.cssText = `
+  position: fixed; top: 12px; left: 12px;
+  font-family: ui-monospace, Menlo, Consolas, monospace;
+  font-size: 12px; line-height: 1.4;
+  color: #fff; background: rgba(0, 0, 0, 0.6);
+  padding: 8px 10px; border-radius: 4px;
+  white-space: pre; pointer-events: none; z-index: 9999;
+  display: none;
+`;
+document.body.appendChild(debugHud);
+
+function updateDebugHud() {
+  if (!debugHudOn) return;
+  const fpsLine = `fps      ${_fpsValue.toFixed(1)}`;
+  debugRay.setFromCamera(new THREE.Vector2(0, 0), camera);
+  const hits = debugRay.intersectObjects(nearBuildingMeshes, false);
+  if (!hits.length) { debugHud.textContent = fpsLine + '\n(no hit)'; return; }
+  const hit     = hits[0];
+  const mesh    = hit.object;
+  const ud      = mesh.userData;
+  const faceIdx = hit.faceIndex;
+  const fi     = ud.triFace ? ud.triFace[faceIdx] : -1;
+  const fData  = (ud.faces && fi >= 0) ? ud.faces[fi] : null;
+
+  const triNormal = hit.face.normal.clone().transformDirection(mesh.matrixWorld).normalize();
+  const triPD     = triNormal.dot(hit.point);
+  const facePD    = fData ? fData.planeD : null;
+  // meshType is now per-face (merged mesh carries both roof + wall).
+  const meshType  = fData && fData.meshType ? fData.meshType
+    : (Math.abs(triNormal.y) > 0.5 ? 'roof' : 'wall');
+
+  // The key used by paint (and the worker's seed cache): face planeD if
+  // available, else the per-triangle planeD. If these disagree enough to
+  // round to different pdKeys, paint misses the cache — that's the bug this
+  // HUD is meant to surface.
+  const paintPD  = facePD != null ? facePD : triPD;
+  const pdKey    = Math.round(paintPD * 2);
+  const cu       = hit.uv ? Math.floor(hit.uv.x) : '—';
+  const cv       = hit.uv ? Math.floor(hit.uv.y) : '—';
+  const cellKey  = `${ud.buildingId}:${meshType}:${cu}:${cv}:${pdKey}`;
+  const cached   = cellGeomCache.get(cellKey);
+  const area     = cached ? geomArea(cached) : null;
+  const pdMismatch = facePD != null &&
+    Math.round(facePD * 2) !== Math.round(triPD * 2);
+
+  // Paint status. If this flips from "no" to "yes <color>" right after a
+  // click, the paintStore is receiving the paint correctly and the problem
+  // is downstream in rebuildBuildingPaint / the mesh itself. If it stays
+  // "no", the click isn't reaching this cellKey at all.
+  const stored = paintStore.cells.get(cellKey);
+  const paintMeshCount = (buildingPaintMeshByBuilding.get(`${ud.buildingId}:${meshType}`) || new Set()).size;
+
+  const group       = cellGroups.get(cellKey);
+  const groupSize   = group ? group.size : 1;
+
+  debugHud.textContent = [
+    fpsLine,
+    `bldg     ${ud.buildingId}`,
+    `mesh     ${meshType}   tri ${faceIdx}   face ${fi}`,
+    `cell     (${cu}, ${cv})   pdKey ${pdKey}`,
+    `cellKey  ${cellKey}`,
+    `cache    ${cached ? `hit (area ${area.toFixed(2)} m²${area < SMALL_CELL_AREA ? ' — SLIVER' : ''})` : 'MISS'}`,
+    `group    ${groupSize}${groupSize > 1 ? ' cells' : ' (singleton)'}`,
+    `painted  ${stored ? `yes ${typeof stored.color === 'number' ? '#' + stored.color.toString(16).padStart(6, '0') : stored.color}` : 'no'}`,
+    `bldgMeshes ${paintMeshCount}`,
+    `planeD   ${paintPD.toFixed(3)}${pdMismatch ? `   (tri ${triPD.toFixed(3)} — MISMATCH)` : ''}`,
+    `normal   (${triNormal.x.toFixed(2)}, ${triNormal.y.toFixed(2)}, ${triNormal.z.toFixed(2)})`,
+    `dist     ${hit.distance.toFixed(1)} m`,
+  ].join('\n');
+}
 const buildingPaintMeshes         = new Map(); // "buildingId:meshType|color" → mesh
 const buildingPaintMeshByBuilding = new Map(); // "buildingId:meshType" → Set<mesh>
 const pendingRebuild    = new Set();   // buildingKeys awaiting rebuild
@@ -302,7 +590,7 @@ function flushPaintRebuilds() {
   const t = performance.now();
   for (const bk of pendingRebuild) {
     const srcMesh = buildingMeshMap.get(bk);
-    if (srcMesh) rebuildBuildingPaint(srcMesh);
+    if (srcMesh) rebuildBuildingPaint(srcMesh, bk);
   }
   pendingRebuild.clear();
   performance.measure('paint:rebuild', { start: t, end: performance.now() });
@@ -356,15 +644,26 @@ function clipHalfPlane(poly, axisIdx, value, sign) {
  *      (rejects parallel faces that are set back, e.g. ledges/steps behind the clicked surface)
  * Returns flat vertex array (x,y,z triples), offset 5 cm along cellNormal.
  */
-function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD) {
+function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD, meshType) {
   const pos = srcMesh.geometry.attributes.position.array;
   const uv  = srcMesh.geometry.attributes.uv.array;
+  const faces   = srcMesh.userData.faces;
+  const triFace = srcMesh.userData.triFace;
   const verts = [];
   const OFFSET        = 0.025;
   const COPLANAR_TOL  = 0.15; // 15 cm — rejects steps/ledges, accepts tessellation seams
   const cn = [cellNormal.x, cellNormal.y, cellNormal.z];
 
-  for (let ti = 0; ti < pos.length / 9; ti++) {
+  // When meshType is known, iterate only that half of the merged mesh (roof
+  // tris vs wall tris live in contiguous ranges — see tileWorker
+  // buildMergedMeshData). Cuts per-call cost roughly in half since the other
+  // half is always rejected by the normal-dot filter anyway.
+  const ranges = srcMesh.userData.triRanges;
+  const range  = (meshType && ranges && ranges[meshType]) ? ranges[meshType] : null;
+  const tiStart = range ? range.start : 0;
+  const tiEnd   = range ? range.start + range.count : (pos.length / 9) | 0;
+
+  for (let ti = tiStart; ti < tiEnd; ti++) {
     const pi = ti * 9, ui = ti * 6;
 
     const tri = [
@@ -397,10 +696,29 @@ function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD) {
     poly = clipHalfPlane(poly, 1, cellV + 1, -1);
     if (poly.length < 3) continue;
 
+    // If the owning face was flagged suspicious in the worker (untrustworthy
+    // outside direction), emit the polygon offset on both sides of the plane
+    // so paint is visible regardless of winding. See tileWorker.js makeMeshData.
+    const fi = triFace ? triFace[ti] : -1;
+    const doubleSide = fi >= 0 && faces && faces[fi] && faces[fi].suspicious === 1;
+
     // Fan-triangulate and offset along normal
     for (let k = 1; k < poly.length - 1; k++) {
       for (const v of [poly[0], poly[k], poly[k+1]]) {
-        verts.push(v.pos[0] + cn[0]*OFFSET, v.pos[1] + cn[1]*OFFSET, v.pos[2] + cn[2]*OFFSET);
+        verts.push(
+          v.pos[0] + cn[0]*OFFSET,
+          v.pos[1] + cn[1]*OFFSET,
+          v.pos[2] + cn[2]*OFFSET,
+        );
+      }
+      if (doubleSide) {
+        for (const v of [poly[0], poly[k], poly[k+1]]) {
+          verts.push(
+            v.pos[0] - cn[0]*OFFSET,
+            v.pos[1] - cn[1]*OFFSET,
+            v.pos[2] - cn[2]*OFFSET,
+          );
+        }
       }
     }
   }
@@ -417,10 +735,22 @@ function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD) {
 const cellGeomCache     = new Map(); // cellKey → Float32Array
 const cellGeomByBuilding = new Map(); // buildingKey → Set<cellKey> — so unloads don't scan the whole cache
 
-function rebuildBuildingPaint(srcMesh) {
-  const { buildingId, meshType } = srcMesh.userData;
-  const buildingKey = `${buildingId}:${meshType}`;
+// Paint groups — pre-baked in tileWorker.buildCellGroups. Every member of a
+// group maps to the SAME shared Set instance, so `.get(k)` is O(1) and
+// reference-identical across members (tryPaint/tryErase just iterate the set).
+const cellGroups             = new Map(); // cellKey → Set<cellKey>
+const cellGroupKeysByBuilding = new Map(); // buildingKey → Set<cellKey> — for O(building) unload cleanup
+
+function rebuildBuildingPaint(srcMesh, buildingKey) {
+  // buildingKey comes from the caller (either flushPaintRebuilds or
+  // seedTileCells) because one merged srcMesh covers both roof + wall. The
+  // paint system still keys paint meshes + cellGeomCache by buildingKey, so
+  // each meshType rebuilds independently.
   const prefix = buildingKey + ':';
+  // Extract meshType (part after the building id) so buildCellGeometry on a
+  // cache miss iterates only the matching half of the merged mesh.
+  const colonIdx = buildingKey.indexOf(':');
+  const meshType = colonIdx >= 0 ? buildingKey.slice(colonIdx + 1) : null;
 
   // Remove all existing paint meshes for this building
   const toDelete = [];
@@ -447,7 +777,7 @@ function rebuildBuildingPaint(srcMesh) {
     if (!cellGeomCache.has(k)) {
       const parts = k.slice(prefix.length).split(':');
       const cu = parseInt(parts[0]), cv = parseInt(parts[1]);
-      const verts = buildCellGeometry(srcMesh, cu, cv, new THREE.Vector3(...v.normal), v.planeD);
+      const verts = buildCellGeometry(srcMesh, cu, cv, new THREE.Vector3(...v.normal), v.planeD, meshType);
       cellGeomCache.set(k, new Float32Array(verts));
       let geomSet = cellGeomByBuilding.get(buildingKey);
       if (!geomSet) { geomSet = new Set(); cellGeomByBuilding.set(buildingKey, geomSet); }
@@ -488,7 +818,7 @@ paintStore.subscribe((cellKey) => {
   schedulePaintRebuild(parts.join(':'));
 });
 
-const SEED_FRACTION = 0.2; // fraction of cells to randomly seed on load (applied in tileWorker.js)
+const SEED_FRACTION = 0.1; // fraction of cells to randomly seed on load (applied in tileWorker.js)
 
 // Apply the worker's pre-computed cell data to paint caches. The triangle scan
 // + clipping + seed dice roll all happened off-thread; this pass just copies
@@ -507,36 +837,63 @@ async function seedTileCells(meshes) {
       const srcMesh = meshes[mi];
       if (!srcMesh.parent) continue; // tile was unloaded before we got here
 
-      const cellData = srcMesh.userData.cellData;
-      if (!cellData) continue; // already applied, or wrapped without worker data
+      const perType = srcMesh.userData.cellDataByType;
+      if (!perType) continue; // already applied, or wrapped without worker data
 
-      const { buildingId, meshType } = srcMesh.userData;
-      const bk = `${buildingId}:${meshType}`;
+      const { buildingId } = srcMesh.userData;
 
-      let geomSet = cellGeomByBuilding.get(bk);
-      if (!geomSet) { geomSet = new Set(); cellGeomByBuilding.set(bk, geomSet); }
+      // Iterate each meshType's CellBundle independently — cellKeys, seeds,
+      // and paint-mesh keys are all scoped to (building, meshType).
+      for (const meshType in perType) {
+        const cellData = perType[meshType];
+        const bk = `${buildingId}:${meshType}`;
 
-      const { cellKeys, cellGeoms, seeds } = cellData;
-      for (let i = 0; i < cellKeys.length; i++) {
-        cellGeomCache.set(cellKeys[i], cellGeoms[i]);
-        geomSet.add(cellKeys[i]);
-      }
+        let geomSet = cellGeomByBuilding.get(bk);
+        if (!geomSet) { geomSet = new Set(); cellGeomByBuilding.set(bk, geomSet); }
 
-      for (const s of seeds) {
-        const cellKey = cellKeys[s.idx];
-        if (paintStore.cells.has(cellKey)) continue; // preserve existing (user or prior-session seed)
-        paintStore.seed(cellKey, {
-          color:     s.color,
-          normal:    s.normal,
-          planeD:    s.planeD,
-          paintedAt: now,
-        });
+        const { cellKeys, cellGeoms, seeds, cellGroups: groups } = cellData;
+        for (let i = 0; i < cellKeys.length; i++) {
+          cellGeomCache.set(cellKeys[i], cellGeoms[i]);
+          geomSet.add(cellKeys[i]);
+        }
+
+        // Paint groups — every member of a group points at the same Set instance.
+        if (groups && groups.length) {
+          let groupKeySet = cellGroupKeysByBuilding.get(bk);
+          if (!groupKeySet) { groupKeySet = new Set(); cellGroupKeysByBuilding.set(bk, groupKeySet); }
+          for (const members of groups) {
+            const shared = new Set(members);
+            for (const k of members) {
+              cellGroups.set(k, shared);
+              groupKeySet.add(k);
+            }
+          }
+        }
+
+        // Once a tile has any persisted cells, its seed pattern is locked in —
+        // skip fresh rolls from the worker so reloads don't grow the coverage
+        // with a new ~16% every session.
+        const tileId = paintStore.tileIdOfBuilding(bk);
+        const tileLocked = tileId && paintStore.tileHasSavedData(tileId);
+
+        if (!tileLocked) {
+          for (const s of seeds) {
+            const cellKey = cellKeys[s.idx];
+            if (paintStore.cells.has(cellKey)) continue; // preserve existing (user or prior-session seed)
+            paintStore.seed(cellKey, {
+              color:     s.color,
+              normal:    s.normal,
+              planeD:    s.planeD,
+              paintedAt: now,
+            });
+          }
+        }
+
+        rebuildBuildingPaint(srcMesh, bk);
       }
 
       // Free the bundle — its Float32Arrays now live in cellGeomCache.
-      srcMesh.userData.cellData = null;
-
-      rebuildBuildingPaint(srcMesh);
+      srcMesh.userData.cellDataByType = null;
     }
 
     if (end < meshes.length) await new Promise(r => requestIdleCallback(r, { timeout: 2000 }));
@@ -547,93 +904,70 @@ async function seedTileCells(meshes) {
 
 // ── Paint / erase actions ─────────────────────────────────────────────────────
 
+/**
+ * Given a tentative cellKey built from a raycast hit's face planeD, return
+ * the canonical cellKey in cellGeomCache for the same visual cell. The worker
+ * dedupes overlapping cells by merging them under one anchor face's pdKey —
+ * but a raycast that hits a different face would compute a different pdKey,
+ * so we scan this building's cells for the same (cu, cv) and pick the nearest
+ * pdKey (within 1 bucket = 50 cm of planeD). Bigger gaps mean genuinely
+ * different surfaces that shouldn't be aliased.
+ */
+function canonicalCellKey(buildingKey, cu, cv, pdKey) {
+  const tentative = `${buildingKey}:${cu}:${cv}:${pdKey}`;
+  if (cellGeomCache.has(tentative)) return tentative;
+  const geomSet = cellGeomByBuilding.get(buildingKey);
+  if (!geomSet) return tentative;
+  const targetPrefix = `${buildingKey}:${cu}:${cv}:`;
+  let bestKey = null, bestDist = Infinity;
+  for (const k of geomSet) {
+    if (!k.startsWith(targetPrefix)) continue;
+    const kpd = parseInt(k.slice(targetPrefix.length));
+    const d = Math.abs(kpd - pdKey);
+    if (d < bestDist) { bestDist = d; bestKey = k; }
+  }
+  return bestKey && bestDist <= 1 ? bestKey : tentative;
+}
+
 function hitCell() {
   paintRay.setFromCamera(new THREE.Vector2(0, 0), camera);
   const hits = paintRay.intersectObjects(nearBuildingMeshes, false);
   if (!hits.length || hits[0].distance > PAINT_DIST || !hits[0].uv) return null;
-  const hit    = hits[0];
-  const mesh   = hit.object;
-  const normal = hit.face.normal.clone().transformDirection(mesh.matrixWorld).normalize();
-  return {
-    cellU:  Math.floor(hit.uv.x),
-    cellV:  Math.floor(hit.uv.y),
-    normal,
-    planeD: normal.dot(hit.point), // signed distance of hit surface from origin along normal
-    mesh,
-  };
-}
+  const hit  = hits[0];
+  const mesh = hit.object;
 
-const NEIGHBORS = [[1,0],[-1,0],[0,1],[0,-1]];
-
-/**
- * Resolves the full group of cell keys that should be painted/erased together.
- *
- * Algorithm:
- * 1. Find the canonical (non-sliver) root for the clicked cell by following
- *    the chain: each sliver points to its largest neighbor, transitively.
- * 2. BFS outward through adjacent slivers, including a sliver only if its
- *    own canonical root matches the group's canonical root.
- *
- * This gives disjoint groups (C and D don't cross-contaminate) and handles
- * chains of slivers (E←F←H all collapse to E's group).
- */
-function resolveGroup(h) {
-  const { buildingId, meshType } = h.mesh.userData;
-  const pd = Math.round(h.planeD * 2); // 50 cm buckets — wide enough to match seed-scan keys on non-planar geometry
-  const key = (cu, cv) => `${buildingId}:${meshType}:${cu}:${cv}:${pd}`;
-  const areaCache = new Map();
-  const getArea = (cu, cv) => {
-    const k = `${cu},${cv}`;
-    if (!areaCache.has(k)) {
-      // Use pre-clipped geometry from the seed-scan cache when available — avoids
-      // a full triangle scan for every neighbour cell during BFS.
-      const cacheKey = key(cu, cv);
-      const cached = cellGeomCache.get(cacheKey);
-      const area = cached
-        ? geomArea(cached)
-        : geomArea(buildCellGeometry(h.mesh, cu, cv, h.normal, h.planeD));
-      areaCache.set(k, area);
-    }
-    return areaCache.get(k);
-  };
-
-  // Follow the chain of "largest neighbor" until we reach a non-sliver cell.
-  function findCanonical(cu, cv, seen = new Set()) {
-    const k = `${cu},${cv}`;
-    if (seen.has(k)) return [cu, cv];
-    seen.add(k);
-    if (getArea(cu, cv) >= SMALL_CELL_AREA) return [cu, cv];
-    let bestU = cu, bestV = cv, best = getArea(cu, cv);
-    for (const [du, dv] of NEIGHBORS) {
-      const a = getArea(cu+du, cv+dv);
-      if (a > best) { best = a; bestU = cu+du; bestV = cv+dv; }
-    }
-    if (bestU === cu && bestV === cv) return [cu, cv]; // no bigger neighbor
-    return findCanonical(bestU, bestV, seen);
+  // Prefer the face's averaged normal + planeD when available. The worker's
+  // seed cache generates cellKeys from face.planeD; using per-triangle planeD
+  // here would round into a different 50 cm bucket for any triangle whose
+  // normal drifted slightly from the face average. Worker dedupe then anchors
+  // the cell on one face's pdKey; canonicalCellKey below redirects any
+  // neighboring pdKey onto that anchor.
+  let normal, planeD;
+  const faces   = mesh.userData.faces;
+  const triFace = mesh.userData.triFace;
+  const fi = (faces && triFace) ? triFace[hit.faceIndex] : -1;
+  if (fi >= 0) {
+    const f = faces[fi];
+    normal = new THREE.Vector3(f.normal[0], f.normal[1], f.normal[2])
+      .transformDirection(mesh.matrixWorld).normalize();
+    planeD = f.planeD;
+  } else {
+    normal = hit.face.normal.clone().transformDirection(mesh.matrixWorld).normalize();
+    planeD = normal.dot(hit.point);
   }
 
-  const [canonU, canonV] = findCanonical(h.cellU, h.cellV);
-  const group = new Set([key(canonU, canonV)]);
+  const cellU = Math.floor(hit.uv.x);
+  const cellV = Math.floor(hit.uv.y);
+  const pd    = Math.round(planeD * 2);
+  const { buildingId } = mesh.userData;
+  // meshType lives on each face now (merged mesh holds both roof + wall).
+  // Fallback infers from normal for degenerate-triangle hits where fi < 0.
+  const meshType = (fi >= 0 && faces && faces[fi] && faces[fi].meshType)
+    ? faces[fi].meshType
+    : (Math.abs(normal.y) > 0.5 ? 'roof' : 'wall');
+  const cellKey = canonicalCellKey(`${buildingId}:${meshType}`, cellU, cellV, pd);
 
-  // BFS through adjacent slivers, keeping only those whose canonical matches.
-  const bfsVisited = new Set([`${canonU},${canonV}`]);
-  const queue = [[canonU, canonV]];
-  while (queue.length > 0) {
-    const [cu, cv] = queue.shift();
-    for (const [du, dv] of NEIGHBORS) {
-      const nu = cu+du, nv = cv+dv;
-      const nk = `${nu},${nv}`;
-      if (bfsVisited.has(nk)) continue;
-      bfsVisited.add(nk);
-      if (getArea(nu, nv) >= SMALL_CELL_AREA) continue; // not a sliver
-      const [scU, scV] = findCanonical(nu, nv);
-      if (scU === canonU && scV === canonV) {
-        group.add(key(nu, nv));
-        queue.push([nu, nv]); // explore this sliver's neighbors too
-      }
-    }
-  }
-  return group;
+  return { cellU, cellV, normal, planeD, mesh, cellKey };
 }
 
 function tryPaint() {
@@ -641,42 +975,39 @@ function tryPaint() {
   if (activeColor.isErase) { tryErase(); return; }
   const h = hitCell();
   if (!h) return;
-  const { buildingId, meshType } = h.mesh.userData;
   const cellData = { color: activeColor.hex, normal: h.normal.toArray(), planeD: h.planeD, paintedAt: Date.now() };
-  const pd = Math.round(h.planeD * 2);
-  const mainKey = `${buildingId}:${meshType}:${h.cellU}:${h.cellV}:${pd}`;
 
-  // Paint the primary cell immediately so it appears this frame.
-  paintStore.paint(mainKey, cellData);
+  // Paint the primary cell immediately so it appears this frame. h.cellKey
+  // has already been canonicalized, so painting here replaces whatever was
+  // stored for this visual cell rather than creating a sibling entry.
+  paintStore.paint(h.cellKey, cellData);
 
-  // Resolve adjacent slivers off the critical path — runs after the frame renders.
-  setTimeout(() => {
-    try {
-      const group = resolveGroup(h);
-      group.delete(mainKey);
-      if (group.size) paintStore.paintBatch([...group].map(k => [k, cellData]));
-    } catch (e) { console.warn('resolveGroup:', e); }
-  }, 0);
+  // Paint-group members are pre-baked by the tile worker. Defer the batch so
+  // the primary cell renders this frame without competing for it.
+  const group = cellGroups.get(h.cellKey);
+  if (group && group.size > 1) {
+    setTimeout(() => {
+      const others = [];
+      for (const k of group) if (k !== h.cellKey) others.push([k, cellData]);
+      if (others.length) paintStore.paintBatch(others);
+    }, 0);
+  }
 }
 
 function tryErase() {
   const h = hitCell();
   if (!h) return;
-  const { buildingId, meshType } = h.mesh.userData;
-  const pd = Math.round(h.planeD * 2);
-  const mainKey = `${buildingId}:${meshType}:${h.cellU}:${h.cellV}:${pd}`;
 
-  // Erase the primary cell immediately.
-  paintStore.erase(mainKey);
+  paintStore.erase(h.cellKey);
 
-  // Resolve and erase adjacent slivers off the critical path.
-  setTimeout(() => {
-    try {
-      const group = resolveGroup(h);
-      group.delete(mainKey);
-      if (group.size) paintStore.eraseBatch([...group]);
-    } catch (e) { console.warn('resolveGroup:', e); }
-  }, 0);
+  const group = cellGroups.get(h.cellKey);
+  if (group && group.size > 1) {
+    setTimeout(() => {
+      const others = [];
+      for (const k of group) if (k !== h.cellKey) others.push(k);
+      if (others.length) paintStore.eraseBatch(others);
+    }, 0);
+  }
 }
 
 // ─── Movement ─────────────────────────────────────────────────────────────────
@@ -685,20 +1016,113 @@ let lastTime = performance.now();
 
 const _fwd  = new THREE.Vector3();
 const _right = new THREE.Vector3();
-const _xDir  = new THREE.Vector3();
-const _zDir  = new THREE.Vector3();
 
-// Y offsets from camera (eye) position that we cast horizontal rays at.
-// Spans the full body: eye → near-feet, so short ledges are caught.
-const WALL_Y_OFFSETS = [0, -0.9, -1.8, -(WALK_HEIGHT - 0.15)];
-const _wallOrigins   = WALL_Y_OFFSETS.map(() => new THREE.Vector3());
+// Y offsets from the eye at which we sample the capsule. Each sample resolves
+// as a sphere of PLAYER_RADIUS against nearby triangles — together they span
+// eye → near-feet so short ledges and low overhangs are caught.
+const CAPSULE_SAMPLE_OFFSETS = [0, -0.9, -1.8, -(WALK_HEIGHT - 0.15)];
 
-const _PUSH_DIRS = [
-  new THREE.Vector3( 1, 0, 0),
-  new THREE.Vector3(-1, 0, 0),
-  new THREE.Vector3( 0, 0, 1),
-  new THREE.Vector3( 0, 0,-1),
-];
+// Reusable temps for resolveCapsule.
+const _capA = new THREE.Vector3();
+const _capB = new THREE.Vector3();
+const _capC = new THREE.Vector3();
+const _capP = new THREE.Vector3();
+const _capClosest = new THREE.Vector3();
+
+const MAX_CAPSULE_ITERS = 4;
+
+// Push the player out of any building triangle that intersects the capsule.
+// Horizontal-only ejection: vertical movement is handled by gravity /
+// surfaceBelow. Iterates a few times so multi-contact corners settle.
+function resolveCapsule(pos) {
+  const r = PLAYER_RADIUS;
+  const r2 = r * r;
+  const lastOff = CAPSULE_SAMPLE_OFFSETS[CAPSULE_SAMPLE_OFFSETS.length - 1];
+  const feetY = pos.y - WALK_HEIGHT;
+
+  for (let iter = 0; iter < MAX_CAPSULE_ITERS; iter++) {
+    let moved = false;
+
+    const capMinX = pos.x - r, capMaxX = pos.x + r;
+    const capMinZ = pos.z - r, capMaxZ = pos.z + r;
+    const capMinY = pos.y + lastOff - r;
+    const capMaxY = pos.y + r;
+
+    for (const mesh of nearBuildingMeshes) {
+      const bb = mesh.geometry.boundingBox;
+      if (!bb) continue;
+      if (capMaxX < bb.min.x || capMinX > bb.max.x) continue;
+      if (capMaxY < bb.min.y || capMinY > bb.max.y) continue;
+      if (capMaxZ < bb.min.z || capMinZ > bb.max.z) continue;
+
+      const posAttr = mesh.geometry.getAttribute('position');
+      const arr = posAttr.array;
+      const triCount = posAttr.count / 3;
+
+      for (let ti = 0; ti < triCount; ti++) {
+        const i0 = ti * 9;
+        const ax = arr[i0],     ay = arr[i0 + 1], az = arr[i0 + 2];
+        const bx = arr[i0 + 3], by = arr[i0 + 4], bz = arr[i0 + 5];
+        const cx = arr[i0 + 6], cy = arr[i0 + 7], cz = arr[i0 + 8];
+
+        if (Math.min(ax, bx, cx) > capMaxX || Math.max(ax, bx, cx) < capMinX) continue;
+        if (Math.min(ay, by, cy) > capMaxY || Math.max(ay, by, cy) < capMinY) continue;
+        if (Math.min(az, bz, cz) > capMaxZ || Math.max(az, bz, cz) < capMinZ) continue;
+
+        // Skip near-horizontal triangles (roofs, floors). Landing and
+        // standing on these is handled by gravity / surfaceBelow; letting
+        // them contribute to horizontal push causes the player to get
+        // ejected sideways when standing near the seam between rooftops
+        // of slightly different heights.
+        const ex1 = bx - ax, ey1 = by - ay, ez1 = bz - az;
+        const ex2 = cx - ax, ey2 = cy - ay, ez2 = cz - az;
+        const nx = ey1 * ez2 - ez1 * ey2;
+        const ny = ez1 * ex2 - ex1 * ez2;
+        const nz = ex1 * ey2 - ey1 * ex2;
+        const nLen2 = nx * nx + ny * ny + nz * nz;
+        if (nLen2 < 1e-10) continue;
+        // Skip if the face is within 30° of horizontal (normal within 30°
+        // of vertical). cos(30°)² ≈ 0.75 → |ny|²/|n|² > 0.75.
+        if ((ny * ny) / nLen2 > 0.75) continue;
+
+        _capA.set(ax, ay, az);
+        _capB.set(bx, by, bz);
+        _capC.set(cx, cy, cz);
+
+        for (let yi = 0; yi < CAPSULE_SAMPLE_OFFSETS.length; yi++) {
+          _capP.set(pos.x, pos.y + CAPSULE_SAMPLE_OFFSETS[yi], pos.z);
+          closestPointOnTriangle(_capP, _capA, _capB, _capC, _capClosest);
+          // Skip contacts whose closest point is at or below the player's
+          // feet. That's the top edge of a wall running up to the roof we're
+          // standing on (our own walls, or a neighbor's lower walls) — the
+          // player should be able to walk right up to and off the edge.
+          if (_capClosest.y < feetY + 0.1) continue;
+          // Push using true 3D separation but project the push horizontally —
+          // this keeps narrow-gap corner ejection while preventing a huge
+          // horizontal shove from a contact that is mostly vertical.
+          const ddx = _capP.x - _capClosest.x;
+          const ddy = _capP.y - _capClosest.y;
+          const ddz = _capP.z - _capClosest.z;
+          const d2 = ddx * ddx + ddy * ddy + ddz * ddz;
+          if (d2 < r2 && d2 > 1e-8) {
+            const d = Math.sqrt(d2);
+            const push = (r - d) / d;
+            pos.x += ddx * push;
+            pos.z += ddz * push;
+            moved = true;
+          }
+        }
+      }
+    }
+    if (!moved) break;
+  }
+}
+
+// Smoothed fly-mode velocity (m/s). Lerps toward the target velocity built
+// from input each frame so starting/stopping movement in the air ramps in
+// instead of snapping. Walk mode bypasses this and resets it to zero.
+const _flyVel = new THREE.Vector3();
+const FLY_SMOOTH_TAU = 0.10; // seconds — ~250ms to reach ~92% of target
 
 function updateMovement() {
   const now = performance.now();
@@ -721,56 +1145,80 @@ function updateMovement() {
   // right = cross(fwd, up) = (-fwd.z, 0, fwd.x)
   _right.set(-_fwd.z, 0, _fwd.x);
 
-  let dx = 0, dz = 0;
-  if (keys['KeyW'] || keys['ArrowUp'])    { dx += _fwd.x;   dz += _fwd.z; }
-  if (keys['KeyS'] || keys['ArrowDown'])  { dx -= _fwd.x;   dz -= _fwd.z; }
-  if (keys['KeyA'] || keys['ArrowLeft'])  { dx -= _right.x; dz -= _right.z; }
-  if (keys['KeyD'] || keys['ArrowRight']) { dx += _right.x; dz += _right.z; }
+  // Target horizontal velocity (m/s) from input.
+  let tvx = 0, tvz = 0;
+  if (keys['KeyW'] || keys['ArrowUp'])    { tvx += _fwd.x;   tvz += _fwd.z; }
+  if (keys['KeyS'] || keys['ArrowDown'])  { tvx -= _fwd.x;   tvz -= _fwd.z; }
+  if (keys['KeyA'] || keys['ArrowLeft'])  { tvx -= _right.x; tvz -= _right.z; }
+  if (keys['KeyD'] || keys['ArrowRight']) { tvx += _right.x; tvz += _right.z; }
 
-  const hLen = Math.sqrt(dx * dx + dz * dz);
+  const hLen = Math.sqrt(tvx * tvx + tvz * tvz);
   if (hLen > 0) {
-    dx = (dx / hLen) * speed * dt;
-    dz = (dz / hLen) * speed * dt;
+    tvx = (tvx / hLen) * speed;
+    tvz = (tvz / hLen) * speed;
   }
 
-  // Axis-separated wall collision (allows wall-sliding)
-  if (Math.abs(dx) > 0.0001) {
-    _xDir.set(Math.sign(dx), 0, 0);
-    if (canMoveAxis(camera.position, _xDir, Math.abs(dx))) camera.position.x += dx;
-  }
-  if (Math.abs(dz) > 0.0001) {
-    _zDir.set(0, 0, Math.sign(dz));
-    if (canMoveAxis(camera.position, _zDir, Math.abs(dz))) camera.position.z += dz;
+  // Target vertical velocity (m/s). Walk mode handles gravity below; in fly
+  // mode Space/Shift are direct vertical input.
+  let tvy = 0;
+  if (isFlying) {
+    if (keys['Space'])                            tvy += FLY_VERT * flyBoost;
+    if (keys['ShiftLeft'] || keys['ShiftRight'])  tvy -= FLY_VERT * flyBoost;
   }
 
-  // Push out of any wall the player has sunk into (e.g. after descending into geometry)
-  for (const dir of _PUSH_DIRS) {
-    for (let i = 0; i < WALL_Y_OFFSETS.length; i++) {
-      _wallOrigins[i].set(camera.position.x, camera.position.y + WALL_Y_OFFSETS[i], camera.position.z);
-      wallRay.set(_wallOrigins[i], dir);
-      wallRay.far = PLAYER_RADIUS;
-      const hits = wallRay.intersectObjects(nearBuildingMeshes, false);
-      if (hits.length > 0 && hits[0].distance < PLAYER_RADIUS) {
-        camera.position.addScaledVector(dir, hits[0].distance - PLAYER_RADIUS);
-        break;
-      }
-    }
+  let dx, dz, dy;
+  if (isFlying) {
+    // Exponential smoothing toward the input-driven target velocity. This is
+    // what gives the brief "ease in / ease out" feel when starting or
+    // stopping in the air.
+    const a = 1 - Math.exp(-dt / FLY_SMOOTH_TAU);
+    _flyVel.x += (tvx - _flyVel.x) * a;
+    _flyVel.y += (tvy - _flyVel.y) * a;
+    _flyVel.z += (tvz - _flyVel.z) * a;
+    dx = _flyVel.x * dt;
+    dy = _flyVel.y * dt;
+    dz = _flyVel.z * dt;
+  } else {
+    // Walking is intentionally snappy.
+    _flyVel.set(0, 0, 0);
+    dx = tvx * dt;
+    dz = tvz * dt;
+    dy = 0; // gravity handled below
   }
+
+  // Capsule collision: apply full horizontal delta, then let resolveCapsule
+  // push us out of any overlapping triangles. Corners eject along the
+  // contact normal so narrow gaps push the player sideways at the entrance
+  // instead of letting them wedge in.
+  const prevX = camera.position.x;
+  const prevZ = camera.position.z;
+  camera.position.x += dx;
+  camera.position.z += dz;
+  resolveCapsule(camera.position);
+  // If the resolver reversed our intended motion on an axis, zero the
+  // smoothed fly velocity so it doesn't keep accumulating against the wall.
+  const actualDx = camera.position.x - prevX;
+  const actualDz = camera.position.z - prevZ;
+  if (dx !== 0 && actualDx * dx < 0) _flyVel.x = 0;
+  if (dz !== 0 && actualDz * dz < 0) _flyVel.z = 0;
 
   // ── Vertical ────────────────────────────────────────────────────────────────
 
   if (isFlying) {
     velY = 0;
-    // Space: ascend freely (intentionally allows clipping through ceilings to escape buildings)
-    if (keys['Space']) camera.position.y += FLY_VERT * flyBoost * dt;
-    // Shift: descend, but block at any surface below (including ground)
-    if (keys['ShiftLeft'] || keys['ShiftRight']) {
-      const dy = FLY_VERT * flyBoost * dt;
+    // Ascending (dy > 0) is unblocked — intentionally allows clipping through
+    // ceilings to escape buildings. Descending (dy < 0) is blocked by any
+    // surface below, so the smoothed velocity gets zeroed when we hit ground.
+    if (dy > 0) {
+      camera.position.y += dy;
+    } else if (dy < 0) {
+      const drop = -dy;
       const footOrigin = new THREE.Vector3(camera.position.x, camera.position.y - WALK_HEIGHT + 0.05, camera.position.z);
       downRay.set(footOrigin, DOWN);
-      downRay.far = dy + 0.1;
+      downRay.far = drop + 0.1;
       const hits = downRay.intersectObjects(nearCollidables, false);
-      if (hits.length === 0 || hits[0].distance > dy) camera.position.y -= dy;
+      if (hits.length === 0 || hits[0].distance > drop) camera.position.y += dy;
+      else _flyVel.y = 0;
     }
     camera.position.y = Math.max(WALK_HEIGHT, camera.position.y);
   } else {
@@ -799,13 +1247,11 @@ function updateMovement() {
 
   // ── HUD ─────────────────────────────────────────────────────────────────────
   hud.textContent = isFlying
-    ? 'Financial District, NYC  ✦ flying'
-    : 'Financial District, NYC';
+    ? 'Graffiti NYC  ✦ flying'
+    : 'Graffiti NYC';
 }
 
 // ─── Buildings ────────────────────────────────────────────────────────────────
-
-const status = document.getElementById('status');
 
 // Maps "buildingId:meshType" → mesh so paint overlays can look up source geometry.
 const buildingMeshMap = new Map();
@@ -858,9 +1304,9 @@ function finishTeleportLoad() {
   if (!teleporting) return;
   teleporting = false;
   overlay.classList.remove('loading');
+  overlayPrompt.textContent = 'Click to explore';
   randomBtn.disabled = false;
   snapToSafeStart();
-  setTimeout(() => { status.textContent = ''; }, 3000);
 }
 
 const tileManager = new TileManager({
@@ -870,6 +1316,8 @@ const tileManager = new TileManager({
   buildingMeshMap,
   cellGeomCache,
   cellGeomByBuilding,
+  cellGroups,
+  cellGroupKeysByBuilding,
   buildingPaintMeshes,
   buildingPaintMeshByBuilding,
   paintGroup,
@@ -882,17 +1330,17 @@ const tileManager = new TileManager({
     if (!firstTileLoaded && tilesLoadedCount >= TILES_NEEDED) {
       firstTileLoaded = true;
       overlay.classList.remove('loading');
+      overlayPrompt.textContent = 'Click to explore';
       randomBtn.disabled = false;
       snapToSafeStart();
-      setTimeout(() => { status.textContent = ''; }, 3000);
     }
     if (teleporting && tileManager.allNearbyTilesLoaded(camera.position.x, camera.position.z)) {
       finishTeleportLoad();
     }
   },
   onTileCellData(meshes) {
-    // Phase 2 — worker's seed scan result is now on mesh.userData.cellData.
-    // Populate cellGeomCache and apply seeded paint.
+    // Phase 2 — worker's seed scan result is now on mesh.userData.cellDataByType,
+    // keyed by meshType. Populate cellGeomCache and apply seeded paint.
     seedTileCells(meshes);
   },
   onTileUnloaded() {
@@ -900,7 +1348,6 @@ const tileManager = new TileManager({
   },
 });
 
-status.textContent = 'Loading buildings…';
 tileManager.init('/tiles/manifest.json');
 
 // OSM overlay — streets, water, and green spaces rendered as flat meshes on
@@ -912,15 +1359,29 @@ osmManager.init('/osm/manifest.json');
 
 const _minimapDir = new THREE.Vector3();
 
-function animate() {
+// Cap the render loop to 60 Hz even on high-refresh monitors. Browsers' RAF
+// fires at the monitor's refresh rate (often 120/144/165 Hz), doing work we
+// don't need for this game. The 0.5 ms epsilon keeps ~60 fps stable against
+// RAF timing jitter (without it the integer divisor occasionally drops to 59).
+const FRAME_INTERVAL = 1000 / 60 - 0.5;
+let _lastFrameTime = 0;
+
+function animate(now) {
   requestAnimationFrame(animate);
+  if (now - _lastFrameTime < FRAME_INTERVAL) return;
+  _lastFrameTime = now;
+  tickFps(now);
+
   tileManager.tick(camera.position.x, camera.position.z);
   osmManager.tick(camera.position.x, camera.position.z);
   maybeCull();
   updateMovement();
+  ground.position.x = camera.position.x;
+  ground.position.z = camera.position.z;
   camera.getWorldDirection(_minimapDir);
   updateMinimap(camera.position.x, camera.position.z, Math.atan2(_minimapDir.x, -_minimapDir.z));
+  updateDebugHud();
   renderer.render(scene, camera);
 }
 
-animate();
+animate(0);

@@ -1,4 +1,6 @@
+import * as THREE from 'three';
 import { wrapMeshData } from './loadCityGML.js';
+import { paintStore } from './paintStore.js';
 
 // A tile is loaded when the player is within this distance of its AABB edge.
 const TILE_LOAD_RADIUS   = 200; // metres
@@ -21,8 +23,9 @@ const MAX_CONCURRENT_LOADS = 3;
  * the tile's world-space AABB, and unloaded when beyond TILE_UNLOAD_RADIUS.
  * The hysteresis gap (150 m) prevents flicker at tile boundaries.
  *
- * Paint data in localStorage is never touched on unload — graffiti survives
- * tile reload because paintStore.cells is keyed by buildingId which persists.
+ * Paint data is fetched per tile from /api/paint/:tileId when a tile loads
+ * (see paintStore.loadTile) and flushed back with a PUT when a tile unloads,
+ * so graffiti survives reloads without round-tripping through the client.
  */
 export class TileManager {
   /**
@@ -33,6 +36,8 @@ export class TileManager {
    * @param {Map}          deps.buildingMeshMap   — "buildingId:meshType" → mesh
    * @param {Map}          deps.cellGeomCache     — cellKey → Float32Array
    * @param {Map}          deps.cellGeomByBuilding — "buildingId:meshType" → Set<cellKey>
+   * @param {Map}          deps.cellGroups        — cellKey → shared Set<cellKey> (paint group)
+   * @param {Map}          deps.cellGroupKeysByBuilding — "buildingId:meshType" → Set<cellKey> (for unload cleanup)
    * @param {Map}          deps.buildingPaintMeshes — "buildingId:meshType|color" → mesh
    * @param {Map}          deps.buildingPaintMeshByBuilding — "buildingId:meshType" → Set<mesh>
    * @param {THREE.Group}  deps.paintGroup
@@ -48,6 +53,8 @@ export class TileManager {
     this._buildingMeshMap     = deps.buildingMeshMap;
     this._cellGeomCache       = deps.cellGeomCache;
     this._cellGeomByBuilding  = deps.cellGeomByBuilding;
+    this._cellGroups               = deps.cellGroups;
+    this._cellGroupKeysByBuilding  = deps.cellGroupKeysByBuilding;
     this._buildingPaintMeshes          = deps.buildingPaintMeshes;
     this._buildingPaintMeshByBuilding  = deps.buildingPaintMeshByBuilding;
     this._paintGroup                   = deps.paintGroup;
@@ -112,22 +119,36 @@ export class TileManager {
     this._applyCellDataToTile(tile, cellData);
   }
 
-  _applyCellDataToTile(tile, cellData) {
-    // Match CellBundle → mesh by buildingId:meshType. Ordering between the
-    // worker's and main's mesh arrays isn't guaranteed to be identical.
-    const meshByKey = new Map();
+  async _applyCellDataToTile(tile, cellData) {
+    // One merged mesh per building now holds both meshTypes (tileWorker
+    // buildMergedMeshData). Match CellBundle → mesh by buildingId only, and
+    // stash per-meshType cellData as `cellDataByType[meshType]` so
+    // seedTileCells can iterate both without overwriting.
+    const meshByBuildingId = new Map();
     for (const m of tile.meshes) {
-      meshByKey.set(`${m.userData.buildingId}:${m.userData.meshType}`, m);
+      meshByBuildingId.set(m.userData.buildingId, m);
     }
     for (const cd of cellData) {
-      const mesh = meshByKey.get(`${cd.buildingId}:${cd.meshType}`);
+      const mesh = meshByBuildingId.get(cd.buildingId);
       if (!mesh) continue;
-      mesh.userData.cellData = {
-        cellKeys:  cd.cellKeys,
-        cellGeoms: cd.cellGeoms,
-        seeds:     cd.seeds,
+      if (!mesh.userData.cellDataByType) mesh.userData.cellDataByType = {};
+      mesh.userData.cellDataByType[cd.meshType] = {
+        cellKeys:   cd.cellKeys,
+        cellGeoms:  cd.cellGeoms,
+        seeds:      cd.seeds,
+        cellGroups: cd.cellGroups,
       };
     }
+
+    // Wait for server-saved paint to land before letting seedTileCells run —
+    // otherwise fresh seeds get saved as authoritative state and any cells
+    // that were already stored on the server would be overwritten.
+    if (tile._paintLoadPromise) {
+      try { await tile._paintLoadPromise; }
+      catch (e) { console.warn(`TileManager: paint load for ${tile.id} failed:`, e); }
+    }
+    if (tile.status === 'unloaded') return; // drifted out of range while we awaited
+
     if (this._onTileCellData) this._onTileCellData(tile.meshes);
   }
 
@@ -217,6 +238,35 @@ export class TileManager {
   }
 
   /**
+   * Shortest distance (metres) from (x, z) to the AABB of any finite-bounds
+   * manifest tile. Building tile AABBs are tight around their buildings, so
+   * this doubles as a "is this point near a building?" proxy — used by the
+   * street-spawn picker to reject points stranded in open space. Queries a
+   * 3×3 neighbourhood of the coarse spatial index; Infinity if none in range.
+   */
+  distanceToNearestBuildingTile(x, z) {
+    const pgx = Math.floor(x / COARSE_GRID);
+    const pgz = Math.floor(z / COARSE_GRID);
+    let min2 = Infinity;
+    const seen = new Set();
+    for (let dx = -1; dx <= 1; dx++) {
+      for (let dz = -1; dz <= 1; dz++) {
+        const bucket = this._spatialIndex.get(`${pgx + dx},${pgz + dz}`);
+        if (!bucket) continue;
+        for (const tile of bucket) {
+          if (seen.has(tile)) continue;
+          seen.add(tile);
+          const b = tile.bounds;
+          if (!isFinite(b.minX)) continue;
+          const d2 = _closestDist2(x, z, b);
+          if (d2 < min2) min2 = d2;
+        }
+      }
+    }
+    return Math.sqrt(min2);
+  }
+
+  /**
    * Call once per frame from the render loop. Cheap: AABB distance checks on
    * a small spatial neighbourhood instead of the full manifest.
    * Starts async loads/unloads as needed.
@@ -265,6 +315,17 @@ export class TileManager {
     // Always check tiles with infinite/special bounds (fallback tile).
     for (const tile of this._alwaysCheck) {
       this._checkTile(tile, loadR2, unloadR2, px, pz);
+    }
+  }
+
+  /**
+   * Iterate loaded tiles — yields `{ bounds, group, meshes }` via the tile
+   * state object. Used by main.js#updateCulling to short-circuit out-of-range
+   * tiles at the group level before walking individual meshes.
+   */
+  *tiles() {
+    for (const tile of this._tiles.values()) {
+      if (tile.status === 'loaded' && tile.group) yield tile;
     }
   }
 
@@ -338,6 +399,14 @@ export class TileManager {
       const tReceived = performance.now();
       performance.measure('tile:wait', { start: tLoad, end: tReceived });
 
+      // One Group per tile lets the renderer short-circuit scene traversal for
+      // out-of-range tiles via a single group.visible=false (main.js#updateCulling),
+      // instead of walking every invisible mesh individually every frame.
+      const tileGroup = new THREE.Group();
+      tileGroup.name = `tile:${tile.id}`;
+      tile.group = tileGroup;
+      this._scene.add(tileGroup);
+
       const CHUNK  = 20;
       const meshes = [];
       for (let start = 0; start < meshDataList.length; start += CHUNK) {
@@ -345,13 +414,14 @@ export class TileManager {
         for (let i = start; i < end; i++) {
           const mesh = wrapMeshData(meshDataList[i]);
           mesh.visible = false; // updateCulling() reveals in-range meshes after load
-          this._scene.add(mesh);
+          tileGroup.add(mesh);
           this._buildingMeshes.push(mesh);
           this._collidables.push(mesh);
-          this._buildingMeshMap.set(
-            `${mesh.userData.buildingId}:${mesh.userData.meshType}`,
-            mesh,
-          );
+          // One merged mesh covers both meshTypes; register each buildingKey
+          // so rebuildBuildingPaint(bk) lookups still resolve to the mesh.
+          for (const bk of mesh.userData.buildingKeys) {
+            this._buildingMeshMap.set(bk, mesh);
+          }
           meshes.push(mesh);
         }
         if (end < meshDataList.length) await new Promise(r => requestIdleCallback(r, { timeout: 100 }));
@@ -360,6 +430,13 @@ export class TileManager {
 
       tile.meshes = meshes;
       tile.status = 'loaded';
+
+      // Kick off the paint fetch in parallel with phase 2. _applyCellDataToTile
+      // awaits this promise before calling onTileCellData, so seedTileCells
+      // runs with server-saved paint already populated in paintStore.
+      const loadBuildingKeys = meshes.flatMap(m => m.userData.buildingKeys);
+      tile._paintLoadPromise = paintStore.loadTile(tile.id, loadBuildingKeys);
+
       this._onTileLoaded(meshes);
 
       // Phase 2 (cellData) may have arrived while we were chunk-wrapping.
@@ -382,16 +459,19 @@ export class TileManager {
 
     // Collect the building keys this tile owns ("buildingId:meshType") — all
     // cleanup indexes are scoped to these keys so we never scan the full maps.
+    // Each merged mesh covers multiple buildingKeys; read them from userData.
     const buildingKeys = [];
     for (const mesh of tile.meshes) {
-      buildingKeys.push(`${mesh.userData.buildingId}:${mesh.userData.meshType}`);
+      for (const bk of mesh.userData.buildingKeys) buildingKeys.push(bk);
     }
 
-    // Remove meshes from scene and dispose GPU resources.
-    for (const mesh of tile.meshes) {
-      this._scene.remove(mesh);
-      mesh.geometry.dispose();
-      // Materials are shared (ROOF_MAT / WALL_MAT) — do not dispose them.
+    // Dispose GPU resources; removing the tile's group from the scene orphans
+    // all meshes in one shot. BUILDING_MAT is shared across all tiles — do
+    // not dispose it.
+    for (const mesh of tile.meshes) mesh.geometry.dispose();
+    if (tile.group) {
+      this._scene.remove(tile.group);
+      tile.group = null;
     }
 
     // Splice tile meshes out of the shared arrays (filter by identity).
@@ -411,6 +491,13 @@ export class TileManager {
         this._cellGeomByBuilding.delete(bk);
       }
 
+      // Same pattern for cellGroups: drop this building's paint-group entries.
+      const groupSet = this._cellGroupKeysByBuilding.get(bk);
+      if (groupSet) {
+        for (const k of groupSet) this._cellGroups.delete(k);
+        this._cellGroupKeysByBuilding.delete(bk);
+      }
+
       // Dispose paint overlay meshes via the per-building mesh set. The
       // "buildingId:meshType|colorHex" key was stashed on each mesh at
       // creation time so we can delete from _buildingPaintMeshes in O(1).
@@ -428,6 +515,13 @@ export class TileManager {
 
     tile.meshes = [];
     tile.status = 'unloaded';
+
+    // Flush any pending save for this tile and drop its cells from paintStore.
+    // Fire-and-forget: the PUT completes in the background; the next loadTile
+    // will re-fetch the server state if the player comes back.
+    tile._paintLoadPromise = null;
+    paintStore.unloadTile(tile.id, buildingKeys);
+
     this._onTileUnloaded();
     performance.measure('tile:unload', { start: tUnload, end: performance.now() });
   }

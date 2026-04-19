@@ -10,7 +10,7 @@ An interactive first-person 3D explorer of NYC's Financial District built on rea
 
 ```
 graffiti/
-├── index.html                  # Entry point — canvas, HUD overlay, crosshair, status text
+├── index.html                  # Entry point — canvas, HUD overlay, crosshair, color bar
 ├── package.json                # three + vite
 │
 ├── src/
@@ -18,7 +18,7 @@ graffiti/
 │   ├── TileManager.js          # Dynamic tile load/unload based on player position
 │   ├── OsmManager.js           # Dynamic OSM-overlay tile load/unload (streets / water / green)
 │   ├── tileWorker.js           # Off-thread fetch + mesh build (UVs, normals, bbox)
-│   ├── paintStore.js           # Cell paint state — localStorage persistence, subscribe() for multiplayer
+│   ├── paintStore.js           # Cell paint state — per-tile server persistence, subscribe() for multiplayer
 │   ├── geo.js                  # lng/lat → local XZ meters (centered on FiDi reference point)
 │   └── loadCityGML.js          # Shared materials + wrapMeshData (MeshData → THREE.Mesh)
 │
@@ -76,22 +76,43 @@ off the main thread, in **two phases** so the spawn gate doesn't wait on the
 expensive seed scan:
 
 - **Phase 1** — mesh build: `fetch` → `JSON.parse` → per-mesh Y-shift + bbox →
-  face-tangent UVs → flat normals. Returns `MeshData` (typed-array buffers
-  ride the `postMessage` transfer list for zero-copy handoff).
+  greedy near-coplanar **face extraction** (normal-dot > 0.9995, plane offset
+  within 15 cm) → **post-merge pass** that re-examines every face pair and
+  merges any whose averaged normals + planes still agree (loosened to 30 cm
+  for the post-merge — greedy ordering can split coplanar triangles into
+  separate faces when an intermediate triangle seeds its own) → per-face
+  face-tangent UVs → flat normals → per-vertex `lineCoord` for shader-drawn
+  face borders → roof + wall for each building are **merged into one MeshData**
+  (`buildMergedMeshData`) so the renderer issues one draw call per building
+  instead of two. Each face carries its `meshType` so main.js recovers it
+  per-triangle via `faces[triFace[ti]].meshType`. Returns one MeshData per
+  building (typed-array buffers ride the `postMessage` transfer list for
+  zero-copy handoff). MeshData carries `triFace` (per-triangle face index),
+  `faces: [{normal, planeD, meshType}, …]`, and `buildingKeys:
+  ['id:roof', 'id:wall']` listing which meshTypes the mesh covers.
 - **Phase 2** — seed scan: per-cell Sutherland-Hodgman triangle clip + random
-  seed dice-roll, run against in-worker snapshots of position+uv. Returns
-  `CellBundle` per mesh (cellKeys + cellGeoms + seeds). Runs in the worker
-  after phase 1's `postMessage` returns, so the main thread wraps + adds
-  meshes to the scene in parallel with the scan.
+  seed dice-roll, run against in-worker snapshots of position+uv. Cell
+  identity uses the face's representative normal/planeD (not the triangle's)
+  so all triangles in a face contribute to the same cells. After discovery,
+  an **overlap dedupe pass** groups cells by `(buildingId, meshType, cu, cv)`
+  and merges entries whose planes are within 30 cm and normals agree (~8°)
+  into a single anchor cellKey — this prevents near-coplanar sibling faces
+  from owning duplicate cells at the same visual position, which would
+  otherwise paint over each other. Returns `CellBundle` per mesh (cellKeys
+  + cellGeoms + seeds). Runs in the worker after phase 1's `postMessage`
+  returns, so the main thread wraps + adds meshes to the scene in parallel
+  with the scan.
 
 On the main thread, `loadCityGML.js#wrapMeshData` allocates a `BufferGeometry`,
-attaches the typed arrays, and picks the shared `ROOF_MAT` / `WALL_MAT`.
+attaches the typed arrays, and uses the shared `BUILDING_MAT`.
 `TileManager._applyCellDataToTile` matches each `CellBundle` to its wrapped
-mesh by `buildingId:meshType` and stashes it on `mesh.userData.cellData`, then
-fires `onTileCellData`. `main.js#seedTileCells` copies each cell's Float32Array
-into `cellGeomCache`, calls `paintStore.seed()` for cells in the seed list that
-aren't already painted, and calls `rebuildBuildingPaint` once per mesh. No
-triangle iteration, no clipping on main — the old bottleneck is gone.
+mesh by `buildingId` (one merged mesh per building) and stashes per-meshType
+entries on `mesh.userData.cellDataByType[meshType]`, then fires
+`onTileCellData`. `main.js#seedTileCells` iterates each mesh's `cellDataByType`,
+copies cell Float32Arrays into `cellGeomCache`, calls `paintStore.seed()` for
+cells in the seed list that aren't already painted, and calls
+`rebuildBuildingPaint(srcMesh, buildingKey)` once per meshType. No triangle
+iteration, no clipping on main — the old bottleneck is gone.
 
 If phase 2 arrives before the main thread has finished chunk-wrapping phase 1,
 `TileManager._handleCellData` stashes the payload on `tile._pendingCellData`
@@ -148,6 +169,13 @@ per-`highway` widths (motorway ≈ 11 m → path ≈ 2 m). Polygon features reus
 the pre-triangulated XZ lists from Python directly as `BufferGeometry.position`
 attributes — no runtime triangulation.
 
+Named streets get a flat label laid along their longest segment
+(`_buildStreetLabels` / `_getLabelAsset`). Labels are built from the bundled
+Helvetiker Bold typeface via `ShapeGeometry` (not a canvas texture), so text
+stays crisp at any viewing distance. A per-name geometry is cached and shared
+across tiles — repeat names only add a mesh transform, not new geometry — and
+labels are dropped if the street segment is too short to fit them.
+
 ---
 
 ## Coordinate System
@@ -172,7 +200,11 @@ attributes — no runtime triangulation.
 | Space (while flying) | Move up |
 | Shift (while flying) | Move down |
 | Q (while flying) | 3× speed boost (horizontal + vertical) |
-| Click "Random location" (unlocked) | Teleport to a random XZ inside a random manifest tile; re-enters the initial "Loading tiles…" overlay until every tile in load range of the new position is loaded, then user clicks to enter |
+| Click "Random location" (unlocked) | Teleport to a random point on an OSM street, constrained to within 50 m of a building tile AABB so the player never lands inside a building interior, in open water, or out on the FDR. Falls back to a random tile XZ if the OSM manifest is unavailable. Re-enters the initial "Loading tiles…" overlay until every tile in load range of the new position is loaded, then user clicks to enter |
+| M | Toggle large minimap — expands the top-right minimap to a square half the shorter viewport axis (≈ a quarter of the screen) and back. Map is north-up; player arrow rotates with heading |
+| F3 | Toggle the debug HUD — top-left overlay showing what the crosshair is hitting: building id, mesh, triangle index, face id, cell coords, canonical cellKey, cache hit/miss + area, paint state, planeD (with tri-vs-face mismatch warning), normal, distance |
+| Ctrl+R / F5 | Soft reload preserves player position, rotation, and fly state via `localStorage` (`graffiti_player_state_v1`) |
+| Ctrl+Shift+R | Hard reload — keydown handler flips a `sessionStorage` flag before the browser reloads; on next load that flag clears the saved state so the player respawns at the default (Times Square) |
 | Esc | Release pointer |
 
 ---
@@ -182,7 +214,7 @@ attributes — no runtime triangulation.
 - **Gravity**: Constant downward acceleration, capped at terminal velocity
 - **Ground/roof detection**: Downward raycast; player lands on buildings and can walk on rooftops
 - **Wall collision**: Per-axis raycasts at two heights (eye level + mid-torso) with wall-sliding. After movement, a push-out pass checks all 4 cardinal directions and ejects the player from any wall they've sunk into (e.g. after descending into geometry).
-- **Fly mode**: Disables gravity; Space ascends (can clip through ceilings to escape buildings); Shift descends but is blocked by any surface below including the ground plane. Q multiplies fly speed 3×.
+- **Fly mode**: Disables gravity; Space ascends (can clip through ceilings to escape buildings); Shift descends but is blocked by any surface below including the ground plane. Q multiplies fly speed 3×. Movement velocity is exponentially smoothed (~100ms time constant) so starting and stopping in the air ease in and out instead of snapping.
 - **Safe spawn**: On load, raycasts outward in 8 directions; walks outward in rings until a clear position is found
 
 ---
@@ -191,7 +223,8 @@ attributes — no runtime triangulation.
 
 - **Engine**: Three.js (WebGL)
 - **Shading**: `MeshToonMaterial` with a 3-step gradient map (hard-edged cel shading)
-- **Grid**: Face-tangent UV projection (axes lie in the face plane) so the 2×2 m grid (`GRID_SIZE = 2.0`, exported from `loadCityGML.js`) is undistorted on walls, flat roofs, and sloped roofs alike. Canvas tile texture with blue grid lines on near-white background. Flat roofs use the building's dominant wall direction (longest horizontal edge in wall geometry) to orient the grid with the building footprint rather than world axes.
+- **Grid**: Face-tangent UV projection (axes lie in the face plane) so the 2×2 m grid (`GRID_SIZE = 2.0`, exported from `loadCityGML.js`) is undistorted on walls, flat roofs, and sloped roofs alike. Canvas tile texture with blue grid lines on near-white background. Flat roofs use the building's dominant wall direction (longest horizontal edge in wall geometry) to orient the grid with the building footprint rather than world axes. UV axes are computed **per extracted face** (not per triangle), so the grid is continuous across triangulation diagonals even when the CityGML source's quads aren't quite coplanar.
+- **Face outlines**: Drawn directly in the wall/roof fragment shader via `onBeforeCompile` injection. A per-vertex `lineCoord` attribute encodes the world-space perpendicular distance to each of the triangle's three edges; internal edges within a face are set to a large sentinel so only real face boundaries emit a line. T-junctions (two same-face polygons sharing a boundary where one side has an extra midpoint vertex the other doesn't) are caught by a fallback that scans for any same-face edge collinear within 2 cm and overlapping by ≥ 1 cm. Thickness (`BORDER_HALF_WIDTH = 0.03 m`) matches the grid texture lines, and `fwidth()`-based screen-space anti-aliasing keeps lines crisp at any camera distance without subpixel flicker.
 - **Buildings**: Separate roof + wall meshes, `DoubleSide`, `castShadow` only (no `receiveShadow` — avoids shadow-acne on triangulated surfaces)
 - **Lighting**: Directional sun (1.8) + ambient (0.35); `PCFSoftShadowMap`
 - **Atmosphere**: Sky-blue background + exponential distance fog
@@ -232,44 +265,67 @@ Each paintable unit is identified by the key `buildingId:meshType:cellU:cellV:pl
 
 - `buildingId` — from the CityGML source (`mesh.userData.buildingId`)
 - `meshType` — `'roof'` or `'wall'`
-- `cellU`, `cellV` — `Math.floor(intersection.uv)` from the Three.js raycast hit. The UV coordinates use the same face-tangent projection as the grid texture (1 UV unit = 2 m), so each integer step corresponds to one visible grid cell.
-- `planeDKey` — `Math.round(planeD * 10)`, where `planeD = normal · hitPoint`. Bucketed to 10 cm so floating-point noise across raycasts produces the same key, while parallel faces at different depths (e.g. a stepped facade) get distinct keys and can be painted independently.
+- `cellU`, `cellV` — `Math.floor(intersection.uv)` from the Three.js raycast hit. The UV coordinates use the same face-tangent projection as the grid texture (1 UV unit = 2 m), so each integer step corresponds to one visible grid cell. Each face's UV origin is shifted so the face sits **centred** within its `ceil(width / GRID_SIZE)` cell span — so the leftmost and rightmost cells end up the same width. A 6.4 m wide face yields cells of width 1.2 / 2 / 2 / 1.2 m instead of 2 / 2 / 2 / 0.4 m. Same cell count, but slivers are bigger and less likely to be unpaintable specks. A 1.3 m cylinder facet becomes a single cu=0 column.
+- `planeDKey` — `Math.round(planeD * 2)`, where `planeD` is the **face's** averaged plane offset (not the per-triangle one — using triangle-local values would round into a different 50 cm bucket for any triangle whose normal drifted slightly from its face average). Bucketed to 50 cm so near-coplanar faces share a key, while parallel faces at different depths (e.g. a stepped facade) get distinct keys and can be painted independently.
 
-### Sliver merging
+`hitCell()` runs the tentative cellKey through `canonicalCellKey()`, which on a `cellGeomCache` miss scans the building's known cells for the same `(cu, cv)` and returns the nearest pdKey within 1 bucket (≈50 cm planeD). This redirects raycast hits onto the worker's overlap-dedupe anchor when the hit face's pdKey isn't the chosen one.
 
-Grid cells near building edges can be very small (e.g. a sliver where the facade meets a step). Cells with area < `GRID_SIZE² × 0.15` (~0.6 m²) are treated as slivers and grouped with nearby full-size cells.
+### Paint groups (sliver + narrow-face absorption)
 
-`resolveGroup(h)` implements this:
-1. Find the **canonical root** for the clicked cell by following a chain of "largest adjacent neighbor" steps until reaching a non-sliver. Handles chains of multiple slivers (e.g. H → F → E all resolve to E).
-2. BFS outward from the root through adjacent slivers, including a sliver only if its own canonical resolves to the same root. This keeps groups disjoint — a sliver adjacent to two different big cells belongs to whichever big cell is its largest neighbor, not both.
+Grid cells near building edges, on chamfered corners, or on cylindrical / many-facet structures can be very small — every cell on a 24-facet cylinder is a narrow sliver, for example. To make these paintable as unified patches rather than fiddly per-click specks, cells with area < `GRID_SIZE² × 0.5` (~2 m²) are grouped with adjacent cells at **tile build time** and painted together at runtime. The threshold is generous on purpose: it's not just true edge slivers but also "narrow but tall" cylinder-facet cells that benefit from being merged.
 
-Painting or erasing any cell in the group affects all cells in the group symmetrically.
+`tileWorker.buildCellGroups` produces the groups. Adjacency is by **shared world-space edge** (vertex pair within 1 cm) computed from each cell's post-dedupe clipped polygon, so groups cross face boundaries naturally. Slivers are processed smallest-first; each tries to join a neighbour's group (or create a new one) subject to four rules:
+
+- **Length:** bbox on each axis of the anchor face's tangent frame ≤ `GRID_SIZE + 0.2` (2.2 m). Tight cap (20 cm slack over a normal cell) lets edge slivers pair with their adjacent full cell on the same face without chaining further.
+- **Angle:** member face normal vs. anchor face normal ≥ `cos 20°`.
+- **Longest-edge-share:** the shared edge between sliver S and candidate N must be ≥ 90% of either cell's longest boundary edge. This bakes in "never merge two long slivers end-to-end" — the short side touching at the ends is nobody's longest edge, so the rule rejects it. Two short slivers sharing their long side → merges.
+- **Cross-face restriction:** if sliver and group anchor are on different faces (different `face.normal` array reference — all cells from one face share the face's normal object), the sliver's narrow dimension must be < 0.1 m (approximated as `area / longest-edge`). Cylinder facets stay singletons (each is already ~its own clean cell after per-face UV centring); thin chamfer slivers can still merge with adjacent walls. The restriction exists because we can't hide the building's underlying face-border line on cross-face merges, so we only do them when that line is short enough not to be visually distracting.
+
+The worker ships `cellGroups: Array<Array<cellKey>>` in the phase-2 `cellData` message. Only groups of size ≥ 2 are sent; singletons are implicit. On the main thread, every member of each group points to one shared `Set<cellKey>` in `cellGroups: Map<cellKey, Set<cellKey>>`, so `tryPaint` / `tryErase` is a single O(1) `.get()` followed by a batch. Groups are cleaned up alongside `cellGeomCache` in `TileManager._unload` via `cellGroupKeysByBuilding`.
+
+After grouping, `buildCellGroups` runs a unified-offset pass: each grouped cell's polygon is re-offset to sit along the **group anchor's** face normal instead of its own. Without this, adjacent cells on different faces (cylinder facets, corners) offset in divergent directions, leaving a ~6 mm V-gap at the seam where the face-border shader line on the building underneath becomes visible. Unified offset makes the paint polygons share an exactly coincident edge at seams, hiding the underlying lines. Members at the far end of a 20° group sit ~2.35 cm above their own face (instead of the usual 2.5 cm) — still safely above z-fighting range.
+
+### Suspicious faces (untrustworthy outside direction)
+
+CityGML occasionally ships faces with inverted winding — most commonly downward-facing roofs, but also inward-pointing walls on irregular buildings. A one-sided 2.5 cm paint offset along a flipped normal would bury the overlay inside the wall. `makeMeshData` flags a face as `suspicious` when either cue holds:
+
+- **Horizontal-toward-center:** the face's horizontal normal component points toward the mesh bbox center (a correctly-wound exterior wall points *away* from center).
+- **Downward-facing:** the face's normal tilts more than 10° below horizontal (`ny < -sin 10°`). Legitimate exterior surfaces don't face downward at any meaningful angle.
+
+For suspicious faces, both `scanCells` (worker, pre-seeded cells) and `buildCellGeometry` (main thread, runtime-painted cells) emit the polygon offset **on both sides** of the face plane. The paint becomes visible regardless of winding, at the cost of a small amount of extra overdraw limited to the suspicious subset.
 
 ### Rendering
 
-When a cell is painted, `buildCellGeometry` clips the building mesh's actual triangles to the cell's UV bounds `[cellU, cellU+1] × [cellV, cellV+1]` using the Sutherland-Hodgman algorithm. Two filters reject off-face triangles: (1) face normal dot product with the hit normal must be > 0.7; (2) triangle centroid must be within 15 cm of the hit plane (`planeD`). The clipped geometry is offset 5 cm along the face normal and rendered as a red `MeshBasicMaterial` mesh.
+For most paint actions, the cell's clipped geometry is already in `cellGeomCache` — the worker pre-clipped every cell during the phase-2 seed scan and offset each polygon 2.5 cm along its face's normal. `rebuildBuildingPaint` reads the cache directly and groups cells by colour into one `MeshBasicMaterial` mesh per (building, colour). When a cell isn't cached (rare — only happens if `paintStore` has data for a cellKey the worker didn't emit), `buildCellGeometry` clips on the fly using the same Sutherland-Hodgman algorithm with two filters: face normal dot product with the hit normal > 0.7, and triangle centroid within 15 cm of `planeD`.
 
 This approach means paint is bounded by the actual surface geometry — edge cells are clipped to the wall boundary rather than hanging over as a full square would.
 
-Each painted cell is a separate `THREE.Mesh`. This is fine for hundreds of cells; the natural upgrade path when needed is to merge all cells on a building into a single geometry (one draw call per building) using `BufferGeometryUtils.mergeGeometries`.
+Per-building paint meshes (one mesh per colour) are tracked in `buildingPaintMeshByBuilding` so `updateCulling()` can toggle them with their parent building when the player moves out of range, and `TileManager._unload` can dispose them in O(1) without scanning the global mesh list.
 
 ### Persistence
 
-`paintStore.js` serialises cell state to `localStorage` as JSON (`graffiti_paint_v2`). Stored cell data: `{ color, normal, planeD, paintedAt }`. On page load, overlays are rebuilt from source geometry after buildings finish loading.
+Paint is stored **per tile** on disk at `data/paint/{tileId}.json` via a Vite dev-server middleware (`scripts/tile-paint-plugin.js`). The client talks to it over two routes:
 
-Writes are **debounced** (`SAVE_DEBOUNCE_MS = 1500`) and flushed on `visibilitychange` / `beforeunload`, so paint actions feel instant — the overlay rebuilds synchronously while the `localStorage` write happens lazily off the critical path.
+- `GET  /api/paint/:tileId` → `{ [cellKey]: cellData }` (empty object if the tile has never been painted)
+- `PUT  /api/paint/:tileId` → body is the full cell map; server overwrites the file
 
-Only **user-painted** cells are serialised. `paintStore` maintains `_persistedKeys: Set<cellKey>` alongside `cells`; `paint`/`paintBatch` add to it, `erase`/`eraseBatch` remove from it, `seed` skips it. `_writeToStorage` iterates `_persistedKeys` rather than the full `cells` map — essential at high `SEED_FRACTION`, where `cells` holds tens of thousands of ephemeral seed entries and stringifying them all would cost 200–400 ms per save.
+Stored cell data: `{ color, normal, planeD, paintedAt }`.
 
-`paintStore` also maintains a `_byBuilding: Map<"buildingId:meshType", Set<cellKey>>` secondary index. `rebuildBuildingPaint` iterates only that building's cells (via `paintStore.cellsForBuilding(buildingKey)`) instead of scanning the full cells map, so rebuild cost scales with cells-per-building rather than total-painted-cells. This is essential at high `SEED_FRACTION` where the in-memory map holds tens of thousands of entries across thousands of buildings.
+`paintStore.loadTile(tileId, buildingKeys)` is called by `TileManager._doLoad` as soon as meshes are wrapped. It synchronously registers a `buildingKey → tileId` mapping and then fetches the tile's cells in the background. `TileManager._applyCellDataToTile` awaits that promise before invoking the phase-2 `onTileCellData` callback, so `seedTileCells` runs with server-saved paint already populated and preserves pre-existing cells instead of overwriting them with freshly-rolled seeds.
 
-Seeded-but-unpainted cells bypass persistence via `paintStore.seed()` — they update the index but skip `localStorage` and skip subscribe listeners (the caller rebuilds the whole building once after seeding).
+`paintStore.unloadTile(tileId, buildingKeys)` is called by `TileManager._unload`; it flushes any pending save for the tile, then drops those cells from memory. Keeps the in-memory map bounded as the player wanders.
+
+Writes are **debounced** (`SAVE_DEBOUNCE_MS = 1500`) per tile. `paint`/`erase`/`seed` mark the owning tile dirty and a single timer flushes every dirty tile on the next tick with a PUT each. On `visibilitychange` we flush with an async fetch; on `beforeunload` we reissue each pending PUT with `keepalive: true` so the write survives page teardown.
+
+Unlike the old localStorage design, seeds now **persist just like user paint**. The first visitor to a tile rolls the seed pattern and saves it; everyone afterward fetches the same cells. `paintStore.seed()` still exists as a separate entry point only because it skips listener dispatch (the caller rebuilds the whole building once after seeding) — the persistence path is identical to `paint()`.
+
+`paintStore` also maintains a `_byBuilding: Map<"buildingId:meshType", Set<cellKey>>` secondary index. `rebuildBuildingPaint` iterates only that building's cells (via `paintStore.cellsForBuilding(buildingKey)`) instead of scanning the full cells map, so rebuild cost scales with cells-per-building rather than total-painted-cells.
 
 Note: the `planeDKey` in the cell key is just for keying; the exact `planeD` float in cell data is used when reconstructing geometry overlays.
 
 ### Multiplayer path
 
-`paintStore.subscribe(fn)` fires `fn(cellKey, cellData)` on every paint, and `fn(cellKey, null)` on every erase. To add real-time sync, emit outgoing events to a WebSocket inside `paint()`/`erase()` and call those same methods when server messages arrive — no caller code changes needed.
+The Vite middleware is a dev-only stepping stone toward a hosted server. Swapping it for a real server is mostly a URL change: the client already fetches and saves per tile over HTTP. Real-time sync adds a WebSocket on top — `paintStore.subscribe(fn)` already fires `fn(cellKey, cellData)` on every paint and `fn(cellKey, null)` on every erase, so incoming server events can call the same `paint()`/`erase()` methods with no caller code changes.
 
 ## Next Steps
 
