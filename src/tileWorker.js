@@ -81,7 +81,13 @@ self.onmessage = async (e) => {
   try {
     const t0 = performance.now();
     const res = await fetch(file);
-    if (!res.ok) throw new Error(`HTTP ${res.status}`);
+    if (!res.ok) throw new Error(res.status === 404 ? 'NOT_READY' : `HTTP ${res.status}`);
+    // Dev servers (Vite) fall back to serving index.html for missing static
+    // files, so a 200 with HTML body means the tile hasn't been built yet.
+    // Detect via content-type before JSON.parse so we can report it cleanly
+    // instead of a spammy "Unexpected token '<'" error.
+    const ct = res.headers.get('content-type') || '';
+    if (!ct.includes('json')) throw new Error('NOT_READY');
     const t1 = performance.now();
     const buildings = await res.json();
     const t2 = performance.now();
@@ -96,11 +102,16 @@ self.onmessage = async (e) => {
     // We also snapshot position+uv and the face data for phase 2 because the
     // originals get their underlying ArrayBuffers transferred out of the
     // worker by postMessage (transfer list detaches them).
+    // Terrain-off (flat) mode shifts each building so its base sits at y=0,
+    // matching the pre-terrain behaviour. Terrain-on mode keeps the raw
+    // NAVD88 elevations from CityGML so buildings sit on the DEM surface.
+    const shiftBuildingsY = !!(seedConfig && seedConfig.shiftBuildingsY);
+
     const meshes       = [];
     const scanInputs   = [];
     const transferMesh = [];
     for (const b of buildings) {
-      const perType = buildMeshDataFromBuilding(b);
+      const perType = buildMeshDataFromBuilding(b, shiftBuildingsY);
       if (perType.length === 0) continue;
 
       // Per-meshType scan inputs for phase 2 (scanCells expects single-meshType data).
@@ -163,13 +174,13 @@ self.onmessage = async (e) => {
 
 // ── Mesh construction ─────────────────────────────────────────────────────────
 
-function buildMeshDataFromBuilding(b) {
+function buildMeshDataFromBuilding(b, shiftY) {
   const minY   = buildingMinY(b.roof, b.walls);
   const horizU = dominantWallDir(b.walls);
   const out = [];
-  const roof = makeMeshData(b.roof,  b.id, minY, horizU, 'roof');
+  const roof = makeMeshData(b.roof,  b.id, minY, horizU, 'roof', shiftY);
   if (roof) out.push(roof);
-  const wall = makeMeshData(b.walls, b.id, minY, null,   'wall');
+  const wall = makeMeshData(b.walls, b.id, minY, null,   'wall', shiftY);
   if (wall) out.push(wall);
   return out;
 }
@@ -310,23 +321,92 @@ function dominantWallDir(walls) {
   return [bestX, bestZ];
 }
 
-function makeMeshData(flatVerts, id, minY, horizU, meshType) {
+// Generic triangle filter. `keep(v, i0)` returns true to keep the triangle at
+// offset i0 in v, false to drop. Logs once per call if anything was dropped.
+// Returns the input unchanged (same reference) when nothing was dropped.
+function filterTriangles(verts, keep, label, id, meshType) {
+  const triCount = (verts.length / 9) | 0;
+  const kept = new Float32Array(verts.length);
+  let writeTri = 0, dropped = 0;
+  for (let ti = 0; ti < triCount; ti++) {
+    const i0 = ti * 9;
+    if (!keep(verts, i0)) { dropped++; continue; }
+    const wi = writeTri * 9;
+    for (let j = 0; j < 9; j++) kept[wi + j] = verts[i0 + j];
+    writeTri++;
+  }
+  if (dropped === 0) return verts;
+  console.log(`[${label}] ${id}:${meshType} dropped ${dropped} of ${triCount}`);
+  return kept.slice(0, writeTri * 9);
+}
+
+// Drop near-horizontal triangles sitting at the building's base. Floor
+// polygons coincide with the terrain beneath and cause z-fighting on both
+// the surface and any paint cells they emit. Invisible to the player either
+// way, so we cut them from the mesh entirely.
+//
+// `floorY` is the building's own minY — floor polys sit within 10 cm of it.
+function dropFloorTriangles(verts, id, meshType, floorY) {
+  const floorTop = floorY + 0.1;
+  return filterTriangles(verts, (v, i0) => {
+    const ay = v[i0 + 1], by = v[i0 + 4], cy = v[i0 + 7];
+    if (ay >= floorTop || by >= floorTop || cy >= floorTop) return true;
+    const ax = v[i0],     az = v[i0 + 2];
+    const bx = v[i0 + 3], bz = v[i0 + 5];
+    const cx = v[i0 + 6], cz = v[i0 + 8];
+    const e1x = bx - ax, e1y = by - ay, e1z = bz - az;
+    const e2x = cx - ax, e2y = cy - ay, e2z = cz - az;
+    const nx = e1y * e2z - e1z * e2y;
+    const ny = e1z * e2x - e1x * e2z;
+    const nz = e1x * e2y - e1y * e2x;
+    const nl = Math.sqrt(nx * nx + ny * ny + nz * nz);
+    return !(nl > 1e-10 && Math.abs(ny / nl) > 0.9);
+  }, 'dropFloorTriangles', id, meshType);
+}
+
+// Rare CityGML glitch: the same polygon is present twice in a building's
+// source data. Canonical triangle key = sorted tuple of three vertices rounded
+// to 1 cm; winding-agnostic.
+function dedupTriangles(verts, id, meshType) {
+  const seen = new Set();
+  return filterTriangles(verts, (v, i0) => {
+    const k0 = `${Math.round(v[i0]     * 100)},${Math.round(v[i0 + 1] * 100)},${Math.round(v[i0 + 2] * 100)}`;
+    const k1 = `${Math.round(v[i0 + 3] * 100)},${Math.round(v[i0 + 4] * 100)},${Math.round(v[i0 + 5] * 100)}`;
+    const k2 = `${Math.round(v[i0 + 6] * 100)},${Math.round(v[i0 + 7] * 100)},${Math.round(v[i0 + 8] * 100)}`;
+    const tri = [k0, k1, k2].sort().join('|');
+    if (seen.has(tri)) return false;
+    seen.add(tri);
+    return true;
+  }, 'dedupTriangles', id, meshType);
+}
+
+function makeMeshData(flatVerts, id, floorY, horizU, meshType, shiftY) {
   if (!flatVerts || flatVerts.length < 9) return null;
 
-  // Shift Y so base sits at y=0 and accumulate bbox in one pass.
+  // Terrain-on: verts keep their CityGML Y (NAVD88) so buildings sit on the
+  // DEM naturally. Terrain-off (`shiftY` true): subtract minY so base sits
+  // at y=0 for the flat ground plane, matching the pre-terrain behaviour.
   const count = flatVerts.length;
-  const verts = new Float32Array(count);
+  let verts = new Float32Array(count);
   let minX =  Infinity, minYo =  Infinity, minZ =  Infinity;
   let maxX = -Infinity, maxYo = -Infinity, maxZ = -Infinity;
+  const yOffset = shiftY ? floorY : 0;
   for (let i = 0; i < count; i += 3) {
     const x = flatVerts[i];
-    const y = flatVerts[i + 1] - minY;
+    const y = flatVerts[i + 1] - yOffset;
     const z = flatVerts[i + 2];
     verts[i] = x; verts[i + 1] = y; verts[i + 2] = z;
     if (x < minX) minX = x; if (x > maxX) maxX = x;
     if (y < minYo) minYo = y; if (y > maxYo) maxYo = y;
     if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
   }
+
+  // Triangle-filter passes. Floor polygons z-fight with the ground mesh;
+  // exact-duplicate triangles z-fight with themselves and split paint into
+  // parallel grids. Both are rare CityGML defects. Bbox stays correct either
+  // way (drops add no new extent).
+  verts = dropFloorTriangles(verts, id, meshType, shiftY ? 0 : floorY);
+  verts = dedupTriangles(verts, id, meshType);
 
   const faceInfo = extractFaces(verts);
 
@@ -804,11 +884,17 @@ function scanCells(pos, uv, buildingId, meshType, seedConfig, faces, triFace, ho
         if (dot3(faceNormal, entry.normal) < 0.7) continue;
         if (Math.abs(facePlaneD - entry.planeD) > COPLANAR_TOL) continue;
 
-        let poly = tri;
-        poly = clipHalfPlane(poly, 0, cu,     +1);
-        poly = clipHalfPlane(poly, 0, cu + 1, -1);
-        poly = clipHalfPlane(poly, 1, cv,     +1);
-        poly = clipHalfPlane(poly, 1, cv + 1, -1);
+        // Early-exit between clips. A triangle spans a cell's UV-bbox but may
+        // miss the cell rectangle itself (diagonal triangles are the common
+        // case). The first clip that leaves <3 vertices means the triangle
+        // doesn't overlap this cell — skip the remaining clips and allocations.
+        let poly = clipHalfPlane(tri,  0, cu,     +1);
+        if (poly.length < 3) continue;
+        poly      = clipHalfPlane(poly, 0, cu + 1, -1);
+        if (poly.length < 3) continue;
+        poly      = clipHalfPlane(poly, 1, cv,     +1);
+        if (poly.length < 3) continue;
+        poly      = clipHalfPlane(poly, 1, cv + 1, -1);
         if (poly.length < 3) continue;
 
         // Offset along the face's normal (not the triangle's) so adjacent
@@ -877,8 +963,31 @@ function scanCells(pos, uv, buildingId, meshType, seedConfig, faces, triFace, ho
 // outside the face thresholds) can still produce cells at the same (cu, cv)
 // with different pdKeys. This pass groups cells by (buildingId:meshType:cu:cv),
 // chains them into near-coplanar sets (plane distance ≤ FACE_DIST_LOOSE,
-// normal-dot ≥ FACE_NDOT_LOOSE against the chain's anchor), and merges each
-// chain into a single entry so exactly one cell owns each visual position.
+// normal-dot ≥ FACE_NDOT_LOOSE, centroid distance ≤ CELL_CENTROID_MAX_DIST
+// against the chain's anchor), and merges each chain into a single entry so
+// exactly one cell owns each visual position.
+//
+// The centroid check is what distinguishes "same visual cell on adjacent
+// faces" from "two cells that share (cu, cv) purely because each face has its
+// own UV origin (computeGridUVs shiftU/shiftV) but live far apart in world
+// space." Without it, two coplanar wall segments on the same facade line —
+// separated by several metres — could both produce cell (cu, cv) and get
+// fused, painting a single click across both segments.
+
+const CELL_CENTROID_MAX_DIST = GRID_SIZE / 2; // 1 m — a full cell is 2 m, so
+                                              // legit same-cell centroids fall
+                                              // well within half a cell even
+                                              // when one side is an edge sliver.
+
+function cellCentroid(verts) {
+  const n = verts.length / 3;
+  if (!n) return [0, 0, 0];
+  let sx = 0, sy = 0, sz = 0;
+  for (let i = 0; i < verts.length; i += 3) {
+    sx += verts[i]; sy += verts[i + 1]; sz += verts[i + 2];
+  }
+  return [sx / n, sy / n, sz / n];
+}
 
 function dedupOverlappingCells(discovered) {
   // Group cells by everything except the pdKey suffix.
@@ -895,17 +1004,28 @@ function dedupOverlappingCells(discovered) {
     if (keys.length < 2) continue;
     keys.sort((a, b) => discovered.get(a).planeD - discovered.get(b).planeD);
 
+    // Cache pre-merge centroids. The anchor's verts grow during absorption,
+    // but we want chain-candidacy to test against the anchor's *original*
+    // centroid so a distant candidate can't be pulled in via transitive
+    // centroid drift.
+    const centroids = new Map();
+    for (const k of keys) centroids.set(k, cellCentroid(discovered.get(k).verts));
+
     // Greedy chaining against each chain's anchor (first member). This avoids
     // transitive merges where A~B and B~C but A and C are too far apart.
     const chains = [];
     for (const k of keys) {
       const e = discovered.get(k);
+      const ec = centroids.get(k);
       let joined = false;
       for (const ch of chains) {
         const a = discovered.get(ch[0]);
         if (Math.abs(e.planeD - a.planeD) > FACE_DIST_LOOSE) continue;
         const nDot = e.normal[0]*a.normal[0] + e.normal[1]*a.normal[1] + e.normal[2]*a.normal[2];
         if (nDot < FACE_NDOT_LOOSE) continue;
+        const ac = centroids.get(ch[0]);
+        const dx = ec[0] - ac[0], dy = ec[1] - ac[1], dz = ec[2] - ac[2];
+        if (dx*dx + dy*dy + dz*dz > CELL_CENTROID_MAX_DIST * CELL_CENTROID_MAX_DIST) continue;
         ch.push(k);
         joined = true;
         break;

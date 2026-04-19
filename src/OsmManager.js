@@ -2,9 +2,23 @@ import * as THREE from 'three';
 import { Font } from 'three/addons/loaders/FontLoader.js';
 import fontData from 'three/examples/fonts/helvetiker_bold.typeface.json';
 
-// Loaded when the player is within this distance of a tile's AABB edge.
-const LOAD_RADIUS   = 300;
-const UNLOAD_RADIUS = 400;
+// Default load radius used when the caller doesn't pass a getLoadRadius()
+// function (fallback path if TileManager hasn't wired itself up yet).
+const DEFAULT_LOAD_RADIUS   = 650;
+const DEFAULT_UNLOAD_RADIUS = 750;
+
+// Scale factor applied to the building-tile load radius to get the OSM load
+// radius. OSM tiles are cheap (flat meshes, no paint), so we lean long so
+// streets/water already exist the moment buildings pop in.
+const OSM_RADIUS_SCALE = 1.5;
+// Minimum OSM load radius — decoupled from buildings so the LAND-vs-void
+// boundary falls into fog even in dense areas where building radius is at
+// its MIN_LOAD_RADIUS (200 m). Without this, dense areas would show a hard
+// ring of OSM coverage only ~300 m away (200 × 1.5).
+const OSM_MIN_LOAD_RADIUS = 650;
+// Extra metres before an OSM tile unloads past its load radius — mirrors
+// TileManager's hysteresis so we don't thrash at the boundary.
+const OSM_UNLOAD_MARGIN = 100;
 
 // Spatial index grid — mirrors TileManager's scheme.
 const COARSE_GRID  = 500;
@@ -33,13 +47,46 @@ const TYPE_WIDTH = {
 };
 const DEFAULT_WIDTH = 5;
 
-// Y stagger so layers don't z-fight. Ground is at y = 0; each overlay is a
-// clear 5 cm above the previous so GPU depth precision at the horizon is
-// still enough to keep them stacked correctly.
+// Y stagger for the flat-mode mesh stack — unused in terrain mode (the
+// canvas texture composites into the terrain shader instead).
+const Y_LAND         = 0.02;
 const Y_WATER        = 0.05;
 const Y_GREEN        = 0.10;
 const Y_STREET       = 0.15;
 const Y_STREET_LABEL = 0.20;
+
+// Canvas resolution for each tile's OSM raster (terrain mode only).
+// 250 m / 512 px ≈ 0.49 m/px — plenty sharp for streets and polygon edges
+// without ballooning VRAM. ~40 active tiles × 512² × 4 B ≈ 40 MB.
+const TILE_TEXTURE_SIZE = 512;
+
+// Overlay colours. CSS strings for Canvas2D raster (terrain mode);
+// mirrored as THREE.Color values on the mesh materials below (flat mode).
+const LAND_COLOR   = '#c4b9a2';
+const WATER_COLOR  = '#7fb3d9';
+const GREEN_COLOR  = '#bcd69c';
+const STREET_COLOR = '#efe6cc';
+
+// Shared materials for the flat-mode mesh stack. polygonOffset biases each
+// overlay's depth toward the camera so it wins the depth test against the
+// flat ground plane even at horizon distances. Larger units further up the
+// stack so water < green < streets stays consistent.
+const LAND_MAT = new THREE.MeshBasicMaterial({
+  color: 0xc4b9a2, side: THREE.DoubleSide,
+  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
+});
+const WATER_MAT = new THREE.MeshBasicMaterial({
+  color: 0x7fb3d9, side: THREE.DoubleSide,
+  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2,
+});
+const GREEN_MAT = new THREE.MeshBasicMaterial({
+  color: 0xbcd69c, side: THREE.DoubleSide,
+  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4,
+});
+const STREET_MAT = new THREE.MeshBasicMaterial({
+  color: 0xefe6cc, side: THREE.DoubleSide,
+  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -6,
+});
 
 // Street-label tuning. Labels are built from real font glyph outlines via
 // ShapeGeometry so they stay crisp at any viewing distance — no texture,
@@ -66,38 +113,6 @@ const LABEL_MAT = new THREE.MeshBasicMaterial({
 // unique-name count is O(few hundred) in FiDi, memory is bounded.
 const _labelCache = new Map();      // name → { geometry, width, height }
 
-// Shared materials — unlit so they read as "map paint" against the cel-shaded
-// buildings. We keep depthWrite on: without it, the overlays sort
-// unpredictably against the ground/building pass and flicker on/off for a
-// frame as the player moves.
-//
-// polygonOffset biases each overlay's depth values toward the camera during
-// rasterization so they reliably win the depth test against the ground plane
-// even at far distances where perspective-depth precision collapses Y=0 and
-// Y=0.15 into the same bucket. Larger offsets for layers further up the
-// stack so water < green < streets stays consistent too.
-const WATER_MAT = new THREE.MeshBasicMaterial({
-  color:               0x7fb3d9,
-  side:                THREE.DoubleSide,
-  polygonOffset:       true,
-  polygonOffsetFactor: -1,
-  polygonOffsetUnits:  -2,
-});
-const GREEN_MAT = new THREE.MeshBasicMaterial({
-  color:               0xbcd69c,
-  side:                THREE.DoubleSide,
-  polygonOffset:       true,
-  polygonOffsetFactor: -1,
-  polygonOffsetUnits:  -4,
-});
-const STREET_MAT = new THREE.MeshBasicMaterial({
-  color:               0xefe6cc,
-  side:                THREE.DoubleSide,
-  polygonOffset:       true,
-  polygonOffsetFactor: -1,
-  polygonOffsetUnits:  -6,
-});
-
 /**
  * Loads OSM "map overlay" tiles (streets, water, green) on the same 250 m grid
  * as building tiles, and renders them as flat meshes at ground level.
@@ -112,10 +127,31 @@ const STREET_MAT = new THREE.MeshBasicMaterial({
  * stay loaded well past the cell boundary thanks to the unload hysteresis.
  */
 export class OsmManager {
-  constructor({ scene, group } = {}) {
+  constructor({ scene, group, getLoadRadius, terrain, flatMode, onTileReady, onTileUnready } = {}) {
     this._scene = scene;
     this._group = group ?? new THREE.Group();
     if (!group && scene) scene.add(this._group);
+    // Optional: function returning the building-tile load radius in metres.
+    // When provided, OSM radius tracks it (scaled by OSM_RADIUS_SCALE) so
+    // streets/water adapt to the same sparsity signal as buildings.
+    this._getLoadRadius = getLoadRadius ?? null;
+
+    // Optional TerrainManager — used only for label drape now (labels stay
+    // as geometry so text renders crisply). The land/water/green/street
+    // layers are rasterised to a per-tile texture and composited by the
+    // terrain shader, so no mesh-time drape is needed for them.
+    this._terrain = terrain ?? null;
+
+    // Fired after a tile finishes loading (texture created) / before it
+    // unloads (texture about to be disposed). TerrainManager listens so it
+    // can swap the OSM texture sampled by tiles inside this OSM footprint.
+    this._onTileReady   = onTileReady   ?? null;
+    this._onTileUnready = onTileUnready ?? null;
+
+    // Flat mode — when terrain is disabled (VITE_TERRAIN=0). Each loaded
+    // tile gets its own flat textured plane at y≈0.1 so the overlay is
+    // still visible without a terrain shader to composite into.
+    this._flatMode = !!flatMode;
 
     this._tiles        = new Map();           // tileId → TileState
     this._spatialIndex = new Map();           // "gx,gz" → Tile[]
@@ -154,6 +190,24 @@ export class OsmManager {
     }
 
     this.tick(0, 0);
+  }
+
+  /**
+   * Return the loaded OSM tile covering (x, z), or null. Terrain uses this
+   * at tile-load time to find the covering OSM texture so the shader can
+   * sample it.
+   */
+  getLoadedTileAt(x, z) {
+    const bucket = this._spatialIndex.get(
+      `${Math.floor(x / COARSE_GRID)},${Math.floor(z / COARSE_GRID)}`,
+    );
+    if (!bucket) return null;
+    for (const tile of bucket) {
+      if (tile.status !== 'loaded') continue;
+      const b = tile.bounds;
+      if (x >= b.minX && x < b.maxX && z >= b.minZ && z < b.maxZ) return tile;
+    }
+    return null;
   }
 
   /** Manifest tiles that report at least one street. Used by the random-spawn picker. */
@@ -210,8 +264,14 @@ export class OsmManager {
   tick(px, pz) {
     this._lastPx = px; this._lastPz = pz;
 
-    const loadR2   = LOAD_RADIUS   ** 2;
-    const unloadR2 = UNLOAD_RADIUS ** 2;
+    const loadR = this._getLoadRadius
+      ? Math.max(OSM_MIN_LOAD_RADIUS, this._getLoadRadius() * OSM_RADIUS_SCALE)
+      : DEFAULT_LOAD_RADIUS;
+    const unloadR = this._getLoadRadius
+      ? loadR + OSM_UNLOAD_MARGIN
+      : DEFAULT_UNLOAD_RADIUS;
+    const loadR2   = loadR   ** 2;
+    const unloadR2 = unloadR ** 2;
 
     // Drop queued tiles that drifted out of range while waiting.
     if (this._loadQueue.length > 0) {
@@ -256,21 +316,39 @@ export class OsmManager {
       const data = await res.json();
 
       const group = new THREE.Group();
+      _buildStreetLabels(data.streets || [], group, this._terrain);
 
-      const waterMesh = _buildPolygonMesh(data.water || [], Y_WATER, WATER_MAT, 1);
-      if (waterMesh) group.add(waterMesh);
+      if (this._flatMode) {
+        // Pre-terrain rendering path: flat stacked meshes at Y_LAND..Y_STREET.
+        // Used when terrain is disabled (`VITE_TERRAIN=0`) so no canvas
+        // texture or terrain shader is needed.
+        group.add(_buildLandMesh(tile.bounds));
+        const water = _buildPolygonMesh(data.water  || [], Y_WATER,  WATER_MAT,  1);
+        if (water)   group.add(water);
+        const green = _buildPolygonMesh(data.green  || [], Y_GREEN,  GREEN_MAT,  2);
+        if (green)   group.add(green);
+        const streets = _buildStreetMesh(data.streets || [], Y_STREET, STREET_MAT, 3);
+        if (streets) group.add(streets);
+      } else {
+        // Terrain mode: rasterise features to a top-down canvas; the terrain
+        // shader samples it per-fragment so no overlay geometry is needed.
+        const canvas  = _rasterizeTile(tile.bounds, data);
+        const texture = new THREE.CanvasTexture(canvas);
+        texture.wrapS     = THREE.ClampToEdgeWrapping;
+        texture.wrapT     = THREE.ClampToEdgeWrapping;
+        texture.magFilter = THREE.LinearFilter;
+        texture.minFilter = THREE.LinearFilter;
+        texture.flipY     = false; // canvas row 0 = minZ, matches shader uv.y=0
+        tile.texture = texture;
+      }
 
-      const greenMesh = _buildPolygonMesh(data.green || [], Y_GREEN, GREEN_MAT, 2);
-      if (greenMesh) group.add(greenMesh);
+      if (group.children.length > 0) {
+        this._group.add(group);
+        tile.group = group;
+      }
 
-      const streetMesh = _buildStreetMesh(data.streets || [], Y_STREET, STREET_MAT, 3);
-      if (streetMesh) group.add(streetMesh);
-
-      _buildStreetLabels(data.streets || [], group);
-
-      this._group.add(group);
-      tile.group  = group;
       tile.status = 'loaded';
+      if (this._onTileReady) this._onTileReady(tile);
     } catch (e) {
       console.error(`OsmManager: failed to load ${tile.id}:`, e);
       tile.status = 'unloaded';
@@ -296,13 +374,20 @@ export class OsmManager {
   }
 
   _unload(tile) {
+    if (this._onTileUnready) this._onTileUnready(tile);
     if (tile.group) {
       for (const child of tile.group.children) {
-        // Label geometry is shared across tiles via _labelCache — skip it.
+        // Label geometry is shared via _labelCache; all overlay materials
+        // (LAND_MAT / WATER_MAT / GREEN_MAT / STREET_MAT / LABEL_MAT) are
+        // shared too. Only per-tile geometry gets disposed here.
         if (child.geometry && !child.userData.sharedGeometry) child.geometry.dispose();
       }
       this._group.remove(tile.group);
       tile.group = null;
+    }
+    if (tile.texture) {
+      tile.texture.dispose();
+      tile.texture = null;
     }
     tile.status = 'unloaded';
   }
@@ -316,9 +401,84 @@ function _closestDist2(px, pz, b) {
   return (px - cx) ** 2 + (pz - cz) ** 2;
 }
 
-// Flat XZ triangle lists (each entry is [x,z,x,z,x,z,...] for one polygon) →
-// one BufferGeometry + Mesh at the given Y plane. `renderOrder` ensures the
-// overlays always draw after the ground / buildings pass so they don't flicker.
+// Sample the terrain at (x, z) and add the overlay's stack offset. If the
+// covering terrain tile hasn't loaded yet, return offset directly — the
+// mesh will drape later as tiles stream in (for now, rebuild-on-ready isn't
+// wired, so the vertex sits at y=offset until the OSM tile itself reloads).
+function drapeY(terrain, x, z, offset) {
+  if (!terrain) return offset;
+  const t = terrain.sample(x, z);
+  return (t !== null ? t : 0) + offset;
+}
+
+// ── Tile rasterisation ────────────────────────────────────────────────────────
+//
+// Rasterise one OSM tile's features to a top-down Canvas2D. Order matters:
+// LAND fills the whole canvas first (opaque), then water + green polygons
+// overdraw where they exist, then streets stroke on top. The resulting
+// CanvasTexture is sampled by the terrain shader at each terrain fragment's
+// world XZ, so coordinates in this function correspond 1:1 to the terrain
+// surface underneath — no polygon offsets, no z-fighting.
+
+function _rasterizeTile(bounds, data) {
+  const { minX, maxX, minZ, maxZ } = bounds;
+  const w = maxX - minX;
+  const d = maxZ - minZ;
+  const SIZE = TILE_TEXTURE_SIZE;
+  const canvas = document.createElement('canvas');
+  canvas.width  = SIZE;
+  canvas.height = SIZE;
+  const ctx = canvas.getContext('2d');
+
+  // World XZ → canvas pixel coords (flipY=false on the texture, so row 0 is
+  // minZ, row N is maxZ).
+  const sx = SIZE / w;
+  const sz = SIZE / d;
+  const wx2px = (x) => (x - minX) * sx;
+  const wz2py = (z) => (z - minZ) * sz;
+
+  // LAND base — opaque fill makes the tile read as "inside OSM coverage"
+  // wherever water/green/streets aren't drawn on top.
+  ctx.fillStyle = LAND_COLOR;
+  ctx.fillRect(0, 0, SIZE, SIZE);
+
+  if (data.water && data.water.length) {
+    ctx.fillStyle = WATER_COLOR;
+    _drawTriangleList(ctx, data.water, wx2px, wz2py);
+  }
+
+  if (data.green && data.green.length) {
+    ctx.fillStyle = GREEN_COLOR;
+    _drawTriangleList(ctx, data.green, wx2px, wz2py);
+  }
+
+  if (data.streets && data.streets.length) {
+    _drawStreets(ctx, data.streets, wx2px, wz2py, sx);
+  }
+
+  return canvas;
+}
+
+// ── Flat-mode mesh builders (pre-terrain behaviour) ───────────────────────────
+//
+// Flat 2-triangle LAND rectangle covering the tile. Adjacent tiles abut
+// exactly (no gap, no overlap) since bounds are the grid cell edges.
+function _buildLandMesh(bounds) {
+  const { minX, maxX, minZ, maxZ } = bounds;
+  const positions = new Float32Array([
+    minX, Y_LAND, minZ,  maxX, Y_LAND, minZ,  maxX, Y_LAND, maxZ,
+    minX, Y_LAND, minZ,  maxX, Y_LAND, maxZ,  minX, Y_LAND, maxZ,
+  ]);
+  const geo = new THREE.BufferGeometry();
+  geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
+  const mesh = new THREE.Mesh(geo, LAND_MAT);
+  mesh.renderOrder = 0;
+  return mesh;
+}
+
+// Flat XZ triangle lists (each entry is [x,z,x,z,...] for one polygon) → one
+// BufferGeometry at the given Y plane. renderOrder ensures overlays draw
+// after the ground / buildings pass so they don't flicker.
 function _buildPolygonMesh(polygons, y, material, renderOrder) {
   if (!polygons.length) return null;
   let total = 0;
@@ -355,17 +515,12 @@ function _buildStreetMesh(streets, y, material, renderOrder) {
   // exactly 2 tris per segment — they just shift the shared vertex outward.
   const positions = new Float32Array(segCount * 18);
   let o = 0;
-
-  // Scratch arrays for per-vertex miter offsets; reused across streets.
   const offX = [];
   const offZ = [];
 
   for (const s of streets) {
     const width = TYPE_WIDTH[s.type] ?? DEFAULT_WIDTH;
     const half  = width * 0.5;
-    // Each polyline's first/last vertex is pushed this far along the adjacent
-    // segment so independent OSM ways meeting at an intersection overlap and
-    // cover the butt-cap triangular gap at the corners.
     const endExtend = width * 0.1;
     const pts  = s.points;
     if (!pts || pts.length < 2) continue;
@@ -373,10 +528,6 @@ function _buildStreetMesh(streets, y, material, renderOrder) {
     offX.length = N;
     offZ.length = N;
 
-    // Compute the miter offset (perpendicular × miter-length) at each vertex.
-    // Tangent = normalized bisector of incoming+outgoing edges; miter length
-    // = half / cos(bend/2) so the outer edge of the ribbon stays a consistent
-    // width through the turn.
     for (let i = 0; i < N; i++) {
       let inX = 0,  inZ = 0;
       let outX = 0, outZ = 0;
@@ -394,28 +545,23 @@ function _buildStreetMesh(streets, y, material, renderOrder) {
         if (len > 1e-6) { outX = dx / len; outZ = dz / len; hasOut = true; }
       }
 
-      // Bisector. At endpoints fall back to the single available direction.
       let tx, tz;
       if (hasIn && hasOut) { tx = inX + outX; tz = inZ + outZ; }
       else if (hasIn)      { tx = inX;        tz = inZ; }
       else                 { tx = outX;       tz = outZ; }
       const tlen = Math.hypot(tx, tz);
       if (tlen < 1e-6) {
-        // 180° reversal (or degenerate) — fall back to outgoing perpendicular.
         tx = hasOut ? outX : inX;
         tz = hasOut ? outZ : inZ;
       } else {
         tx /= tlen; tz /= tlen;
       }
-      // Left-hand perpendicular (90° CCW in XZ).
       const px = -tz, pz = tx;
 
-      // Miter length scales with 1/cos(half_bend). Clamp to 4× half-width so
-      // a near-180° turn doesn't produce a spike off to infinity.
       let miter = half;
       if (hasIn && hasOut) {
-        const inPx = -inZ, inPz = inX;   // perpendicular of incoming edge
-        const c = px * inPx + pz * inPz; // cos(half_bend); sign = which side
+        const inPx = -inZ, inPz = inX;
+        const c = px * inPx + pz * inPz;
         if (Math.abs(c) > 0.2) miter = half / c;
         else                   miter = (c >= 0 ? 4 : -4) * half;
       }
@@ -427,38 +573,26 @@ function _buildStreetMesh(streets, y, material, renderOrder) {
       offZ[i] = pz * miter;
     }
 
-    // Emit two triangles per segment using the shared miter offsets at both ends.
     for (let i = 0; i < N - 1; i++) {
       let x0 = pts[i][0],     z0 = pts[i][1];
       let x1 = pts[i + 1][0], z1 = pts[i + 1][1];
-      // Extend the first vertex backward along its outgoing segment, and the
-      // last vertex forward along its incoming segment. Offsets are unchanged
-      // because they depend only on direction, not position.
       if (i === 0) {
         const dx = pts[1][0] - pts[0][0], dz = pts[1][1] - pts[0][1];
         const len = Math.hypot(dx, dz);
-        if (len > 1e-6) {
-          x0 -= (dx / len) * endExtend;
-          z0 -= (dz / len) * endExtend;
-        }
+        if (len > 1e-6) { x0 -= (dx / len) * endExtend; z0 -= (dz / len) * endExtend; }
       }
       if (i + 1 === N - 1) {
         const dx = pts[N - 1][0] - pts[N - 2][0], dz = pts[N - 1][1] - pts[N - 2][1];
         const len = Math.hypot(dx, dz);
-        if (len > 1e-6) {
-          x1 += (dx / len) * endExtend;
-          z1 += (dz / len) * endExtend;
-        }
+        if (len > 1e-6) { x1 += (dx / len) * endExtend; z1 += (dz / len) * endExtend; }
       }
       const o0x = offX[i],     o0z = offZ[i];
       const o1x = offX[i + 1], o1z = offZ[i + 1];
 
-      // tri 1: (p0 + o0), (p0 − o0), (p1 − o1)
       positions[o++] = x0 + o0x; positions[o++] = y; positions[o++] = z0 + o0z;
       positions[o++] = x0 - o0x; positions[o++] = y; positions[o++] = z0 - o0z;
       positions[o++] = x1 - o1x; positions[o++] = y; positions[o++] = z1 - o1z;
 
-      // tri 2: (p0 + o0), (p1 − o1), (p1 + o1)
       positions[o++] = x0 + o0x; positions[o++] = y; positions[o++] = z0 + o0z;
       positions[o++] = x1 - o1x; positions[o++] = y; positions[o++] = z1 - o1z;
       positions[o++] = x1 + o1x; positions[o++] = y; positions[o++] = z1 + o1z;
@@ -470,6 +604,37 @@ function _buildStreetMesh(streets, y, material, renderOrder) {
   const mesh = new THREE.Mesh(geo, material);
   mesh.renderOrder = renderOrder;
   return mesh;
+}
+
+function _drawTriangleList(ctx, polygons, wx2px, wz2py) {
+  for (const flat of polygons) {
+    for (let i = 0; i < flat.length; i += 6) {
+      ctx.beginPath();
+      ctx.moveTo(wx2px(flat[i]),     wz2py(flat[i + 1]));
+      ctx.lineTo(wx2px(flat[i + 2]), wz2py(flat[i + 3]));
+      ctx.lineTo(wx2px(flat[i + 4]), wz2py(flat[i + 5]));
+      ctx.closePath();
+      ctx.fill();
+    }
+  }
+}
+
+function _drawStreets(ctx, streets, wx2px, wz2py, pxPerM) {
+  ctx.strokeStyle = STREET_COLOR;
+  ctx.lineCap  = 'round';
+  ctx.lineJoin = 'round';
+  for (const s of streets) {
+    const pts = s.points;
+    if (!pts || pts.length < 2) continue;
+    const width = TYPE_WIDTH[s.type] ?? DEFAULT_WIDTH;
+    ctx.lineWidth = Math.max(1, width * pxPerM);
+    ctx.beginPath();
+    ctx.moveTo(wx2px(pts[0][0]), wz2py(pts[0][1]));
+    for (let i = 1; i < pts.length; i++) {
+      ctx.lineTo(wx2px(pts[i][0]), wz2py(pts[i][1]));
+    }
+    ctx.stroke();
+  }
 }
 
 // Build (or fetch cached) flat ShapeGeometry for a street name. Glyphs come
@@ -503,7 +668,7 @@ function _getLabelAsset(name) {
 // For each named street, pick its longest segment and lay a flat label plane
 // along it. One mesh per street — the material/texture come from the shared
 // _labelCache, so repeat names across tiles add only geometry cost.
-function _buildStreetLabels(streets, parentGroup) {
+function _buildStreetLabels(streets, parentGroup, terrain) {
   for (const s of streets) {
     if (!s.name) continue;
     const pts = s.points;
@@ -540,7 +705,9 @@ function _buildStreetLabels(streets, parentGroup) {
     if (scale / baseScale < MIN_LABEL_SCALE) continue;
 
     const mesh = new THREE.Mesh(geometry, LABEL_MAT);
-    mesh.position.set((p0[0] + p1[0]) * 0.5, Y_STREET_LABEL, (p0[1] + p1[1]) * 0.5);
+    const cx = (p0[0] + p1[0]) * 0.5;
+    const cz = (p0[1] + p1[1]) * 0.5;
+    mesh.position.set(cx, drapeY(terrain, cx, cz, Y_STREET_LABEL), cz);
     mesh.rotation.y  = Math.atan2(-dz, dx);
     mesh.scale.set(scale, scale, scale);
     mesh.renderOrder = 4;

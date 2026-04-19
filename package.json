@@ -3,10 +3,11 @@
   "version": "0.0.1",
   "type": "module",
   "scripts": {
-    "dev": "vite",
-    "build": "vite build",
+    "dev":      "vite",
+    "dev:flat": "vite --mode flat",
+    "build":    "vite build",
     "build-tiles": "python scripts/build_tiles.py",
-    "build-osm": "python scripts/fetch_osm_features.py"
+    "build-osm":   "python scripts/fetch_osm_features.py"
   },
   "dependencies": {
     "three": "^0.172.0"

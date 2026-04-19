@@ -31,12 +31,14 @@
     #minimap-wrap {
       position: fixed;
       top: 28px; right: 16px;
-      width: 180px; height: 180px;
+      width: 234px; height: 234px;
       overflow: hidden;
       box-shadow: 0 0 0 2px rgba(255,255,255,0.25), 0 2px 8px rgba(0,0,0,0.6);
       pointer-events: none;
       z-index: 10;
     }
+    #minimap-wrap.big { pointer-events: auto; cursor: grab; }
+    #minimap-wrap.big.dragging { cursor: grabbing; }
     #minimap-wrap canvas { display: block; }
     #minimap-attr {
       position: fixed;
@@ -47,8 +49,8 @@
     }
     #minimap-random {
       position: fixed;
-      top: 214px; right: 16px;
-      width: 180px;
+      top: 268px; right: 16px;
+      width: 234px;
       padding: 6px 8px;
       font-family: monospace;
       font-size: 12px;
@@ -133,7 +135,7 @@
   <div id="colorbar"></div>
   <div id="hud">Graffiti NYC</div>
   <div id="minimap-wrap">
-    <canvas id="minimap" width="180" height="180"></canvas>
+    <canvas id="minimap" width="234" height="234"></canvas>
   </div>
   <div id="minimap-attr">© OpenStreetMap contributors</div>
   <button id="minimap-random" disabled>Random location</button>

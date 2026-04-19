@@ -34,6 +34,11 @@ OUTPUT_DIR = os.path.join(os.path.dirname(__file__), '..', 'public', 'tiles')
 DA_COUNT  = 20
 GRID_SIZE = 125  # metres per cell side — roughly one Manhattan long-block / 1.5 short blocks
 
+# Runtime paint-cell edge length (metres). Must match GRID_SIZE in
+# src/loadCityGML.js; cellEstimate = surface_area / PAINT_CELL_SIZE² is our
+# build-time proxy for the number of 2×2 m paint cells a tile will produce.
+PAINT_CELL_SIZE = 2.0
+
 
 def building_centroid_and_bounds(b):
     """
@@ -54,6 +59,28 @@ def building_centroid_and_bounds(b):
     cx = (min_x + max_x) / 2
     cz = (min_z + max_z) / 2
     return cx, cz, min_x, max_x, min_z, max_z
+
+
+def building_surface_area(b):
+    """
+    Sum the area of every triangle across roof + walls. Used as a proxy for
+    paint-cell count — each cell is PAINT_CELL_SIZE² so cells ≈ area / 4 m².
+    Vertices are flat [x, y, z, x, y, z, …] in 3 × 3-tuple triangle groups.
+    """
+    total = 0.0
+    for arr in (b['roof'], b['walls']):
+        for i in range(0, len(arr) - 8, 9):
+            ax, ay, az = arr[i],     arr[i + 1], arr[i + 2]
+            bx, by, bz = arr[i + 3], arr[i + 4], arr[i + 5]
+            cx, cy, cz = arr[i + 6], arr[i + 7], arr[i + 8]
+            ux, uy, uz = bx - ax, by - ay, bz - az
+            vx, vy, vz = cx - ax, cy - ay, cz - az
+            # |u × v| / 2
+            nx = uy * vz - uz * vy
+            ny = uz * vx - ux * vz
+            nz = ux * vy - uy * vx
+            total += 0.5 * math.sqrt(nx * nx + ny * ny + nz * nz)
+    return total
 
 
 def grid_key(cx, cz):
@@ -103,10 +130,12 @@ def main():
                     'buildings': [],
                     'min_x':  math.inf, 'max_x': -math.inf,
                     'min_z':  math.inf, 'max_z': -math.inf,
+                    'area':   0.0,
                 }
 
             entry = cell_data[key]
             entry['buildings'].append(b)
+            entry['area'] += building_surface_area(b)
             if bmin_x < entry['min_x']: entry['min_x'] = bmin_x
             if bmax_x > entry['max_x']: entry['max_x'] = bmax_x
             if bmin_z < entry['min_z']: entry['min_z'] = bmin_z
@@ -142,6 +171,11 @@ def main():
                 'minZ': entry['min_z'], 'maxZ': entry['max_z'],
             },
             'buildingCount': len(entry['buildings']),
+            # Proxy for paint-cell count, used by TileManager to budget adaptive
+            # load radius (sparse areas load further out). Overestimates because
+            # it doesn't account for face merging or per-face UV centring, but
+            # consistent scaling is what matters for the budget comparison.
+            'cellEstimate':  int(round(entry['area'] / (PAINT_CELL_SIZE ** 2))),
         })
 
         # Free building data as we go so memory drops progressively.

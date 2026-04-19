@@ -3,8 +3,13 @@ import { PointerLockControls } from 'three/addons/controls/PointerLockControls.j
 import { GRID_SIZE } from './loadCityGML.js';
 import { TileManager } from './TileManager.js';
 import { OsmManager } from './OsmManager.js';
+import { TerrainManager } from './TerrainManager.js';
 import { paintStore } from './paintStore.js';
-import { initMinimap, updateMinimap, setMinimapSize } from './minimap.js';
+import {
+  initMinimap, updateMinimap, setMinimapSize,
+  adjustMinimapZoom, adjustMinimapPan, resetMinimapPan,
+  minimapMetersPerPixel, minimapPixelToWorld,
+} from './minimap.js';
 
 // ─── Scene ───────────────────────────────────────────────────────────────────
 
@@ -83,15 +88,26 @@ scene.add(sun);
 
 // ─── Ground ───────────────────────────────────────────────────────────────────
 
+// Terrain-on vs terrain-off switch. When terrain is enabled (default), the
+// ground plane sits well below DEM water level (-1.34 m in NYC) so it never
+// peeks through the terrain. When terrain is disabled (`npm run dev:flat`)
+// the ground plane is the only floor, so it sits just below y=0 like
+// pre-terrain — buildings have their bases shifted to y=0 in the worker and
+// OSM overlays stack flat at Y_LAND etc.
+const TERRAIN_ENABLED = import.meta.env.VITE_TERRAIN !== '0';
+const FLOOR_Y = TERRAIN_ENABLED ? -5 : -0.1;
+
 // The ground plane follows the player every frame — cheaper and more robust
 // than making it arena-sized (which runs into depth precision issues at the
 // horizon) and guarantees a floor exists wherever the random-teleport drops us.
+// Cooler, greyer than the OSM LAND_MAT colour so the border between
+// "inside 5-borough coverage" and "no OSM data here" is visible.
 const ground = new THREE.Mesh(
   new THREE.PlaneGeometry(20000, 20000),
-  new THREE.MeshLambertMaterial({ color: 0xb0b0ac }),
+  new THREE.MeshLambertMaterial({ color: 0x9b9b9e }),
 );
 ground.rotation.x = -Math.PI / 2;
-ground.position.set(0, 0, 0);
+ground.position.set(0, FLOOR_Y, 0);
 ground.receiveShadow = false;
 scene.add(ground);
 
@@ -103,22 +119,29 @@ const buildingMeshes = [];      // buildings only (for wall collision)
 
 // ─── Culling ──────────────────────────────────────────────────────────────────
 
-const CULL_RADIUS = 200; // metres — buildings beyond this are hidden and skipped in raycasts
+// The cull radius tracks TileManager's effective load radius — there's no
+// reason to render/raycast beyond what's actually loaded, and scaling them
+// together keeps the visual edge consistent when sparsity widens the ring.
+function cullRadius() { return tileManager.getLoadRadius(); }
 
-// Filtered views rebuilt by updateCulling() whenever the player moves enough.
+// Filtered views rebuilt by updateCulling() whenever the player moves enough
+// or the load radius shifts past CULL_HYSTERESIS.
 let nearBuildingMeshes = [];
 let nearCollidables    = [ground];
 
 let _cullX = NaN, _cullZ = NaN;
+let _cullR = 0;
 
 function updateCulling() {
   const px = camera.position.x, pz = camera.position.z;
   _cullX = px; _cullZ = pz;
-  const r2 = CULL_RADIUS * CULL_RADIUS;
+  _cullR = cullRadius();
+  updateViewFalloff(_cullR);
+  const r2 = _cullR * _cullR;
   nearBuildingMeshes = [];
 
   // Per-tile short-circuit: hide the tile's group when its AABB is entirely
-  // outside CULL_RADIUS so the renderer doesn't walk each invisible mesh every
+  // outside the cull radius so the renderer doesn't walk each invisible mesh every
   // frame. Inside in-range tiles we still do per-building culling for the
   // partial-overlap case at the boundary.
   for (const tile of tileManager.tiles()) {
@@ -143,7 +166,7 @@ function updateCulling() {
       }
     }
   }
-  nearCollidables = [ground, ...nearBuildingMeshes];
+  nearCollidables = [ground, ...nearBuildingMeshes, ...terrainManager.meshes()];
 }
 
 // Only re-cull when the player has moved at least this far (metres).
@@ -151,7 +174,24 @@ const CULL_HYSTERESIS = 10;
 
 function maybeCull() {
   const dx = camera.position.x - _cullX, dz = camera.position.z - _cullZ;
-  if (dx * dx + dz * dz >= CULL_HYSTERESIS ** 2) updateCulling();
+  const r = cullRadius();
+  if (dx * dx + dz * dz >= CULL_HYSTERESIS ** 2 ||
+      Math.abs(r - _cullR)  >= CULL_HYSTERESIS) {
+    updateCulling();
+  }
+}
+
+// Fog density and camera.far are tuned relative to BASE_RADIUS. Density
+// scales inversely (less fog when the radius widens, so distant buildings
+// stay visible) and far sits a short margin past the cull edge so we don't
+// waste depth precision on geometry nothing will ever reach.
+const BASE_RADIUS     = 200;
+const BASE_FOG_DENSITY = 0.003;
+const FAR_MARGIN       = 400;
+function updateViewFalloff(r) {
+  scene.fog.density = BASE_FOG_DENSITY * (BASE_RADIUS / Math.max(r, 1));
+  camera.far        = r + FAR_MARGIN;
+  camera.updateProjectionMatrix();
 }
 
 let isFlying    = _savedPlayer ? !!_savedPlayer.flying : false;
@@ -159,17 +199,31 @@ let lastSpaceTap = 0;
 const DOUBLE_TAP_MS = 280;
 
 const WALK_HEIGHT   = 3.0;  // eye height above surface
+const MIN_EYE_Y     = FLOOR_Y + WALK_HEIGHT; // camera clamp when standing on the default floor (no building underfoot)
 const WALK_SPEED    = 8;
 const SPRINT_SPEED  = 24;
 const FLY_SPEED     = 22;
 const FLY_VERT      = 14;
 const PLAYER_RADIUS = 1.5;  // body collision radius; also used as spawn clearance
+const STEP_UP_HEIGHT = 0.4; // max lip the player auto-climbs when walking
 const GRAVITY       = 22;   // m/s²
 const TERMINAL_VEL  = -50;
 
 let velY = 0;
 
 // ─── Controls ─────────────────────────────────────────────────────────────────
+
+// Drop pointer-lock mousemove spikes before PointerLockControls sees them.
+// Chrome occasionally fires a mousemove with a huge delta after focus
+// changes or OS cursor warps; stock controls multiply that straight into
+// yaw/pitch and the view snaps wildly. A real human flick stays well under
+// this threshold even on high-polling-rate mice.
+const LOOK_SPIKE_PX = 200;
+document.addEventListener('mousemove', (e) => {
+  if (Math.abs(e.movementX) > LOOK_SPIKE_PX || Math.abs(e.movementY) > LOOK_SPIKE_PX) {
+    e.stopImmediatePropagation();
+  }
+}, { capture: true });
 
 const controls = new PointerLockControls(camera, renderer.domElement);
 
@@ -181,10 +235,10 @@ const randomBtn   = document.getElementById('minimap-random');
 const minimapWrap = document.getElementById('minimap-wrap');
 initMinimap();
 
-// Small vs. big minimap. 180 px mirrors the initial HTML canvas size; big mode
+// Small vs. big minimap. 234 px mirrors the initial HTML canvas size; big mode
 // fills half the shorter viewport axis (so it's ~a quarter of the screen's
 // area, always square, never overflows on portrait windows).
-const MINIMAP_SIZE_SMALL = 180;
+const MINIMAP_SIZE_SMALL = 234;
 function minimapBigSize() {
   return Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.5);
 }
@@ -202,6 +256,19 @@ function toggleMinimapBig() {
   minimapBig = !minimapBig;
   minimapWrap.classList.toggle('big', minimapBig);
   applyMinimapLayout();
+  if (minimapBig) {
+    // Map mode = pointer-escape mode: release the mouse so the user can
+    // interact with the map (drag/scroll/click) instead of mouse-looking.
+    if (controls.isLocked) controls.unlock();
+  } else {
+    // Pan is a map-mode-local view adjustment — snap back to player-centred
+    // so the small map always tracks the player.
+    resetMinimapPan();
+    // Exiting map mode also exits escape mode — re-lock into first-person.
+    // Guarded like the overlay's click-to-lock so we don't try to lock during
+    // initial load or mid-teleport.
+    if (firstTileLoaded && !teleporting && !controls.isLocked) controls.lock();
+  }
 }
 window.addEventListener('resize', () => {
   if (minimapBig) applyMinimapLayout();
@@ -248,32 +315,113 @@ async function pickStreetSpawn(maxTileTries = 20, pointsPerTile = 4) {
   return null;
 }
 
-randomBtn.addEventListener('click', async () => {
-  if (!firstTileLoaded || teleporting) return;
-  randomBtn.disabled = true;
-  const loc = (await pickStreetSpawn()) ?? tileManager.randomLocation();
-  if (!loc) { randomBtn.disabled = false; return; }
-  camera.position.set(loc.x, WALK_HEIGHT, loc.z);
+const _teleportEuler = new THREE.Euler(0, 0, 0, 'YXZ');
+
+// Mirror the first-page-load experience: move the player, unlock pointer,
+// show the dimmed "loading" overlay, and wait for nearby tiles to finish
+// loading before letting the user click in. Shared by the random-location
+// button and map-click teleport.
+function fastTravelTo(x, z) {
+  if (!firstTileLoaded) return;
+  // Intentionally not gated on `teleporting`: a fresh teleport preempts the
+  // in-flight one. The gate check in onTileLoaded runs against the current
+  // camera position, so only tiles around the latest destination matter.
+  camera.position.set(x, MIN_EYE_Y, z);
   velY = 0;
+  // Keep the current yaw but pitch the view 20° above horizontal so the player
+  // lands looking at the skyline, not their feet. YXZ Euler + positive X = up.
+  _teleportEuler.setFromQuaternion(camera.quaternion);
+  _teleportEuler.x = Math.PI * 20 / 180;
+  _teleportEuler.z = 0;
+  camera.quaternion.setFromEuler(_teleportEuler);
   updateCulling();
 
-  // Mirror the first-page-load experience: unlock pointer, show the dimmed
-  // "loading" overlay, and wait for nearby tiles to finish loading before
-  // letting the user click in.
   teleporting = true;
   overlay.classList.add('loading');
   overlayPrompt.textContent = 'Loading data...';
-  randomBtn.disabled = true;
   colorPickMode = false;
   if (controls.isLocked) controls.unlock();
   else overlay.classList.remove('hidden');
 
+  // Close the big map if it was open so the loading overlay is actually
+  // visible; resetMinimapPan() runs via toggleMinimapBig.
+  if (minimapBig) toggleMinimapBig();
+
   // Kick the tile manager now so any fresh loads are in-flight before the
   // next frame, and so we can detect the "nothing new to load" case (e.g.
   // teleport landed inside an already-loaded tile) and clear immediately.
-  tileManager.tick(loc.x, loc.z);
-  if (tileManager.allNearbyTilesLoaded(loc.x, loc.z)) finishTeleportLoad();
+  tileManager.tick(x, z);
+  if (tileManager.allNearbyTilesLoaded(x, z)) finishTeleportLoad();
+}
+
+randomBtn.addEventListener('click', async () => {
+  if (!firstTileLoaded) return;
+  const loc = (await pickStreetSpawn()) ?? tileManager.randomLocation();
+  if (!loc) return;
+  fastTravelTo(loc.x, loc.z);
 });
+
+// ─── Map-mode mouse interaction ───────────────────────────────────────────────
+// Active only while the minimap is in "big" mode (.big class). Drag to pan,
+// wheel to zoom, click to fast-travel. Pan does not persist when leaving map
+// mode (reset in toggleMinimapBig); zoom does.
+
+let _mapDragging = false;
+let _mapDragMoved = false;
+let _mapDragStartX = 0, _mapDragStartY = 0;
+let _mapDragLastX  = 0, _mapDragLastY  = 0;
+const MAP_CLICK_SLOP = 3; // px — mouse movement under this on a press counts as a click
+
+function _mapMouseLocal(e) {
+  const rect = minimapWrap.getBoundingClientRect();
+  return { x: e.clientX - rect.left, y: e.clientY - rect.top, rect };
+}
+
+minimapWrap.addEventListener('mousedown', (e) => {
+  if (!minimapBig || e.button !== 0) return;
+  const { x, y } = _mapMouseLocal(e);
+  _mapDragging = true;
+  _mapDragMoved = false;
+  _mapDragStartX = _mapDragLastX = x;
+  _mapDragStartY = _mapDragLastY = y;
+  minimapWrap.classList.add('dragging');
+  e.preventDefault();
+  e.stopPropagation();
+});
+
+document.addEventListener('mousemove', (e) => {
+  if (!_mapDragging) return;
+  const { x, y } = _mapMouseLocal(e);
+  const dxPx = x - _mapDragLastX;
+  const dyPx = y - _mapDragLastY;
+  _mapDragLastX = x;
+  _mapDragLastY = y;
+  if (!_mapDragMoved &&
+      Math.hypot(x - _mapDragStartX, y - _mapDragStartY) > MAP_CLICK_SLOP) {
+    _mapDragMoved = true;
+  }
+  // Dragging right moves content right → view centre shifts left (west).
+  const m = minimapMetersPerPixel();
+  adjustMinimapPan(-dxPx * m, -dyPx * m);
+});
+
+document.addEventListener('mouseup', (e) => {
+  if (!_mapDragging) return;
+  _mapDragging = false;
+  minimapWrap.classList.remove('dragging');
+  if (_mapDragMoved || !minimapBig) return;
+  const { x, y, rect } = _mapMouseLocal(e);
+  if (x < 0 || y < 0 || x >= rect.width || y >= rect.height) return;
+  const { x: wx, z: wz } = minimapPixelToWorld(x, y, camera.position.x, camera.position.z);
+  fastTravelTo(wx, wz);
+});
+
+minimapWrap.addEventListener('wheel', (e) => {
+  if (!minimapBig) return;
+  e.preventDefault();
+  // deltaY > 0 on scroll-down → zoom out; ~0.5 zoom per standard notch (100px).
+  adjustMinimapZoom(-e.deltaY * 0.005);
+}, { passive: false });
 
 renderer.domElement.addEventListener('mousedown', e => {
   if (!controls.isLocked) { if (e.button === 0 && firstTileLoaded) { colorPickMode = false; controls.lock(); } return; }
@@ -286,6 +434,9 @@ overlay.addEventListener('click', () => { if (firstTileLoaded && !teleporting) c
 controls.addEventListener('lock', () => {
   overlay.classList.add('hidden');
   crosshair.classList.add('visible');
+  // Re-locking means the user is returning to first-person — close the big
+  // map (and reset its pan) so it doesn't stay spread across the game view.
+  if (minimapBig) toggleMinimapBig();
 });
 controls.addEventListener('unlock', () => {
   crosshair.classList.remove('visible');
@@ -410,14 +561,48 @@ function closestPointOnTriangle(p, a, b, c, out) {
   return out.copy(a).addScaledVector(_cptAB, v).addScaledVector(_cptAC, w);
 }
 
-// Cast a ray straight down from just above the player's feet.
-// Returns the Y of the nearest surface below, or null if none within `maxDrop`.
+// Returns the highest surface the player's footprint is sitting on, or null.
+//
+// Center ray starts at feet + STEP_UP_HEIGHT + 0.15 so it can detect a surface
+// up to STEP_UP_HEIGHT above current feet — this is the step-up: the moment
+// the player's center crosses onto a slightly-higher roof, Y snaps to it.
+//
+// Ring rays (8 compass offsets at ~PLAYER_RADIUS) start at feet + 0.15 and
+// only see surfaces at or below feet — they support the player at current
+// feet level when their center has drifted past a roof edge, without
+// triggering an unwanted snap-up from a taller neighbor the player is merely
+// standing next to.
+const _surfOrig = new THREE.Vector3();
+const RING_OFFSETS = (() => {
+  const offsets = [];
+  const r = PLAYER_RADIUS * 0.9;
+  for (let i = 0; i < 8; i++) {
+    const a = (i / 8) * Math.PI * 2;
+    offsets.push([Math.cos(a) * r, Math.sin(a) * r]);
+  }
+  return offsets;
+})();
 function surfaceBelow(pos, maxDrop) {
-  const origin = new THREE.Vector3(pos.x, pos.y - WALK_HEIGHT + 0.15, pos.z);
-  downRay.set(origin, DOWN);
-  downRay.far = maxDrop + 0.15;
-  const hits = downRay.intersectObjects(nearCollidables, false);
-  return hits.length > 0 ? hits[0].point.y : null;
+  let bestY = null;
+
+  _surfOrig.set(pos.x, pos.y - WALK_HEIGHT + STEP_UP_HEIGHT + 0.15, pos.z);
+  downRay.set(_surfOrig, DOWN);
+  downRay.far = maxDrop + STEP_UP_HEIGHT + 0.15;
+  const centerHits = downRay.intersectObjects(nearCollidables, false);
+  if (centerHits.length > 0) bestY = centerHits[0].point.y;
+
+  for (let i = 0; i < RING_OFFSETS.length; i++) {
+    const [ox, oz] = RING_OFFSETS[i];
+    _surfOrig.set(pos.x + ox, pos.y - WALK_HEIGHT + 0.15, pos.z + oz);
+    downRay.set(_surfOrig, DOWN);
+    downRay.far = maxDrop + 0.15;
+    const hits = downRay.intersectObjects(nearCollidables, false);
+    if (hits.length > 0) {
+      const y = hits[0].point.y;
+      if (bestY === null || y > bestY) bestY = y;
+    }
+  }
+  return bestY;
 }
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
@@ -1092,11 +1277,13 @@ function resolveCapsule(pos) {
         for (let yi = 0; yi < CAPSULE_SAMPLE_OFFSETS.length; yi++) {
           _capP.set(pos.x, pos.y + CAPSULE_SAMPLE_OFFSETS[yi], pos.z);
           closestPointOnTriangle(_capP, _capA, _capB, _capC, _capClosest);
-          // Skip contacts whose closest point is at or below the player's
-          // feet. That's the top edge of a wall running up to the roof we're
-          // standing on (our own walls, or a neighbor's lower walls) — the
-          // player should be able to walk right up to and off the edge.
-          if (_capClosest.y < feetY + 0.1) continue;
+          // Skip contacts whose closest point is within STEP_UP_HEIGHT above
+          // the player's feet. This covers the top edge of a wall under our
+          // own roof (the original case) and also the short wall of a
+          // slightly-higher adjacent roof — ignoring it here lets the player
+          // walk into the step, and surfaceBelow's center-ray step-up then
+          // raises Y onto the higher roof the same frame.
+          if (_capClosest.y < feetY + STEP_UP_HEIGHT + 0.1) continue;
           // Push using true 3D separation but project the push horizontally —
           // this keeps narrow-gap corner ejection while preventing a huge
           // horizontal shove from a contact that is mostly vertical.
@@ -1220,8 +1407,18 @@ function updateMovement() {
       if (hits.length === 0 || hits[0].distance > drop) camera.position.y += dy;
       else _flyVel.y = 0;
     }
-    camera.position.y = Math.max(WALK_HEIGHT, camera.position.y);
+    camera.position.y = Math.max(MIN_EYE_Y, camera.position.y);
   } else {
+    // Rescue: if the player is saved-loaded or spawned below the terrain
+    // (e.g. old save from before terrain existed, or a teleport beat terrain
+    // streaming), the downward surfaceBelow ray starts inside the mesh and
+    // misses. Snap up so gravity finds the surface on the next frame.
+    const terrainY = terrainManager.sample(camera.position.x, camera.position.z);
+    if (terrainY !== null && camera.position.y - WALK_HEIGHT < terrainY - 0.5) {
+      camera.position.y = terrainY + WALK_HEIGHT;
+      velY = 0;
+    }
+
     // Gravity
     velY = Math.max(velY - GRAVITY * dt, TERMINAL_VEL);
     const dY = velY * dt;
@@ -1236,8 +1433,8 @@ function updateMovement() {
       } else {
         camera.position.y += dY;
         // Hard floor fallback
-        if (camera.position.y < WALK_HEIGHT) {
-          camera.position.y = WALK_HEIGHT;
+        if (camera.position.y < MIN_EYE_Y) {
+          camera.position.y = MIN_EYE_Y;
           velY = 0;
         }
       }
@@ -1259,7 +1456,7 @@ const buildingMeshMap = new Map();
 
 // Returns true if the XZ position has clearance in all 8 horizontal directions.
 function positionIsClear(x, z) {
-  const pos = new THREE.Vector3(x, WALK_HEIGHT, z);
+  const pos = new THREE.Vector3(x, MIN_EYE_Y, z);
   for (let i = 0; i < 8; i++) {
     const angle = (i / 8) * Math.PI * 2;
     snapRay.set(pos, new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle)));
@@ -1271,6 +1468,9 @@ function positionIsClear(x, z) {
 
 // After buildings load, make sure the camera isn't spawned inside one.
 // Tries expanding rings of candidate positions until a clear spot is found.
+// When the position is already clear, the saved Y is left alone so rooftop
+// saves survive the reload. The per-frame below-terrain rescue in walk mode
+// handles the case where the saved Y ends up inside newly-loaded terrain.
 function snapToSafeStart() {
   const cx = camera.position.x, cz = camera.position.z;
   if (positionIsClear(cx, cz)) return;
@@ -1282,18 +1482,28 @@ function snapToSafeStart() {
       const x = cx + Math.cos(angle) * r;
       const z = cz + Math.sin(angle) * r;
       if (positionIsClear(x, z)) {
-        camera.position.set(x, WALK_HEIGHT, z);
+        placeOnGround(x, z);
         return;
       }
     }
   }
 }
 
+function placeOnGround(x, z) {
+  const terrainY = terrainManager.sample(x, z);
+  const y = terrainY !== null ? terrainY + WALK_HEIGHT : MIN_EYE_Y;
+  camera.position.set(x, y, z);
+  velY = 0;
+}
+
 // ─── Tile manager ─────────────────────────────────────────────────────────────
 
 let firstTileLoaded = false;
 let tilesLoadedCount = 0;
-const TILES_NEEDED = 4;
+// ?buildings=doitt is the only single-tile override (?=lod2 now loads a real
+// tile manifest from /tiles_lod2/). Drop the 4-tile gate to 1 in that case so
+// the loading overlay clears on the single tile.
+const TILES_NEEDED = new URLSearchParams(location.search).get('buildings') === 'doitt' ? 1 : 4;
 
 // Teleport loading state — the random-location button re-enters the same
 // "Loading tiles…" overlay as the initial page load, cleared when every
@@ -1321,7 +1531,7 @@ const tileManager = new TileManager({
   buildingPaintMeshes,
   buildingPaintMeshByBuilding,
   paintGroup,
-  seedConfig: { fraction: SEED_FRACTION, colors: SEED_COLOR_HEX },
+  seedConfig: { fraction: SEED_FRACTION, colors: SEED_COLOR_HEX, shiftBuildingsY: !TERRAIN_ENABLED },
   onTileLoaded(meshes) {
     // Phase 1 — buildings are visible now. The spawn gate opens here so the
     // player can start interacting before the seed scan (phase 2) finishes.
@@ -1351,8 +1561,38 @@ const tileManager = new TileManager({
 tileManager.init('/tiles/manifest.json');
 
 // OSM overlay — streets, water, and green spaces rendered as flat meshes on
-// the ground. Loads its own tiles on the same 250 m grid as building tiles.
-const osmManager = new OsmManager({ scene });
+// the ground. OSM radius tracks TileManager's adaptive radius so the overlay
+// widens alongside buildings in sparse areas.
+// Terrain-on: DEM heightfields stream in, OSM textures composite in the
+// terrain shader.
+// Terrain-off (VITE_TERRAIN=0, e.g. `npm run dev:flat`): no DEM loading,
+// buildings are Y-shifted to sit at y=0 in the worker, OSM overlays render
+// as the pre-terrain mesh stack (LAND/water/green/streets at Y_LAND..Y_STREET
+// with polygon-offset biasing). TerrainManager is replaced with a null-object
+// so the rest of main.js (spawn, collision, rescue) keeps calling it
+// unconditionally.
+const terrainManager = TERRAIN_ENABLED
+  ? new TerrainManager({
+      scene,
+      getLoadRadius: () => tileManager.getLoadRadius(),
+      osmLookup:     (x, z) => osmManager.getLoadedTileAt(x, z),
+    })
+  : {
+      tick() {},
+      sample() { return null; },
+      meshes() { return []; },
+      applyOsmTile() {},
+      removeOsmTile() {},
+    };
+
+const osmManager = new OsmManager({
+  scene,
+  getLoadRadius: () => tileManager.getLoadRadius(),
+  terrain:       TERRAIN_ENABLED ? terrainManager : null, // labels still drape
+  flatMode:      !TERRAIN_ENABLED,                        // render own flat planes with texture
+  onTileReady:   (tile) => terrainManager.applyOsmTile(tile),
+  onTileUnready: (tile) => terrainManager.removeOsmTile(tile),
+});
 osmManager.init('/osm/manifest.json');
 
 // ─── Render loop ──────────────────────────────────────────────────────────────
@@ -1363,6 +1603,9 @@ const _minimapDir = new THREE.Vector3();
 // fires at the monitor's refresh rate (often 120/144/165 Hz), doing work we
 // don't need for this game. The 0.5 ms epsilon keeps ~60 fps stable against
 // RAF timing jitter (without it the integer divisor occasionally drops to 59).
+// NOTE: the cap can only produce divisors of the monitor rate (RAF aliasing),
+// so a 45 Hz target on a 60 Hz monitor collapses to 30 Hz. Stick to 60, 30,
+// 20, 15 etc. for stable results.
 const FRAME_INTERVAL = 1000 / 60 - 0.5;
 let _lastFrameTime = 0;
 
@@ -1374,6 +1617,7 @@ function animate(now) {
 
   tileManager.tick(camera.position.x, camera.position.z);
   osmManager.tick(camera.position.x, camera.position.z);
+  terrainManager.tick(camera.position.x, camera.position.z);
   maybeCull();
   updateMovement();
   ground.position.x = camera.position.x;

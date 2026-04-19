@@ -26,8 +26,25 @@ import urllib.request, urllib.parse
 import mapbox_earcut as earcut
 import numpy as np
 
-# Must match build_tiles.py so street / building tiles align.
+# OSM tile grid — 250 m cells. Building tiles use a finer 125 m grid, so one
+# OSM cell covers a 2×2 block of building cells. We still index by OSM cell
+# throughout this script.
 GRID_SIZE = 250
+
+# Douglas-Peucker tolerance for water polygon simplification (metres). NYC
+# harbor coastlines in OSM are sampled every 10–30 cm; simplifying to 1 m
+# roughly halves vertex / triangle count without visibly changing the shore
+# at the distances we render from. Small ponds (bbox diagonal < 5 m) skip
+# simplification so we don't accidentally collapse them to a line.
+WATER_SIMPLIFY_TOL_M = 1.0
+
+# When writing and fetching, keep only OSM cells within this many cells of a
+# NYC building tile. Our building coverage (DoITT CityGML) defines the 5
+# boroughs we care about; rectangular bbox fetch otherwise pulls in a lot of
+# New Jersey and mid-harbour cells we never show. 6 cells = 1500 m pad —
+# wide enough that the far bank of the Hudson and the middle of Upper NY
+# Bay still carry water; NJ and open ocean still get dropped.
+BUILDING_PROXIMITY_CELLS = 6
 
 REF_LNG = -74.01175
 REF_LAT = 40.70475
@@ -65,11 +82,14 @@ def lng_lat_to_local(lng, lat):
 
 # ── Bbox derivation ───────────────────────────────────────────────────────────
 
-def compute_bbox():
-    """Read the building manifest, return (south, west, north, east) in lng/lat
-    with one cell of padding so streets at the coverage edge are included."""
+def read_building_manifest():
     with open(BUILDING_MANIFEST) as f:
-        manifest = json.load(f)
+        return json.load(f)
+
+
+def compute_bbox(manifest):
+    """Return (south, west, north, east) in lng/lat with one OSM-cell of
+    padding so streets at the coverage edge are included."""
     min_x = min(t['bounds']['minX'] for t in manifest) - GRID_SIZE
     max_x = max(t['bounds']['maxX'] for t in manifest) + GRID_SIZE
     min_z = min(t['bounds']['minZ'] for t in manifest) - GRID_SIZE
@@ -78,6 +98,51 @@ def compute_bbox():
     west_lng,  north_lat = local_to_lng_lat(min_x, min_z)
     east_lng,  south_lat = local_to_lng_lat(max_x, max_z)
     return south_lat, west_lng, north_lat, east_lng
+
+
+def compute_building_osm_cells(manifest):
+    """Set of OSM (gx, gz) cells that any building tile bbox overlaps.
+    Proximity filter below uses this to cull chunks / output cells that
+    don't touch NYC's 5-borough coverage."""
+    cells = set()
+    for t in manifest:
+        b = t['bounds']
+        gx0 = math.floor(b['minX'] / GRID_SIZE)
+        gx1 = math.floor((b['maxX'] - 1e-6) / GRID_SIZE)
+        gz0 = math.floor(b['minZ'] / GRID_SIZE)
+        gz1 = math.floor((b['maxZ'] - 1e-6) / GRID_SIZE)
+        for gx in range(gx0, gx1 + 1):
+            for gz in range(gz0, gz1 + 1):
+                cells.add((gx, gz))
+    return cells
+
+
+def cell_near_building(gx, gz, building_cells, pad=BUILDING_PROXIMITY_CELLS):
+    for dx in range(-pad, pad + 1):
+        for dz in range(-pad, pad + 1):
+            if (gx + dx, gz + dz) in building_cells:
+                return True
+    return False
+
+
+def chunk_near_building(chunk, building_cells, pad=BUILDING_PROXIMITY_CELLS):
+    """True if any OSM cell inside `chunk`'s lng/lat bbox (expanded by `pad`
+    cells) is in `building_cells`. Used to skip Overpass chunks that cover
+    only New Jersey / open ocean / other regions we never render."""
+    s, w, n, e = chunk
+    sw_x, sw_z = lng_lat_to_local(w, s)
+    ne_x, ne_z = lng_lat_to_local(e, n)
+    min_x, max_x = min(sw_x, ne_x), max(sw_x, ne_x)
+    min_z, max_z = min(sw_z, ne_z), max(sw_z, ne_z)
+    gx0 = math.floor(min_x / GRID_SIZE) - pad
+    gx1 = math.floor(max_x / GRID_SIZE) + pad
+    gz0 = math.floor(min_z / GRID_SIZE) - pad
+    gz1 = math.floor(max_z / GRID_SIZE) + pad
+    for gx in range(gx0, gx1 + 1):
+        for gz in range(gz0, gz1 + 1):
+            if (gx, gz) in building_cells:
+                return True
+    return False
 
 
 # ── Overpass fetch ────────────────────────────────────────────────────────────
@@ -89,16 +154,19 @@ OVERPASS_QUERY = """
 (
   way["highway"]({bbox});
 
-  way["natural"~"^(water|wood|grassland|scrub|heath|wetland|beach)$"]({bbox});
+  way["natural"~"^(water|bay|strait|wood|grassland|scrub|heath|wetland|beach)$"]({bbox});
   way["waterway"="riverbank"]({bbox});
-  relation["natural"="water"]({bbox});
+  way["landuse"="reservoir"]({bbox});
+  relation["natural"~"^(water|bay|strait)$"]({bbox});
   relation["waterway"="riverbank"]({bbox});
+  relation["landuse"="reservoir"]({bbox});
 
   way["leisure"~"^(park|garden|playground|recreation_ground|pitch|nature_reserve|golf_course)$"]({bbox});
   way["landuse"~"^(grass|forest|meadow|recreation_ground|cemetery|village_green|orchard|farmland)$"]({bbox});
   relation["leisure"~"^(park|garden|recreation_ground|nature_reserve|golf_course)$"]({bbox});
   relation["landuse"~"^(grass|forest|meadow|recreation_ground|cemetery)$"]({bbox});
 );
+(._;>;);
 out geom;
 """
 
@@ -141,8 +209,10 @@ def fetch_chunk(chunk, timeout=180):
     return _post_overpass(query, timeout=timeout).get('elements', [])
 
 
-def fetch_overpass(bbox, use_cache=True):
+def fetch_overpass(bbox, building_cells, use_cache=True):
     """Split the bbox into CHUNK_DEG × CHUNK_DEG chunks and fetch each.
+    Chunks that don't overlap any NYC building cell (within
+    BUILDING_PROXIMITY_CELLS) are skipped entirely — no fetch, no parse.
     Per-chunk JSON is cached under data/overpass_chunks/ so re-running after
     a partial failure resumes where it left off. Returns merged, deduped
     elements in the same shape as a raw Overpass response."""
@@ -161,7 +231,13 @@ def fetch_overpass(bbox, use_cache=True):
             lng = elng
         lat = nlat
 
-    print(f'Splitting bbox into {len(chunks)} chunks of up to {CHUNK_DEG}°')
+    # Drop chunks that don't touch NYC. Each chunk is ~5 km; the proximity
+    # pad (750 m default) is much smaller, so any chunk with no building
+    # cells near its bbox is entirely off-coverage.
+    total_chunks = len(chunks)
+    chunks = [c for c in chunks if chunk_near_building(c, building_cells)]
+    print(f'Splitting bbox into {len(chunks)} chunks of up to {CHUNK_DEG}° '
+          f'(skipped {total_chunks - len(chunks)} off-coverage)')
     os.makedirs(CHUNK_CACHE_DIR, exist_ok=True)
 
     all_elements = []
@@ -282,22 +358,43 @@ def triangulate(outer, holes=None):
 
 # ── Feature classification ────────────────────────────────────────────────────
 
+# Parks/reserves whose polygons enclose huge bays or harbours — painting them
+# green covers up the water inside. Easier to blocklist by name than to clip
+# geometry. Substring match, case-insensitive.
+PARK_NAME_BLOCKLIST = [
+    'jamaica bay',           # Wildlife Refuge — polygon covers the whole bay
+    'gateway national',      # NRA — same story, includes Jamaica Bay unit
+]
+
+
+def _park_name_blocklisted(name):
+    if not name:
+        return False
+    lower = name.lower()
+    return any(b in lower for b in PARK_NAME_BLOCKLIST)
+
+
 def feature_kind(tags):
     """Bucket an OSM element's tags into 'street', 'water', 'green', or None."""
     if tags.get('highway'):
         return 'street'
-    if tags.get('natural') == 'water' or tags.get('waterway') == 'riverbank':
+    # 'bay' / 'strait' catch older tagging (e.g. Upper NY Bay) where the water
+    # body isn't wrapped in a 'natural=water' + 'water=bay' combo. landuse=
+    # reservoir covers Central Park's Jacqueline Kennedy Onassis Reservoir.
+    if (tags.get('natural') in {'water', 'bay', 'strait'}
+            or tags.get('waterway') == 'riverbank'
+            or tags.get('landuse') == 'reservoir'):
         return 'water'
     if tags.get('leisure') in {
         'park', 'garden', 'playground', 'recreation_ground',
         'pitch', 'nature_reserve', 'golf_course'
     }:
-        return 'green'
+        return None if _park_name_blocklisted(tags.get('name')) else 'green'
     if tags.get('landuse') in {
         'grass', 'forest', 'meadow', 'recreation_ground',
         'cemetery', 'village_green', 'orchard', 'farmland'
     }:
-        return 'green'
+        return None if _park_name_blocklisted(tags.get('name')) else 'green'
     if tags.get('natural') in {'wood', 'grassland', 'scrub', 'heath', 'wetland'}:
         return 'green'
     return None
@@ -353,12 +450,95 @@ def polyline_cells(points):
     return cells
 
 
-def bbox_cells(points):
-    """All cells covered by the bounding box of a polyline/polygon."""
-    xs = [p[0] for p in points]; zs = [p[1] for p in points]
-    gx0 = math.floor(min(xs) / GRID_SIZE); gx1 = math.floor(max(xs) / GRID_SIZE)
-    gz0 = math.floor(min(zs) / GRID_SIZE); gz1 = math.floor(max(zs) / GRID_SIZE)
-    return {(gx, gz) for gx in range(gx0, gx1 + 1) for gz in range(gz0, gz1 + 1)}
+def simplify_ring(ring, tol):
+    """Douglas-Peucker on a closed ring (first == last). Strips closure,
+    simplifies the open polyline (preserving endpoints), then re-appends
+    the closure. Returns the simplified closed ring.
+
+    Skips simplification when the ring's bbox diagonal is small enough
+    that the tolerance would risk collapsing the whole feature (< ~5× tol).
+    """
+    if len(ring) < 4:
+        return ring
+    xs = [p[0] for p in ring]; zs = [p[1] for p in ring]
+    diag = math.hypot(max(xs) - min(xs), max(zs) - min(zs))
+    if diag < 5 * tol:
+        return ring
+
+    open_pts = ring[:-1]  # drop closing duplicate
+    n = len(open_pts)
+    if n < 3:
+        return ring
+
+    keep = [False] * n
+    keep[0] = keep[-1] = True
+    # Iterative DP — stack of (lo, hi) index pairs. Finds the point on
+    # segment [lo, hi] with max perpendicular distance; if > tol, keep
+    # and recurse on (lo, idx) and (idx, hi).
+    stack = [(0, n - 1)]
+    tol2 = tol * tol
+    while stack:
+        lo, hi = stack.pop()
+        if hi - lo < 2:
+            continue
+        x0, z0 = open_pts[lo]
+        x1, z1 = open_pts[hi]
+        dx, dz = x1 - x0, z1 - z0
+        seg_len2 = dx * dx + dz * dz
+        max_d2 = -1.0
+        idx = -1
+        if seg_len2 < 1e-12:
+            # Degenerate segment — use raw distance from lo.
+            for i in range(lo + 1, hi):
+                px, pz = open_pts[i]
+                d2 = (px - x0) ** 2 + (pz - z0) ** 2
+                if d2 > max_d2:
+                    max_d2 = d2; idx = i
+        else:
+            for i in range(lo + 1, hi):
+                px, pz = open_pts[i]
+                # Perpendicular distance² from p to infinite line through
+                # (x0,z0)-(x1,z1). cross² / seg_len².
+                cross = dx * (z0 - pz) - dz * (x0 - px)
+                d2 = cross * cross / seg_len2
+                if d2 > max_d2:
+                    max_d2 = d2; idx = i
+        if max_d2 > tol2:
+            keep[idx] = True
+            stack.append((lo, idx))
+            stack.append((idx, hi))
+
+    out = [open_pts[i] for i in range(n) if keep[i]]
+    out.append(out[0])  # close the ring
+    return out
+
+
+def bucket_triangles_by_cell(tri):
+    """Group a flat XZ triangle list (6 floats per tri) by the cells each
+    triangle's bbox touches. Returns { (gx, gz): [flat tris in this cell] }.
+
+    Why per-triangle instead of per-polygon bbox: a huge polygon like Upper
+    NY Bay has an envelope thousands of cells wide. Writing the full
+    triangulated polygon into each envelope cell would duplicate many MB of
+    geometry per tile. Per-triangle assignment keeps each tile's payload
+    proportional to the geometry actually overlapping it."""
+    buckets = {}
+    for ti in range(0, len(tri), 6):
+        x0, z0 = tri[ti],     tri[ti + 1]
+        x1, z1 = tri[ti + 2], tri[ti + 3]
+        x2, z2 = tri[ti + 4], tri[ti + 5]
+        gx_min = math.floor(min(x0, x1, x2) / GRID_SIZE)
+        gx_max = math.floor(max(x0, x1, x2) / GRID_SIZE)
+        gz_min = math.floor(min(z0, z1, z2) / GRID_SIZE)
+        gz_max = math.floor(max(z0, z1, z2) / GRID_SIZE)
+        for gx in range(gx_min, gx_max + 1):
+            for gz in range(gz_min, gz_max + 1):
+                bucket = buckets.get((gx, gz))
+                if bucket is None:
+                    bucket = []
+                    buckets[(gx, gz)] = bucket
+                bucket.extend((x0, z0, x1, z1, x2, z2))
+    return buckets
 
 
 # ── Main ──────────────────────────────────────────────────────────────────────
@@ -377,8 +557,10 @@ def main():
         if removed:
             print(f'Dropped {removed} cached chunks')
 
-    bbox = compute_bbox()
-    osm  = fetch_overpass(bbox, use_cache=use_cache)
+    bldg_manifest  = read_building_manifest()
+    bbox           = compute_bbox(bldg_manifest)
+    building_cells = compute_building_osm_cells(bldg_manifest)
+    osm            = fetch_overpass(bbox, building_cells, use_cache=use_cache)
 
     elements = osm.get('elements', [])
     print(f'\nParsing {len(elements)} OSM elements …')
@@ -427,10 +609,14 @@ def main():
                                                  pts[0][1] - pts[-1][1]) < 0.01):
                     if pts[0] != pts[-1]:
                         pts = pts + [pts[0]]
+                    if kind == 'water':
+                        pts = simplify_ring(pts, WATER_SIMPLIFY_TOL_M)
+                        if len(pts) < 4:
+                            continue
                     tri = triangulate(pts)
                     if tri:
-                        rounded = [round(v, 2) for v in tri]
-                        for cell in bbox_cells(pts):
+                        for cell, tris in bucket_triangles_by_cell(tri).items():
+                            rounded = [round(v, 2) for v in tris]
                             cell_entry(cell)[kind].append(rounded)
                         if kind == 'water': n_water += 1
                         else:               n_green += 1
@@ -460,6 +646,12 @@ def main():
             outer_rings = stitch_rings(outers_frags)
             inner_rings = stitch_rings(inners_frags)
 
+            if kind == 'water':
+                outer_rings = [simplify_ring(r, WATER_SIMPLIFY_TOL_M) for r in outer_rings]
+                outer_rings = [r for r in outer_rings if len(r) >= 4]
+                inner_rings = [simplify_ring(r, WATER_SIMPLIFY_TOL_M) for r in inner_rings]
+                inner_rings = [r for r in inner_rings if len(r) >= 4]
+
             # Assign each hole to the outer ring that contains it (by centroid).
             def point_in_ring(p, ring):
                 inside = False
@@ -486,8 +678,8 @@ def main():
                 tri = triangulate(outer, holes=outer_holes[i])
                 if not tri:
                     continue
-                rounded = [round(v, 2) for v in tri]
-                for cell in bbox_cells(outer):
+                for cell, tris in bucket_triangles_by_cell(tri).items():
+                    rounded = [round(v, 2) for v in tris]
                     cell_entry(cell)[kind].append(rounded)
                 if kind == 'water': n_water += 1
                 else:               n_green += 1
@@ -499,8 +691,12 @@ def main():
 
     manifest = []
     total_size_kb = 0
+    dropped_off_coverage = 0
     for (gx, gz), entry in sorted(cell_data.items()):
         if not (entry['streets'] or entry['water'] or entry['green']):
+            continue
+        if not cell_near_building(gx, gz, building_cells):
+            dropped_off_coverage += 1
             continue
         tile_id = f'cell_{gx}_{gz}'
         out_path = os.path.join(OUTPUT_DIR, f'{tile_id}.json')
@@ -527,6 +723,7 @@ def main():
 
     print(f'\n{"─" * 50}')
     print(f'OSM tiles written : {len(manifest)}')
+    print(f'Dropped off-coverage : {dropped_off_coverage}')
     print(f'Total size        : {total_size_kb / 1024:.1f} MB')
     print(f'Avg per tile      : {total_size_kb / max(len(manifest), 1):.0f} KB')
     print(f'Manifest          : {manifest_path}')

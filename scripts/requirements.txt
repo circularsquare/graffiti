@@ -2,3 +2,4 @@ lxml
 pyproj
 numpy
 mapbox-earcut
+rasterio

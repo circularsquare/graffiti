@@ -1,20 +1,21 @@
 meoww!
 
-- add random travel button? or fast travel
-- walk up really shallow cliffs
-- add minimap to floor visually (and tile borders? on ctrl d)
-- gradual acceleration
-- glitching between narrow gap
 - draw on floor 
-- cylinder / thin ffaces?
-- map mode
-- mouse keeps snapping in random direction
-have random location put u in a loading screen, also spawn u facing horizontally
+
+- topography
 - increase load dist if theres like no buildings nearby
 - add bridges...
   - statue of liberty
-  - see if there are any  huge buildings in the data? break them up? merge small ones?
-- fps display 
+  - trains??
+  - see if there are any huge buildings in the data? break them up? merge small ones?
+
+- cylinder tweak / thin faces?
+- build time face merging?
+
+- terrain 
+  - stitch holes on tile borders 
+
+is movement speed dependent on frame rate?
 
 
 file size

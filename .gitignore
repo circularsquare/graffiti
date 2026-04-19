@@ -8,3 +8,4 @@ data/
 public/buildings.json
 public/tiles/
 public/osm/
+public/terrain/
