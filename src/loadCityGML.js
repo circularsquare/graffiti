@@ -1,7 +1,7 @@
 import * as THREE from 'three';
 
 // ─── Grid textures ────────────────────────────────────────────────────────────
-// Each canvas tile = one 2×2 m grid cell. The texture repeats via UV coords.
+// Each canvas tile = one 1×1 m grid cell. The texture repeats via UV coords.
 
 function makeGridTexture(bgHex, lineRGBA, size = 256, lineWidth = 4) {
   const canvas = document.createElement('canvas');
@@ -56,7 +56,7 @@ const BUILDING_MAT = new THREE.MeshToonMaterial({ color: 0xf5f3ef, map: gridTex,
 // texture lines — easy to tell which lines are cell boundaries (blue) vs
 // face boundaries (green) at a glance.
 const BORDER_COLOR      = new THREE.Color(0x1e7a4e);
-const BORDER_HALF_WIDTH = 0.03;   // metres — ≈ grid line width (4 px / 256 px × 2 m)
+const BORDER_HALF_WIDTH = 0.015;  // metres — ≈ grid line width (4 px / 256 px × 1 m)
 const BORDER_OPACITY    = 0.7;
 
 function injectBorderShader(mat) {
@@ -100,7 +100,7 @@ gl_FragColor.rgb = mix(gl_FragColor.rgb, uBorderColor, _lineEdge * uBorderOpacit
 
 injectBorderShader(BUILDING_MAT);
 
-export const GRID_SIZE = 2.0; // metres per grid cell — must match tileWorker.js
+export const GRID_SIZE = 1.0; // metres per grid cell — must match tileWorker.js
 
 /**
  * Wrap a worker MeshData object into a THREE.Mesh. The heavy work — UVs,

@@ -14,7 +14,10 @@
       "Bash(python3 -c \":*)",
       "Bash(py -c \":*)",
       "Read(//c/Users/anita/.claude/**)",
-      "WebSearch"
+      "WebSearch",
+      "Bash(python -c ' *)",
+      "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/fetch_osm_features.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
+      "Read(//c/Users/anita/projects/graffiti/**)"
     ],
     "additionalDirectories": [
       "C:\\Users\\anita\\.claude"

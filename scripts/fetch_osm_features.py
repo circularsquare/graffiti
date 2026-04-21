@@ -1,18 +1,16 @@
 #!/usr/bin/env python3
 """
 Fetch OSM features (streets + water + green spaces) via the Overpass API and
-tile them into 250 m grid cells, matching the building-tile layout.
+tile them into 125 m grid cells.
 
 Outputs:
-    public/osm/cell_{gx}_{gz}.json   — one file per non-empty cell
-    public/osm/manifest.json         — tile index with world-space bounds
+    public/osm/cell_{gx}_{gz}.bin.gz — one gzipped binary file per non-empty cell
+    public/osm/manifest.json          — tile index with world-space bounds
 
-Per-cell JSON:
-{
-  "streets": [ { "type": "residential", "points": [[x, z], ...], "name"?: "..." }, ... ],
-  "water":   [ [x, z, x, z, x, z, ...], ... ],   // flat XZ triangle lists, one per polygon
-  "green":   [ [x, z, x, z, x, z, ...], ... ]
-}
+The binary layout is defined inline in encode_tile_binary(). Tile coords are
+stored as int32 decimetres relative to each tile's world origin, so the whole
+dataset ships at ~1/5 the size of the old JSON format after gzip. See
+src/OsmManager.js for the decoder.
 
 Usage:
     python scripts/fetch_osm_features.py
@@ -21,15 +19,26 @@ All coordinates are in local metres, same system as geo.js (X = east, Z = south,
 relative to REF_LNG / REF_LAT).
 """
 
-import os, sys, json, math, time
+import os, sys, json, math, time, struct, gzip
 import urllib.request, urllib.parse
 import mapbox_earcut as earcut
 import numpy as np
 
-# OSM tile grid — 250 m cells. Building tiles use a finer 125 m grid, so one
-# OSM cell covers a 2×2 block of building cells. We still index by OSM cell
-# throughout this script.
-GRID_SIZE = 250
+# Binary tile format — see encode_tile_binary() below. Written gzipped to
+# cell_{gx}_{gz}.bin.gz so the on-wire size is ~5× smaller than the old
+# per-cell JSON and hosting doesn't need to negotiate Content-Encoding.
+BIN_MAGIC   = 0x4D534F47   # 'GOSM' little-endian
+BIN_VERSION = 1
+# Coords are stored as int32 decimeters relative to the tile's world origin
+# (gx * GRID_SIZE, gz * GRID_SIZE). int32 range (±214 km) covers large ocean
+# triangles that extend far past a 125 m cell; 10 cm precision is finer than
+# the 0.24 m/px terrain canvas can resolve.
+BIN_COORD_SCALE = 10   # metres → decimetres
+
+# OSM tile grid — 125 m cells. Smaller tiles make each per-tile drape in
+# OsmManager cheaper (O(triangles), which scale with area), so the frame
+# hitches when new tiles load are shorter and less noticeable.
+GRID_SIZE = 125
 
 # Douglas-Peucker tolerance for water polygon simplification (metres). NYC
 # harbor coastlines in OSM are sampled every 10–30 cm; simplifying to 1 m
@@ -41,10 +50,20 @@ WATER_SIMPLIFY_TOL_M = 1.0
 # When writing and fetching, keep only OSM cells within this many cells of a
 # NYC building tile. Our building coverage (DoITT CityGML) defines the 5
 # boroughs we care about; rectangular bbox fetch otherwise pulls in a lot of
-# New Jersey and mid-harbour cells we never show. 6 cells = 1500 m pad —
-# wide enough that the far bank of the Hudson and the middle of Upper NY
-# Bay still carry water; NJ and open ocean still get dropped.
-BUILDING_PROXIMITY_CELLS = 6
+# New Jersey and mid-harbour cells we never show. 24 cells = 3000 m pad —
+# wide enough to cover all of Jamaica Bay (~3 km from the nearest shore
+# buildings to the bay's midpoint). The tradeoff: cells up to ~1.5 km into NJ
+# (roughly the Hoboken waterfront) are now included, but since NJ has no
+# building tiles those cells only appear near the Manhattan waterfront in-game.
+BUILDING_PROXIMITY_CELLS = 24
+
+# Features within BLEED_M of a cell boundary are ALSO assigned to the cell
+# across that boundary. That way when two tiles rasterise their feature lists
+# onto per-tile 1024² canvases, the pixels near the shared edge both include
+# the feature and rasterise to the same colour — eliminating the hairline
+# seam you'd otherwise see at 125 m boundaries in the terrain shader's OSM
+# texture sampling. Must match src/OsmManager.js::OSM_TEXTURE_BLEED_M.
+BLEED_M = 2.0
 
 REF_LNG = -74.01175
 REF_LAT = 40.70475
@@ -67,6 +86,11 @@ OVERPASS_URLS = [
 # latitude — small enough to stay well under the default 180 s Overpass
 # timeout even for dense highway queries.
 CHUNK_DEG = 0.05
+
+# Fallback bbox used when --bbox is passed without an explicit value. Covers
+# the 5 NYC boroughs with a small margin — roughly the historical coverage
+# the building manifest used to span before the FiDi-iteration trim.
+DEFAULT_FULL_BBOX = (40.49, -74.27, 40.92, -73.68)   # (south, west, north, east)
 
 
 # ── Coordinate helpers ────────────────────────────────────────────────────────
@@ -155,11 +179,15 @@ OVERPASS_QUERY = """
   way["highway"]({bbox});
 
   way["natural"~"^(water|bay|strait|wood|grassland|scrub|heath|wetland|beach)$"]({bbox});
-  way["waterway"="riverbank"]({bbox});
+  way["waterway"~"^(riverbank|dock|basin)$"]({bbox});
   way["landuse"="reservoir"]({bbox});
+  way["water"="reservoir"]({bbox});
+  way["leisure"="marina"]({bbox});
   relation["natural"~"^(water|bay|strait)$"]({bbox});
-  relation["waterway"="riverbank"]({bbox});
+  relation["waterway"~"^(riverbank|dock|basin)$"]({bbox});
   relation["landuse"="reservoir"]({bbox});
+  relation["water"="reservoir"]({bbox});
+  relation["leisure"="marina"]({bbox});
 
   way["leisure"~"^(park|garden|playground|recreation_ground|pitch|nature_reserve|golf_course)$"]({bbox});
   way["landuse"~"^(grass|forest|meadow|recreation_ground|cemetery|village_green|orchard|farmland)$"]({bbox});
@@ -177,7 +205,14 @@ def _chunk_cache_path(chunk):
 
 
 def _post_overpass(query, timeout=180):
-    """POST a query against mirrors in order. Returns parsed JSON or raises."""
+    """POST a query against mirrors in order. Returns parsed JSON or raises.
+
+    For a given mirror we only retry on 429/503-style rate-limit responses
+    (where a short backoff is worth a second try). On a timeout or other
+    generic failure we move straight to the next mirror — the same mirror
+    is almost always still overloaded a few seconds later, and retrying it
+    just doubles the wall-time cost of every failed chunk.
+    """
     data = urllib.parse.urlencode({'data': query}).encode()
     last_err = None
     for url in OVERPASS_URLS:
@@ -192,14 +227,15 @@ def _post_overpass(query, timeout=180):
                 last_err = e
                 print(f'    {url}: HTTP {e.code}')
                 if e.code in (429, 504, 502, 503):
-                    # Back off before trying again / next mirror.
+                    # Back off and try this mirror once more — rate limits
+                    # often clear in a few seconds.
                     time.sleep(8 * (attempt + 1))
-                else:
-                    break  # hard failure — don't retry on this URL
+                    continue
+                break  # hard failure — don't retry on this URL
             except Exception as e:
                 last_err = e
                 print(f'    {url}: {e}')
-                time.sleep(4)
+                break  # timeout / network error — try next mirror immediately
     raise RuntimeError(f'All Overpass mirrors failed: {last_err}')
 
 
@@ -380,10 +416,14 @@ def feature_kind(tags):
         return 'street'
     # 'bay' / 'strait' catch older tagging (e.g. Upper NY Bay) where the water
     # body isn't wrapped in a 'natural=water' + 'water=bay' combo. landuse=
-    # reservoir covers Central Park's Jacqueline Kennedy Onassis Reservoir.
+    # reservoir covers older-style tagging; water=reservoir the modern sub-tag.
+    # waterway=dock covers enclosed harbor basins (Red Hook, Navy Yard, etc.).
+    # leisure=marina covers marina water areas.
     if (tags.get('natural') in {'water', 'bay', 'strait'}
-            or tags.get('waterway') == 'riverbank'
-            or tags.get('landuse') == 'reservoir'):
+            or tags.get('waterway') in {'riverbank', 'dock', 'basin'}
+            or tags.get('landuse') == 'reservoir'
+            or tags.get('water') == 'reservoir'
+            or tags.get('leisure') == 'marina'):
         return 'water'
     if tags.get('leisure') in {
         'park', 'garden', 'playground', 'recreation_ground',
@@ -436,18 +476,129 @@ def segment_cells(p0, p1):
 
 
 def polyline_cells(points):
-    """Set of cells touched by a polyline."""
+    """Set of cells touched by a polyline, or within BLEED_M of one of its
+    points. The bleed lets features near a cell boundary appear in both
+    adjacent tiles so their canvas rasterisations match at the shared edge.
+
+    Used for the cell bbox enumeration; per-cell polyline content is built by
+    bucket_polyline_by_cell which clips to each cell's bleed-expanded bbox."""
     cells = set()
     if not points:
         return cells
     if len(points) == 1:
         x, z = points[0]
-        cells.add((math.floor(x / GRID_SIZE), math.floor(z / GRID_SIZE)))
+        cells.update(_bleed_cells_for_point(x, z))
         return cells
     for p0, p1 in zip(points, points[1:]):
         for c in segment_cells(p0, p1):
             cells.add(c)
+    # Also include bleed cells around each vertex — near-edge points get
+    # their boundary-crossing neighbour added. Cheap because BLEED_M ≪
+    # GRID_SIZE, so each point adds at most 1-3 neighbour cells.
+    for (x, z) in points:
+        cells.update(_bleed_cells_for_point(x, z))
     return cells
+
+
+def _clip_polyline_to_bbox(points, x_min, x_max, z_min, z_max):
+    """Clip an open polyline to an axis-aligned bbox. Returns a list of
+    sub-polylines (each a list of (x, z) points) — a polyline that leaves
+    and re-enters the bbox produces multiple pieces. Empty list if no part
+    of the polyline is inside the bbox.
+
+    Liang-Barsky per-segment with continuity: consecutive segments whose
+    clipped portions share an endpoint get stitched into a single sub-
+    polyline; a segment that leaves the bbox terminates the current sub-
+    polyline."""
+    if len(points) < 2:
+        return []
+    out = []
+    current = []
+    for i in range(len(points) - 1):
+        ax, az = points[i]
+        bx, bz = points[i + 1]
+        t0, t1 = 0.0, 1.0
+        dx, dz = bx - ax, bz - az
+        ok = True
+        # Clip parameter t to the intersection of the 4 half-planes.
+        for p, q in ((-dx, ax - x_min), (dx,  x_max - ax),
+                     (-dz, az - z_min), (dz,  z_max - az)):
+            if p == 0:
+                if q < 0:
+                    ok = False
+                    break
+            else:
+                r = q / p
+                if p < 0:
+                    if r > t1: ok = False; break
+                    if r > t0: t0 = r
+                else:
+                    if r < t0: ok = False; break
+                    if r < t1: t1 = r
+        if not ok or t0 > t1:
+            # Whole segment outside — terminate any open sub-polyline.
+            if current:
+                out.append(current)
+                current = []
+            continue
+        sx, sz = ax + t0 * dx, az + t0 * dz
+        ex, ez = ax + t1 * dx, az + t1 * dz
+        if not current:
+            current.append((sx, sz))
+        else:
+            # Continuity check: if the previous segment's clipped end
+            # doesn't match this segment's clipped start, the polyline left
+            # and re-entered the bbox between them → start a new sub-poly.
+            prev = current[-1]
+            if abs(prev[0] - sx) > 1e-6 or abs(prev[1] - sz) > 1e-6:
+                out.append(current)
+                current = [(sx, sz)]
+        current.append((ex, ez))
+        # If this segment's clipped end was shortened (t1 < 1), the next
+        # segment starts outside → terminate the sub-polyline.
+        if t1 < 1.0 - 1e-9:
+            out.append(current)
+            current = []
+    if current:
+        out.append(current)
+    return out
+
+
+def bucket_polyline_by_cell(points):
+    """Per-cell clipped polylines for a street. Each cell gets only the
+    portion of the polyline inside its bleed-expanded bbox; a polyline
+    crossing N cells is split into N pieces instead of being duplicated
+    whole. Returns { (gx, gz): [sub_polyline, ...] }."""
+    if not points:
+        return {}
+    xs = [p[0] for p in points]
+    zs = [p[1] for p in points]
+    gx_min = math.floor((min(xs) - BLEED_M) / GRID_SIZE)
+    gx_max = math.floor((max(xs) + BLEED_M) / GRID_SIZE)
+    gz_min = math.floor((min(zs) - BLEED_M) / GRID_SIZE)
+    gz_max = math.floor((max(zs) + BLEED_M) / GRID_SIZE)
+    out = {}
+    for gx in range(gx_min, gx_max + 1):
+        for gz in range(gz_min, gz_max + 1):
+            x_min = gx * GRID_SIZE - BLEED_M
+            x_max = (gx + 1) * GRID_SIZE + BLEED_M
+            z_min = gz * GRID_SIZE - BLEED_M
+            z_max = (gz + 1) * GRID_SIZE + BLEED_M
+            subs = _clip_polyline_to_bbox(points, x_min, x_max, z_min, z_max)
+            if subs:
+                out[(gx, gz)] = subs
+    return out
+
+
+def _bleed_cells_for_point(x, z):
+    """Cells whose bounds are within BLEED_M of (x, z)."""
+    gx_min = math.floor((x - BLEED_M) / GRID_SIZE)
+    gx_max = math.floor((x + BLEED_M) / GRID_SIZE)
+    gz_min = math.floor((z - BLEED_M) / GRID_SIZE)
+    gz_max = math.floor((z + BLEED_M) / GRID_SIZE)
+    return {(gx, gz)
+            for gx in range(gx_min, gx_max + 1)
+            for gz in range(gz_min, gz_max + 1)}
 
 
 def simplify_ring(ring, tol):
@@ -513,35 +664,243 @@ def simplify_ring(ring, tol):
     return out
 
 
+def _clip_poly_half_plane(poly, axis, bound, sign):
+    """Sutherland-Hodgman clip of a convex polygon against one axis-aligned
+    half-plane. `poly` is a list of (x, z); `axis` is 0 (clip on x) or 1
+    (clip on z); `sign` is +1 to keep points with value >= bound, -1 for <=.
+    Returns the clipped polygon (possibly empty)."""
+    if not poly:
+        return poly
+    out = []
+    n = len(poly)
+    for i in range(n):
+        a = poly[i]
+        b = poly[(i + 1) % n]
+        a_in = (a[axis] - bound) * sign >= -1e-9
+        b_in = (b[axis] - bound) * sign >= -1e-9
+        if a_in:
+            out.append(a)
+        if a_in != b_in:
+            denom = b[axis] - a[axis]
+            t = (bound - a[axis]) / denom if denom else 0.0
+            out.append((a[0] + t * (b[0] - a[0]),
+                        a[1] + t * (b[1] - a[1])))
+    return out
+
+
+def _clip_tri_to_bbox(x0, z0, x1, z1, x2, z2, x_min, x_max, z_min, z_max):
+    """Clip a triangle to an axis-aligned bbox and fan-triangulate the
+    resulting convex polygon. Returns a flat [x,z,x,z,...] triangle list,
+    empty if the triangle lies entirely outside the bbox."""
+    poly = [(x0, z0), (x1, z1), (x2, z2)]
+    poly = _clip_poly_half_plane(poly, 0, x_min,  1)
+    poly = _clip_poly_half_plane(poly, 0, x_max, -1)
+    poly = _clip_poly_half_plane(poly, 1, z_min,  1)
+    poly = _clip_poly_half_plane(poly, 1, z_max, -1)
+    if len(poly) < 3:
+        return []
+    out = []
+    for i in range(1, len(poly) - 1):
+        out.extend((poly[0][0], poly[0][1],
+                    poly[i][0], poly[i][1],
+                    poly[i + 1][0], poly[i + 1][1]))
+    return out
+
+
 def bucket_triangles_by_cell(tri):
     """Group a flat XZ triangle list (6 floats per tri) by the cells each
-    triangle's bbox touches. Returns { (gx, gz): [flat tris in this cell] }.
+    triangle's bbox touches. Each source triangle is Sutherland-Hodgman
+    clipped to each cell's (bleed-expanded) bounds before being written, so
+    the per-tile payload stays bounded by what actually intersects the tile.
 
-    Why per-triangle instead of per-polygon bbox: a huge polygon like Upper
-    NY Bay has an envelope thousands of cells wide. Writing the full
-    triangulated polygon into each envelope cell would duplicate many MB of
-    geometry per tile. Per-triangle assignment keeps each tile's payload
-    proportional to the geometry actually overlapping it."""
+    Without the clip, a single ocean triangle from Upper NY Bay (~10 km
+    across) would be bucketed whole into every cell its bbox overlaps; at
+    runtime OsmManager._tessellateTri would then iterate every 2 m terrain
+    block in that triangle's full bbox, emitting millions of sub-triangles
+    per tile and OOMing the tab. Clipping here bounds each source triangle
+    at the tile scale (~125 m), keeping runtime tessellation proportional
+    to the tile's own area."""
     buckets = {}
     for ti in range(0, len(tri), 6):
         x0, z0 = tri[ti],     tri[ti + 1]
         x1, z1 = tri[ti + 2], tri[ti + 3]
         x2, z2 = tri[ti + 4], tri[ti + 5]
-        gx_min = math.floor(min(x0, x1, x2) / GRID_SIZE)
-        gx_max = math.floor(max(x0, x1, x2) / GRID_SIZE)
-        gz_min = math.floor(min(z0, z1, z2) / GRID_SIZE)
-        gz_max = math.floor(max(z0, z1, z2) / GRID_SIZE)
+        gx_min = math.floor((min(x0, x1, x2) - BLEED_M) / GRID_SIZE)
+        gx_max = math.floor((max(x0, x1, x2) + BLEED_M) / GRID_SIZE)
+        gz_min = math.floor((min(z0, z1, z2) - BLEED_M) / GRID_SIZE)
+        gz_max = math.floor((max(z0, z1, z2) + BLEED_M) / GRID_SIZE)
         for gx in range(gx_min, gx_max + 1):
             for gz in range(gz_min, gz_max + 1):
+                # Clip to the cell's bleed-expanded bbox — matching the
+                # bleed semantics of polyline_cells (features within BLEED_M
+                # of a boundary appear in both adjacent tiles, so seam
+                # rendering lines up).
+                x_min = gx * GRID_SIZE - BLEED_M
+                x_max = (gx + 1) * GRID_SIZE + BLEED_M
+                z_min = gz * GRID_SIZE - BLEED_M
+                z_max = (gz + 1) * GRID_SIZE + BLEED_M
+                clipped = _clip_tri_to_bbox(
+                    x0, z0, x1, z1, x2, z2,
+                    x_min, x_max, z_min, z_max,
+                )
+                if not clipped:
+                    continue
                 bucket = buckets.get((gx, gz))
                 if bucket is None:
                     bucket = []
                     buckets[(gx, gz)] = bucket
-                bucket.extend((x0, z0, x1, z1, x2, z2))
+                bucket.extend(clipped)
     return buckets
 
 
+# ── Binary tile encoding ──────────────────────────────────────────────────────
+
+def _pack_coords(flat_xz, origin_x, origin_z):
+    """Convert a flat [x, z, x, z, ...] float list into int32 decimeter bytes
+    (little-endian) relative to (origin_x, origin_z)."""
+    if not flat_xz:
+        return b''
+    arr = np.asarray(flat_xz, dtype=np.float64)
+    arr[0::2] -= origin_x
+    arr[1::2] -= origin_z
+    arr *= BIN_COORD_SCALE
+    return np.rint(arr).astype('<i4').tobytes()
+
+
+def _pad4(buf):
+    """Pad `buf` (bytearray) with zero bytes up to the next 4-byte boundary."""
+    while len(buf) & 3:
+        buf.append(0)
+
+
+def encode_tile_binary(entry, gx, gz):
+    """Serialize one tile's streets/water/green to the binary format.
+
+    Layout (little-endian):
+      Header: uint32 magic, uint8 version, uint8 reserved,
+              int16 gx, int16 gz, uint8 typeCount, uint8 reserved
+      Type table:  per type: uint8 len, bytes utf8; then pad to 4B
+      Streets:     uint32 count; per street:
+                     uint8 typeIdx, uint8 nameLen, uint16 pointCount,
+                     bytes name (utf8), pad to 4B,
+                     int32 coords[pointCount * 2]   (tile-local decimeters)
+      Water:       uint32 polyCount; per poly:
+                     uint32 coordCount (= numTris * 6),
+                     int32 coords[coordCount]
+      Green:       same as water.
+    """
+    streets = entry.get('streets') or []
+    water   = entry.get('water')   or []
+    green   = entry.get('green')   or []
+
+    origin_x = gx * GRID_SIZE
+    origin_z = gz * GRID_SIZE
+
+    # Type table — inline per tile. Most tiles use only a handful of highway
+    # types so the overhead is tiny, and keeping the mapping in-file means
+    # bake and runtime stay in sync without a shared enum constant.
+    type_list = []
+    type_idx  = {}
+    for s in streets:
+        t = s.get('type') or ''
+        if t not in type_idx:
+            type_idx[t] = len(type_list)
+            type_list.append(t)
+    if len(type_list) > 255:
+        raise ValueError(f'tile {gx},{gz}: too many street types ({len(type_list)})')
+
+    buf = bytearray()
+    buf += struct.pack('<IBBhhBB', BIN_MAGIC, BIN_VERSION, 0, gx, gz, len(type_list), 0)
+
+    for t in type_list:
+        tb = t.encode('utf-8')[:255]
+        buf.append(len(tb))
+        buf += tb
+    _pad4(buf)
+
+    buf += struct.pack('<I', len(streets))
+    for s in streets:
+        pts = s.get('points') or []
+        name_bytes = (s.get('name') or '').encode('utf-8')[:255]
+        buf += struct.pack('<BBH', type_idx[s.get('type') or ''], len(name_bytes), len(pts))
+        buf += name_bytes
+        _pad4(buf)
+        if pts:
+            flat = [v for xz in pts for v in xz]
+            buf += _pack_coords(flat, origin_x, origin_z)
+
+    buf += struct.pack('<I', len(water))
+    for tris in water:
+        buf += struct.pack('<I', len(tris))
+        buf += _pack_coords(tris, origin_x, origin_z)
+
+    buf += struct.pack('<I', len(green))
+    for tris in green:
+        buf += struct.pack('<I', len(tris))
+        buf += _pack_coords(tris, origin_x, origin_z)
+
+    return bytes(buf)
+
+
+def _cleanup_stale_tiles(output_dir, keep_ids):
+    """Remove any cell_*.json or cell_*.bin.gz files whose tile_id isn't in
+    `keep_ids`. Previous bakes may have left orphans from cells that are now
+    empty or off-coverage."""
+    removed = 0
+    for name in os.listdir(output_dir):
+        if not name.startswith('cell_'):
+            continue
+        tile_id = name.split('.', 1)[0]
+        if tile_id in keep_ids and name.endswith('.bin.gz'):
+            continue
+        # Drop stale .json from the old format and any .bin.gz for cells we
+        # no longer emit.
+        if name.endswith('.json') or name.endswith('.bin.gz'):
+            os.remove(os.path.join(output_dir, name))
+            removed += 1
+    if removed:
+        print(f'Cleaned up {removed} stale tile files')
+
+
 # ── Main ──────────────────────────────────────────────────────────────────────
+
+def _parse_bbox_override(argv):
+    """Return a (south, west, north, east) tuple if --bbox is in argv, else None.
+
+    Forms:
+      --bbox                         use DEFAULT_FULL_BBOX (all 5 NYC boroughs)
+      --bbox <south,west,north,east> explicit bbox (comma-separated, deg)
+    """
+    if '--bbox' not in argv:
+        return None
+    i = argv.index('--bbox')
+    val = argv[i + 1] if i + 1 < len(argv) and not argv[i + 1].startswith('--') else None
+    if val is None:
+        return DEFAULT_FULL_BBOX
+    try:
+        s, w, n, e = (float(x) for x in val.split(','))
+    except ValueError:
+        print(f'--bbox expected "south,west,north,east", got {val!r}')
+        sys.exit(2)
+    return s, w, n, e
+
+
+def _synthetic_building_cells(bbox):
+    """When --bbox overrides the manifest-derived bbox, we also need a
+    building_cells set that keeps the whole bbox "on coverage" for
+    chunk_near_building + cell_near_building. Return every OSM cell (gx, gz)
+    whose 125 m bounds intersect the bbox."""
+    s, w, n, e = bbox
+    sw_x, sw_z = lng_lat_to_local(w, s)
+    ne_x, ne_z = lng_lat_to_local(e, n)
+    min_x, max_x = min(sw_x, ne_x), max(sw_x, ne_x)
+    min_z, max_z = min(sw_z, ne_z), max(sw_z, ne_z)
+    gx0 = math.floor(min_x / GRID_SIZE)
+    gx1 = math.floor(max_x / GRID_SIZE)
+    gz0 = math.floor(min_z / GRID_SIZE)
+    gz1 = math.floor(max_z / GRID_SIZE)
+    return {(gx, gz) for gx in range(gx0, gx1 + 1) for gz in range(gz0, gz1 + 1)}
+
 
 def main():
     os.makedirs(OUTPUT_DIR, exist_ok=True)
@@ -557,10 +916,19 @@ def main():
         if removed:
             print(f'Dropped {removed} cached chunks')
 
-    bldg_manifest  = read_building_manifest()
-    bbox           = compute_bbox(bldg_manifest)
-    building_cells = compute_building_osm_cells(bldg_manifest)
-    osm            = fetch_overpass(bbox, building_cells, use_cache=use_cache)
+    bldg_manifest = read_building_manifest()
+    bbox_override = _parse_bbox_override(sys.argv)
+    if bbox_override is not None:
+        bbox = bbox_override
+        # Synthetic coverage set so the chunk + write filters don't drop cells
+        # just because the (intentionally-trimmed) building manifest is small.
+        building_cells = _synthetic_building_cells(bbox)
+        print(f'Using --bbox override: {bbox} '
+              f'({len(building_cells)} coverage cells)')
+    else:
+        bbox           = compute_bbox(bldg_manifest)
+        building_cells = compute_building_osm_cells(bldg_manifest)
+    osm = fetch_overpass(bbox, building_cells, use_cache=use_cache)
 
     elements = osm.get('elements', [])
     print(f'\nParsing {len(elements)} OSM elements …')
@@ -591,15 +959,24 @@ def main():
             pts = [lng_lat_to_local(pt['lon'], pt['lat']) for pt in geom]
 
             if kind == 'street':
-                street = {
-                    'type':   tags.get('highway'),
-                    'points': [[round(x, 2), round(z, 2)] for x, z in pts],
-                }
+                highway_type = tags.get('highway')
                 name = tags.get('name')
-                if name:
-                    street['name'] = name
-                for cell in polyline_cells(pts):
-                    cell_entry(cell)['streets'].append(street)
+                # Split the polyline into per-cell clipped sub-polylines so
+                # a street crossing N cells lives in N tiles as N trimmed
+                # pieces, not N copies of the whole polyline. At runtime
+                # each sub-polyline becomes its own ribbon, keeping street
+                # ribbon geometry proportional to the tile's own area.
+                for cell, subs in bucket_polyline_by_cell(pts).items():
+                    for sub in subs:
+                        if len(sub) < 2:
+                            continue
+                        street = {
+                            'type':   highway_type,
+                            'points': [[round(x, 2), round(z, 2)] for x, z in sub],
+                        }
+                        if name:
+                            street['name'] = name
+                        cell_entry(cell)['streets'].append(street)
                 n_streets += 1
             else:
                 # Polygon feature — way's geometry is a closed ring (first == last)
@@ -691,7 +1068,9 @@ def main():
 
     manifest = []
     total_size_kb = 0
+    total_raw_kb  = 0
     dropped_off_coverage = 0
+    kept_ids = set()
     for (gx, gz), entry in sorted(cell_data.items()):
         if not (entry['streets'] or entry['water'] or entry['green']):
             continue
@@ -699,34 +1078,41 @@ def main():
             dropped_off_coverage += 1
             continue
         tile_id = f'cell_{gx}_{gz}'
-        out_path = os.path.join(OUTPUT_DIR, f'{tile_id}.json')
-        with open(out_path, 'w') as f:
-            json.dump(entry, f, separators=(',', ':'))
-        size_kb = os.path.getsize(out_path) / 1024
-        total_size_kb += size_kb
+        kept_ids.add(tile_id)
 
+        raw = encode_tile_binary(entry, gx, gz)
+        payload = gzip.compress(raw, compresslevel=6)
+        out_path = os.path.join(OUTPUT_DIR, f'{tile_id}.bin.gz')
+        with open(out_path, 'wb') as f:
+            f.write(payload)
+        total_raw_kb += len(raw) / 1024
+        total_size_kb += len(payload) / 1024
+
+        # streetCount is used by OsmManager.tilesWithStreets(); file URL is
+        # derived client-side from `id`. waterCount/greenCount were unused.
         manifest.append({
             'id':    tile_id,
-            'file':  f'/osm/{tile_id}.json',
             'bounds': {
                 'minX': gx * GRID_SIZE, 'maxX': (gx + 1) * GRID_SIZE,
                 'minZ': gz * GRID_SIZE, 'maxZ': (gz + 1) * GRID_SIZE,
             },
             'streetCount': len(entry['streets']),
-            'waterCount':  len(entry['water']),
-            'greenCount':  len(entry['green']),
         })
+
+    _cleanup_stale_tiles(OUTPUT_DIR, kept_ids)
 
     manifest_path = os.path.join(OUTPUT_DIR, 'manifest.json')
     with open(manifest_path, 'w') as f:
-        json.dump(manifest, f, indent=2)
+        # Compact — every byte of the manifest ships to every client on load.
+        json.dump(manifest, f, separators=(',', ':'))
 
     print(f'\n{"─" * 50}')
     print(f'OSM tiles written : {len(manifest)}')
     print(f'Dropped off-coverage : {dropped_off_coverage}')
-    print(f'Total size        : {total_size_kb / 1024:.1f} MB')
-    print(f'Avg per tile      : {total_size_kb / max(len(manifest), 1):.0f} KB')
-    print(f'Manifest          : {manifest_path}')
+    print(f'Total size (gz)   : {total_size_kb / 1024:.1f} MB')
+    print(f'Total size (raw)  : {total_raw_kb  / 1024:.1f} MB')
+    print(f'Avg per tile (gz) : {total_size_kb / max(len(manifest), 1):.1f} KB')
+    print(f'Manifest          : {manifest_path} ({os.path.getsize(manifest_path) / 1024:.0f} KB)')
 
 
 if __name__ == '__main__':

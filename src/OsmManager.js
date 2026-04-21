@@ -1,24 +1,24 @@
 import * as THREE from 'three';
 import { Font } from 'three/addons/loaders/FontLoader.js';
 import fontData from 'three/examples/fonts/helvetiker_bold.typeface.json';
+import { gridToWorld } from './geo.js';
+import { injectGridOverlay, enableGridExtensions, GRID_SHADER_CACHE_KEY } from './gridShader.js';
 
-// Default load radius used when the caller doesn't pass a getLoadRadius()
-// function (fallback path if TileManager hasn't wired itself up yet).
-const DEFAULT_LOAD_RADIUS   = 650;
-const DEFAULT_UNLOAD_RADIUS = 750;
-
-// Scale factor applied to the building-tile load radius to get the OSM load
-// radius. OSM tiles are cheap (flat meshes, no paint), so we lean long so
-// streets/water already exist the moment buildings pop in.
-const OSM_RADIUS_SCALE = 1.5;
-// Minimum OSM load radius — decoupled from buildings so the LAND-vs-void
-// boundary falls into fog even in dense areas where building radius is at
-// its MIN_LOAD_RADIUS (200 m). Without this, dense areas would show a hard
-// ring of OSM coverage only ~300 m away (200 × 1.5).
-const OSM_MIN_LOAD_RADIUS = 650;
-// Extra metres before an OSM tile unloads past its load radius — mirrors
-// TileManager's hysteresis so we don't thrash at the boundary.
-const OSM_UNLOAD_MARGIN = 100;
+// OSM-specific load radius. Tight (100 m) because draped OSM geometry is
+// by far the heaviest per-tile payload in the client — ~3–20 MB of
+// positions + normals + skirts per tile — and at the old 350 m radius
+// that's 25 tiles × double-digit megabytes loading in the first second
+// after spawn, which crashes the tab on memory-constrained machines.
+// At 100 m only the player's own tile plus partial neighbours stay
+// resident (~1–4 tiles), and distant ground just reads as bare LAND-tan
+// terrain — an acceptable LOD cut since fine polygon detail isn't
+// readable beyond this distance anyway. UNLOAD_MARGIN keeps tiles
+// around for an extra 60 m past the load edge so walking doesn't thrash.
+//
+// Render-distance slider (setRadiusScale) still scales this, so users
+// on strong machines can raise it. Default keeps initial load safe.
+const LOAD_RADIUS       = 100;
+const OSM_UNLOAD_MARGIN = 60;
 
 // Spatial index grid — mirrors TileManager's scheme.
 const COARSE_GRID  = 500;
@@ -50,43 +50,105 @@ const DEFAULT_WIDTH = 5;
 // Y stagger for the flat-mode mesh stack — unused in terrain mode (the
 // canvas texture composites into the terrain shader instead).
 const Y_LAND         = 0.02;
-const Y_WATER        = 0.05;
-const Y_GREEN        = 0.10;
+const Y_WATER        = 0.10;
+const Y_GREEN        = 0.05;
 const Y_STREET       = 0.15;
-const Y_STREET_LABEL = 0.20;
+const Y_STREET_LABEL = 0.50;
 
-// Canvas resolution for each tile's OSM raster (terrain mode only).
-// 250 m / 512 px ≈ 0.49 m/px — plenty sharp for streets and polygon edges
-// without ballooning VRAM. ~40 active tiles × 512² × 4 B ≈ 40 MB.
-const TILE_TEXTURE_SIZE = 512;
+// Overlay colours used by both the flat-mode mesh materials below and the
+// terrain-mode draped meshes. Exported so TerrainManager can use LAND_COLOR
+// as its default terrain material colour — with no OSM mesh drawn on a
+// stretch of terrain, the terrain itself reads as LAND.
+export const LAND_COLOR   = 0xd1c8b7;
+export const WATER_COLOR  = 0x9cc4e2;
+export const GREEN_COLOR  = 0xb8de92;
+export const STREET_COLOR = 0xf3ecd7;
 
-// Overlay colours. CSS strings for Canvas2D raster (terrain mode);
-// mirrored as THREE.Color values on the mesh materials below (flat mode).
-const LAND_COLOR   = '#c4b9a2';
-const WATER_COLOR  = '#7fb3d9';
-const GREEN_COLOR  = '#bcd69c';
-const STREET_COLOR = '#efe6cc';
+// Corner-Y drop threshold (metres) for emitting a block-edge skirt. Any
+// non-zero drop at a shared edge means the union-find did NOT merge those
+// corners, which means terrain has a cliff face there. 5 mm absorbs float-
+// arithmetic rounding in the union-find sum/cnt division without masking
+// genuine sub-block height variation.
+const SKIRT_EPS = 0.005;
 
-// Shared materials for the flat-mode mesh stack. polygonOffset biases each
-// overlay's depth toward the camera so it wins the depth test against the
-// flat ground plane even at horizon distances. Larger units further up the
-// stack so water < green < streets stays consistent.
-const LAND_MAT = new THREE.MeshBasicMaterial({
-  color: 0xc4b9a2, side: THREE.DoubleSide,
-  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -1,
-});
-const WATER_MAT = new THREE.MeshBasicMaterial({
-  color: 0x7fb3d9, side: THREE.DoubleSide,
-  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -2,
-});
-const GREEN_MAT = new THREE.MeshBasicMaterial({
-  color: 0xbcd69c, side: THREE.DoubleSide,
-  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4,
-});
-const STREET_MAT = new THREE.MeshBasicMaterial({
-  color: 0xefe6cc, side: THREE.DoubleSide,
-  polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -6,
-});
+// Terrain-block pitch in grid space (metres). MUST match the bake:
+// CELL_SIZE=125 m, SAMPLES=64 per side → step = 125/64 ≈ 1.953 m. Using a
+// rounded 2.0 here would drift off the real block grid by ~5 cm per cell,
+// and by 20 cells later each clip cell's centroid lands in a neighbouring
+// block than the aligned one — giving a sawtooth where each sub-triangle
+// picks up its own block's interpolated Y and the heights disagree cell to
+// cell. If bake_terrain.py changes SAMPLES, update here.
+const BLOCK_STEP = 125 / 64;
+
+// Y offsets (metres) per layer, relative to the draped terrain surface.
+// Each layer sits a few mm above terrain so it clears the terrain without
+// z-fight flicker at grazing angles (polygonOffset alone gets marginal on
+// long slopes), and layers are stacked so green < water < streets. Water
+// is above green so reservoir/bay polygons show through overlapping park
+// boundaries (e.g. Central Park's leisure=park covers the JKO Reservoir).
+// All kept below paint's +0.025 m offset so graffiti painted on roads/parks
+// still draws on top.
+const DRAPE_Y_WATER  = 0.0024;
+const DRAPE_Y_GREEN  = 0.0016;
+const DRAPE_Y_STREET = 0.0032;
+
+// Shared materials for both flat-mode (fixed-Y mesh stack) and terrain-
+// mode (draped meshes). Lambert-shaded so skirts down cliff faces pick up
+// the same lighting gradient as the terrain cliffs beside them. Same
+// normal-bias hook the terrain material uses (SHADING_STRENGTH below) so
+// vertical faces aren't darker here than on the terrain next to them —
+// visual consistency between the two meshes.
+// polygonOffset keeps the overlay ahead of the ground plane (flat mode)
+// or terrain (terrain mode) in the z-test; larger units further up the
+// stack so green < water < streets stays consistent.
+
+// Must match TerrainManager's SHADING_STRENGTH so OSM skirts and terrain
+// cliff faces shade identically. If that constant moves there, mirror it
+// here — trying to share via import creates a minor circular-import risk
+// (OsmManager already exports symbols TerrainManager consumes).
+const SHADING_STRENGTH = 0.7;
+
+// Apply the same normal-bias as the terrain's Lambert hook: blend each
+// vertex normal toward world-up by (1 − SHADING_STRENGTH), compressing
+// NoL variation so vertical skirts don't read noticeably darker than
+// their draped top faces. Also inject the shared block-grid overlay so the
+// grid sits above draped OSM fills — desired stack is terrain → OSM → grid
+// → paint. Bias runs first so the grid captures the pre-bias geometric
+// normal (see gridShader.js for the ordering contract).
+const _onOsmCompile = function (shader) {
+  shader.vertexShader = shader.vertexShader
+    .replace('#include <beginnormal_vertex>',
+      `#include <beginnormal_vertex>
+       objectNormal = normalize(mix(vec3(0.0, 1.0, 0.0), objectNormal, ${SHADING_STRENGTH.toFixed(3)}));`);
+  injectGridOverlay(shader);
+};
+const _OSM_CACHE_KEY = `graffiti-osm-lambert-v2-${GRID_SHADER_CACHE_KEY}`;
+
+function _makeOsmMaterial(color, polygonOffsetUnits) {
+  const mat = new THREE.MeshLambertMaterial({
+    color, side: THREE.DoubleSide,
+    polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits,
+  });
+  mat.onBeforeCompile = _onOsmCompile;
+  mat.customProgramCacheKey = () => _OSM_CACHE_KEY;
+  enableGridExtensions(mat);
+  return mat;
+}
+
+const LAND_MAT         = _makeOsmMaterial(0xd1c8b7, -1);
+const WATER_MAT        = _makeOsmMaterial(0x9cc4e2, -2);
+const GREEN_MAT        = _makeOsmMaterial(0xb8de92, -4);
+const STREET_MAT       = _makeOsmMaterial(0xf3ecd7, -6);
+
+// Skirt meshes are coplanar with the terrain cliff face (yOffset shift is parallel to the face), so they need real perpendicular separation — see SKIRT_OUT_* below. polygonOffset here is just a belt-and-braces backup; ordering matches tops (street > water > green > terrain).
+const GREEN_SKIRT_MAT  = _makeOsmMaterial(GREEN_COLOR,  -10);
+const WATER_SKIRT_MAT  = _makeOsmMaterial(WATER_COLOR,  -16);
+const STREET_SKIRT_MAT = _makeOsmMaterial(STREET_COLOR, -22);
+
+// Horizontal push (metres) applied to each skirt's XZ at emit time, outward from the cliff face. This is the primary depth separator between layers and the terrain cliff — polygonOffset alone can't carry this at close range because `r * units` shrinks with depth-buffer precision.
+const SKIRT_OUT_GREEN  = 0.002;
+const SKIRT_OUT_WATER  = 0.004;
+const SKIRT_OUT_STREET = 0.006;
 
 // Street-label tuning. Labels are built from real font glyph outlines via
 // ShapeGeometry so they stay crisp at any viewing distance — no texture,
@@ -94,8 +156,109 @@ const STREET_MAT = new THREE.MeshBasicMaterial({
 const LABEL_HEIGHT_M        = 2.5;
 const MIN_LABELED_STREET_M  = 40;   // don't bother labelling tiny service stubs
 const MIN_LABEL_SCALE       = 0.45; // drop labels that would shrink below this to fit
+// Labels only render when the player is within this many metres of them —
+// at a distance they compress to unreadable scribble and waste fill rate.
+const LABEL_VISIBILITY_RANGE_M = 300;
 
 const _font = new Font(fontData);
+
+// ── Binary tile decoder ───────────────────────────────────────────────────────
+//
+// Mirrors scripts/fetch_osm_features.py::encode_tile_binary. See that
+// function for the on-disk layout. Coords are stored as int32 decimetres
+// relative to each tile's world origin (gx*125, gz*125); we undo the shift
+// at decode so downstream rasterisation/meshing code sees the same world-space
+// floats the old JSON path delivered.
+const BIN_MAGIC   = 0x4D534F47;  // 'GOSM' little-endian
+const BIN_VERSION = 1;
+const BIN_GRID_SIZE = 125;
+const BIN_INV_SCALE = 0.1;       // 1 decimetre → 1 metre
+
+async function _fetchOsmTile(fileUrl) {
+  const res = await fetch(fileUrl);
+  if (!res.ok) throw new Error(`HTTP ${res.status}`);
+  // Pipe response bytes through the browser's gzip decompressor. Using the
+  // streaming API avoids buffering the compressed blob separately.
+  const stream = res.body.pipeThrough(new DecompressionStream('gzip'));
+  return _decodeOsmTile(await new Response(stream).arrayBuffer());
+}
+
+function _decodeOsmTile(buffer) {
+  const view = new DataView(buffer);
+  const td   = new TextDecoder();
+  let p = 0;
+
+  const magic = view.getUint32(p, true); p += 4;
+  if (magic !== BIN_MAGIC) throw new Error(`OSM tile: bad magic 0x${magic.toString(16)}`);
+  const version = view.getUint8(p); p += 1;
+  if (version !== BIN_VERSION) throw new Error(`OSM tile: unsupported version ${version}`);
+  p += 1;                                              // reserved
+  const gx = view.getInt16(p, true); p += 2;
+  const gz = view.getInt16(p, true); p += 2;
+  const typeCount = view.getUint8(p); p += 1;
+  p += 1;                                              // reserved
+
+  const types = new Array(typeCount);
+  for (let i = 0; i < typeCount; i++) {
+    const len = view.getUint8(p); p += 1;
+    types[i] = td.decode(new Uint8Array(buffer, p, len));
+    p += len;
+  }
+  p = (p + 3) & ~3;                                    // pad to 4B
+
+  const originX = gx * BIN_GRID_SIZE;
+  const originZ = gz * BIN_GRID_SIZE;
+
+  // Streets
+  const streetCount = view.getUint32(p, true); p += 4;
+  const streets = new Array(streetCount);
+  for (let i = 0; i < streetCount; i++) {
+    const typeIdx    = view.getUint8(p); p += 1;
+    const nameLen    = view.getUint8(p); p += 1;
+    const pointCount = view.getUint16(p, true); p += 2;
+    const name = nameLen > 0 ? td.decode(new Uint8Array(buffer, p, nameLen)) : '';
+    p += nameLen;
+    p = (p + 3) & ~3;
+    // p is 4-byte-aligned here, so the Int32Array view is safe.
+    const coords = new Int32Array(buffer, p, pointCount * 2);
+    p += pointCount * 8;
+    const pts = new Array(pointCount);
+    for (let k = 0; k < pointCount; k++) {
+      pts[k] = [
+        originX + coords[k * 2]     * BIN_INV_SCALE,
+        originZ + coords[k * 2 + 1] * BIN_INV_SCALE,
+      ];
+    }
+    const s = { type: types[typeIdx], points: pts };
+    if (name) s.name = name;
+    streets[i] = s;
+  }
+
+  // Water + green share the same per-polygon layout.
+  const water = _decodePolyList(view, buffer, p, originX, originZ);
+  p = water.end;
+  const green = _decodePolyList(view, buffer, p, originX, originZ);
+
+  return { streets, water: water.polys, green: green.polys };
+}
+
+function _decodePolyList(view, buffer, startP, originX, originZ) {
+  let p = startP;
+  const count = view.getUint32(p, true); p += 4;
+  const polys = new Array(count);
+  for (let i = 0; i < count; i++) {
+    const n = view.getUint32(p, true); p += 4;
+    const coords = new Int32Array(buffer, p, n);
+    p += n * 4;
+    const flat = new Array(n);
+    for (let k = 0; k < n; k += 2) {
+      flat[k]     = originX + coords[k]     * BIN_INV_SCALE;
+      flat[k + 1] = originZ + coords[k + 1] * BIN_INV_SCALE;
+    }
+    polys[i] = flat;
+  }
+  return { polys, end: p };
+}
 
 // Shared material for every label — depthWrite off + polygonOffset biases
 // labels camera-ward so they reliably win over the street layer.
@@ -114,7 +277,7 @@ const LABEL_MAT = new THREE.MeshBasicMaterial({
 const _labelCache = new Map();      // name → { geometry, width, height }
 
 /**
- * Loads OSM "map overlay" tiles (streets, water, green) on the same 250 m grid
+ * Loads OSM "map overlay" tiles (streets, water, green) on the same 125 m grid
  * as building tiles, and renders them as flat meshes at ground level.
  *
  * Each tile renders up to three meshes (streets / water / green), grouped
@@ -122,19 +285,15 @@ const _labelCache = new Map();      // name → { geometry, width, height }
  *
  * Polygons (water, green) may extend past their assigned cell's AABB because
  * we assign by the bbox of the full polygon — that's intentional. The load
- * radius (300 m) is wider than the cell size (250 m) so every polygon that
- * would be visible near the player has its tile loaded, and adjacent tiles
- * stay loaded well past the cell boundary thanks to the unload hysteresis.
+ * radius is wider than the cell size so every polygon that would be visible
+ * near the player has its tile loaded, and adjacent tiles stay loaded well
+ * past the cell boundary thanks to the unload hysteresis.
  */
 export class OsmManager {
-  constructor({ scene, group, getLoadRadius, terrain, flatMode, onTileReady, onTileUnready } = {}) {
+  constructor({ scene, group, terrain, flatMode, showLabels, onTileReady, onTileUnready } = {}) {
     this._scene = scene;
     this._group = group ?? new THREE.Group();
     if (!group && scene) scene.add(this._group);
-    // Optional: function returning the building-tile load radius in metres.
-    // When provided, OSM radius tracks it (scaled by OSM_RADIUS_SCALE) so
-    // streets/water adapt to the same sparsity signal as buildings.
-    this._getLoadRadius = getLoadRadius ?? null;
 
     // Optional TerrainManager — used only for label drape now (labels stay
     // as geometry so text renders crisply). The land/water/green/street
@@ -153,6 +312,12 @@ export class OsmManager {
     // still visible without a terrain shader to composite into.
     this._flatMode = !!flatMode;
 
+    // Whether to draw street-name labels as geometry on top of terrain/ground.
+    // Default true preserves old behaviour. Blocky terrain sets false to avoid
+    // "painting" streets visually while still letting random-teleport use
+    // OSM street data.
+    this._showLabels = showLabels ?? true;
+
     this._tiles        = new Map();           // tileId → TileState
     this._spatialIndex = new Map();           // "gx,gz" → Tile[]
     this._loadQueue    = [];
@@ -160,9 +325,59 @@ export class OsmManager {
     this._lastPx       = 0;
     this._lastPz       = 0;
 
+    // User-facing render-distance multiplier applied to LOAD_RADIUS in tick().
+    this._radiusScale  = 1;
+
     // Raw streets cache for random-spawn sampling. Stores the in-flight Promise
     // so two concurrent callers share one fetch; resolved value replaces it.
     this._streetsCache = new Map();           // tileId → Array<street> | Promise
+
+    // Tessellation worker. Main posts raw source polygons/streets; worker
+    // returns interleaved 7-float-per-vertex `topXz` arrays plus the list of
+    // terrain blocks each layer covers. Main still runs skirt emission and
+    // Y resolution because both need live terrain state. Only used in
+    // terrain mode; flat mode stays entirely on main.
+    this._worker = new Worker(new URL('./osmWorker.js', import.meta.url), { type: 'module' });
+    this._pendingBuilds = new Map(); // jobId → { resolve, reject }
+    this._nextJobId = 1;
+    this._worker.onmessage = (e) => {
+      const msg = e.data;
+      const pending = this._pendingBuilds.get(msg.jobId);
+      if (!pending) return;
+      this._pendingBuilds.delete(msg.jobId);
+      if (msg.type === 'drapeResult') pending.resolve(msg);
+      else if (msg.type === 'error')  pending.reject(new Error(msg.error));
+    };
+    this._worker.onerror = (e) => {
+      console.error('OsmManager worker error:', e.message);
+    };
+  }
+
+  _postDrapeJob(payload) {
+    const jobId = this._nextJobId++;
+    return new Promise((resolve, reject) => {
+      this._pendingBuilds.set(jobId, { resolve, reject });
+      this._worker.postMessage({ type: 'buildDrape', jobId, ...payload });
+    });
+  }
+
+  setRadiusScale(s) { this._radiusScale = s; }
+
+  /**
+   * Toggle each loaded tile's street labels on/off based on the player's XZ
+   * distance to the label's anchor. Call from the caller's cull-update hook —
+   * it already runs with hysteresis so per-frame cost isn't an issue.
+   */
+  updateLabelVisibility(px, pz) {
+    const r2 = LABEL_VISIBILITY_RANGE_M * LABEL_VISIBILITY_RANGE_M;
+    for (const tile of this._tiles.values()) {
+      if (tile.status !== 'loaded' || !tile.labels) continue;
+      for (const mesh of tile.labels) {
+        const dx = mesh.userData.anchorX - px;
+        const dz = mesh.userData.anchorZ - pz;
+        mesh.visible = dx * dx + dz * dz < r2;
+      }
+    }
   }
 
   async init(manifestUrl = '/osm/manifest.json') {
@@ -179,7 +394,9 @@ export class OsmManager {
     for (const entry of entries) {
       const tile = {
         id:          entry.id,
-        file:        entry.file,
+        // Manifest no longer stores `file` — it's deterministic from `id`.
+        // Accept the old field for forward/backward compatibility.
+        file:        entry.file ?? `/osm/${entry.id}.bin.gz`,
         bounds:      entry.bounds,
         streetCount: entry.streetCount ?? 0,
         status:      'unloaded',
@@ -230,9 +447,7 @@ export class OsmManager {
     const tile = this._tiles.get(tileId);
     if (!tile) return [];
     const promise = (async () => {
-      const res = await fetch(tile.file);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      const data = await _fetchOsmTile(tile.file);
       const streets = data.streets || [];
       this._streetsCache.set(tileId, streets);
       return streets;
@@ -264,12 +479,8 @@ export class OsmManager {
   tick(px, pz) {
     this._lastPx = px; this._lastPz = pz;
 
-    const loadR = this._getLoadRadius
-      ? Math.max(OSM_MIN_LOAD_RADIUS, this._getLoadRadius() * OSM_RADIUS_SCALE)
-      : DEFAULT_LOAD_RADIUS;
-    const unloadR = this._getLoadRadius
-      ? loadR + OSM_UNLOAD_MARGIN
-      : DEFAULT_UNLOAD_RADIUS;
+    const loadR    = LOAD_RADIUS * this._radiusScale;
+    const unloadR  = loadR + OSM_UNLOAD_MARGIN;
     const loadR2   = loadR   ** 2;
     const unloadR2 = unloadR ** 2;
 
@@ -311,42 +522,19 @@ export class OsmManager {
   async _doLoad(tile) {
     this._activeLoads++;
     try {
-      const res = await fetch(tile.file);
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
+      const data = await _fetchOsmTile(tile.file);
+      // Cache decoded source on the tile so `redrapeOverBounds` can rebuild
+      // the drape meshes (not just re-sample Y) when a covering terrain
+      // cell arrives after OSM — skirts are only emitted at build time, so
+      // a tile built before its terrain arrives needs a full rebuild to
+      // recover missing cliff-face coverage. Tiny memory cost (~kB per
+      // tile, ~4 tiles loaded).
+      tile.sourceData = data;
+      await this._buildTileMeshes(tile);
 
-      const group = new THREE.Group();
-      _buildStreetLabels(data.streets || [], group, this._terrain);
-
-      if (this._flatMode) {
-        // Pre-terrain rendering path: flat stacked meshes at Y_LAND..Y_STREET.
-        // Used when terrain is disabled (`VITE_TERRAIN=0`) so no canvas
-        // texture or terrain shader is needed.
-        group.add(_buildLandMesh(tile.bounds));
-        const water = _buildPolygonMesh(data.water  || [], Y_WATER,  WATER_MAT,  1);
-        if (water)   group.add(water);
-        const green = _buildPolygonMesh(data.green  || [], Y_GREEN,  GREEN_MAT,  2);
-        if (green)   group.add(green);
-        const streets = _buildStreetMesh(data.streets || [], Y_STREET, STREET_MAT, 3);
-        if (streets) group.add(streets);
-      } else {
-        // Terrain mode: rasterise features to a top-down canvas; the terrain
-        // shader samples it per-fragment so no overlay geometry is needed.
-        const canvas  = _rasterizeTile(tile.bounds, data);
-        const texture = new THREE.CanvasTexture(canvas);
-        texture.wrapS     = THREE.ClampToEdgeWrapping;
-        texture.wrapT     = THREE.ClampToEdgeWrapping;
-        texture.magFilter = THREE.LinearFilter;
-        texture.minFilter = THREE.LinearFilter;
-        texture.flipY     = false; // canvas row 0 = minZ, matches shader uv.y=0
-        tile.texture = texture;
-      }
-
-      if (group.children.length > 0) {
-        this._group.add(group);
-        tile.group = group;
-      }
-
+      // Tile could have been cancelled mid-build if we later add that path; for
+      // now status stays 'loading' until here, but guard defensively.
+      if (tile.status === 'unloaded') return;
       tile.status = 'loaded';
       if (this._onTileReady) this._onTileReady(tile);
     } catch (e) {
@@ -355,6 +543,88 @@ export class OsmManager {
     } finally {
       this._drainQueue();
     }
+  }
+
+  /**
+   * Build all the meshes for a tile from its cached `sourceData`. Called by
+   * `_doLoad` on first load, and by `redrapeOverBounds` when a terrain cell
+   * arrives under an OSM tile whose drape was marked incomplete (i.e. built
+   * before some of its covering terrain was loaded, so skirts were skipped).
+   * Rebuilds set `tile.drapeComplete` to whether the new build managed to
+   * sample all needed terrain — if still false, a future terrain arrival
+   * will trigger another rebuild.
+   */
+  async _buildTileMeshes(tile) {
+    const data = tile.sourceData;
+    if (!data) return;
+
+    const group = new THREE.Group();
+    const labels = [];
+    if (this._showLabels) _buildStreetLabels(data.streets || [], group, this._terrain, labels);
+    tile.labels = labels;
+
+    if (this._flatMode) {
+      // Pre-terrain rendering path: flat stacked meshes at Y_LAND..Y_STREET.
+      // Used when terrain is disabled (`VITE_TERRAIN=0`) so no canvas
+      // texture or terrain shader is needed.
+      group.add(_buildLandMesh(tile.bounds));
+      const water = _buildPolygonMesh(data.water  || [], Y_WATER,  WATER_MAT,  2);
+      if (water)   group.add(water);
+      const green = _buildPolygonMesh(data.green  || [], Y_GREEN,  GREEN_MAT,  1);
+      if (green)   group.add(green);
+      const streets = _buildStreetMesh(data.streets || [], Y_STREET, STREET_MAT, 3);
+      if (streets) group.add(streets);
+      tile.drapeComplete = true;
+    } else {
+      // Terrain mode: worker tessellates each source triangle down to the 2 m
+      // block grid, returning interleaved 7-float-per-vertex top arrays + the
+      // list of covered blocks. Main then emits skirts (needs terrain state)
+      // and finalizes meshes. Skirt emission and Y resolution both live on
+      // main because both depend on live `terrain.getBlockCorners` lookups.
+      tile.drapables = [];
+      const result = await this._postDrapeJob({
+        water:      data.water   || [],
+        green:      data.green   || [],
+        streets:    data.streets || [],
+        hasTerrain: !!this._terrain,
+      });
+
+      // Bail if the tile was unloaded during the worker roundtrip (keeps us
+      // from attaching meshes to a disposed group).
+      if (tile.status === 'unloaded') return;
+
+      _applyDrapeLayer(result.water,   WATER_MAT,  WATER_SKIRT_MAT,  2, this._terrain, DRAPE_Y_WATER,  tile.drapables, group, SKIRT_OUT_WATER);
+      _applyDrapeLayer(result.green,   GREEN_MAT,  GREEN_SKIRT_MAT,  1, this._terrain, DRAPE_Y_GREEN,  tile.drapables, group, SKIRT_OUT_GREEN);
+      _applyDrapeLayer(result.streets, STREET_MAT, STREET_SKIRT_MAT, 3, this._terrain, DRAPE_Y_STREET, tile.drapables, group, SKIRT_OUT_STREET);
+
+      // `stats.missingTerrain` used to live here but was never written; the
+      // drape is considered complete after any build. If partial-terrain
+      // tracking comes back, hook it into `_applyDrapeLayer` / the drape
+      // sampler and set `drapeComplete` accordingly.
+      tile.drapeComplete = true;
+    }
+
+    if (group.children.length > 0) {
+      this._group.add(group);
+      tile.group = group;
+    }
+  }
+
+  /**
+   * Dispose the tile's current meshes so `_buildTileMeshes` can rebuild
+   * from scratch. Does not touch tile.sourceData (we need it to rebuild)
+   * and does not toggle tile.status (tile is still logically loaded).
+   */
+  _disposeTileMeshes(tile) {
+    if (tile.group) {
+      for (const child of tile.group.children) {
+        if (child.geometry && !child.userData.sharedGeometry) child.geometry.dispose();
+      }
+      this._group.remove(tile.group);
+      tile.group = null;
+    }
+    tile.drapables = null;
+    tile.labels = null;
   }
 
   _drainQueue() {
@@ -375,21 +645,69 @@ export class OsmManager {
 
   _unload(tile) {
     if (this._onTileUnready) this._onTileUnready(tile);
-    if (tile.group) {
-      for (const child of tile.group.children) {
-        // Label geometry is shared via _labelCache; all overlay materials
-        // (LAND_MAT / WATER_MAT / GREEN_MAT / STREET_MAT / LABEL_MAT) are
-        // shared too. Only per-tile geometry gets disposed here.
-        if (child.geometry && !child.userData.sharedGeometry) child.geometry.dispose();
-      }
-      this._group.remove(tile.group);
-      tile.group = null;
-    }
-    if (tile.texture) {
-      tile.texture.dispose();
-      tile.texture = null;
-    }
+    this._disposeTileMeshes(tile);
+    tile.sourceData = null;
+    tile.drapeComplete = false;
     tile.status = 'unloaded';
+  }
+
+  /**
+   * Fire-and-forget rebuild. Coalesces rapid repeat requests: if a rebuild is
+   * already in flight when we're called, we don't stack — we flag a
+   * follow-up and trigger it once the current one settles. Used by the
+   * redrape path where many terrain cells can land in quick succession.
+   */
+  _rebuildTile(tile) {
+    if (tile.rebuildInFlight) { tile.rebuildQueued = true; return; }
+    tile.rebuildInFlight = true;
+    this._disposeTileMeshes(tile);
+    this._buildTileMeshes(tile).catch(e => {
+      console.error(`OsmManager: rebuild ${tile.id} failed:`, e);
+    }).finally(() => {
+      tile.rebuildInFlight = false;
+      if (tile.rebuildQueued && tile.status === 'loaded') {
+        tile.rebuildQueued = false;
+        this._rebuildTile(tile);
+      } else {
+        tile.rebuildQueued = false;
+      }
+    });
+  }
+
+  /**
+   * Called by main.js when a TerrainManager cell finishes loading.
+   *
+   * Two paths per overlapping OSM tile:
+   *   - tile.drapeComplete: just re-sample Ys on the existing mesh (fast,
+   *     in-place position-buffer rewrite). Covers the common case where
+   *     terrain arrives later under a tile whose drape already had full
+   *     terrain coverage at build.
+   *   - !tile.drapeComplete: dispose + rebuild from cached sourceData via
+   *     `_rebuildTile` (fire-and-forget, coalesces concurrent requests).
+   *
+   * `bounds` is expected in WORLD space. Callers (main.js::onTerrainLoaded)
+   * convert from terrain's grid-space bounds via gridToWorld corners first.
+   */
+  redrapeOverBounds(bounds) {
+    if (!this._terrain) return;
+    for (const tile of this._tiles.values()) {
+      if (tile.status !== 'loaded') continue;
+      const b = tile.bounds;
+      if (b.maxX <= bounds.minX || b.minX >= bounds.maxX ||
+          b.maxZ <= bounds.minZ || b.minZ >= bounds.maxZ) continue;
+
+      if (tile.drapeComplete) {
+        if (tile.drapables) {
+          for (const drap of tile.drapables) _redrapeMesh(drap, this._terrain);
+        }
+      } else {
+        // Full rebuild — drape was incomplete at last build. _buildTileMeshes
+        // flips tile.drapeComplete based on whether this build managed to
+        // sample all needed terrain; if still false, the next terrain-cell
+        // arrival will trigger another rebuild.
+        this._rebuildTile(tile);
+      }
+    }
   }
 }
 
@@ -402,61 +720,243 @@ function _closestDist2(px, pz, b) {
 }
 
 // Sample the terrain at (x, z) and add the overlay's stack offset. If the
-// covering terrain tile hasn't loaded yet, return offset directly — the
-// mesh will drape later as tiles stream in (for now, rebuild-on-ready isn't
-// wired, so the vertex sits at y=offset until the OSM tile itself reloads).
+// covering terrain tile hasn't loaded yet, return offset directly. For
+// terrain-mode OSM overlays, OsmManager.redrapeOverBounds rewrites these
+// vertices when the covering terrain tile lands.
+//
+// Uses sampleTriangulated (not sample) so each vertex lands on the exact
+// rendered surface — sampleTriangulated honours the NW-SE diagonal split
+// the terrain renderer uses. Combined with block-granular rasterization
+// (_emitCoveredBlock emits both diagonal halves using the same 4 corner
+// Ys), the drape is perfectly coplanar with the terrain's block top.
 function drapeY(terrain, x, z, offset) {
   if (!terrain) return offset;
-  const t = terrain.sample(x, z);
+  const t = terrain.sampleTriangulated
+    ? terrain.sampleTriangulated(x, z)
+    : terrain.sample(x, z);
   return (t !== null ? t : 0) + offset;
 }
 
-// ── Tile rasterisation ────────────────────────────────────────────────────────
+// ── Terrain-mode draped builders ──────────────────────────────────────────────
 //
-// Rasterise one OSM tile's features to a top-down Canvas2D. Order matters:
-// LAND fills the whole canvas first (opaque), then water + green polygons
-// overdraw where they exist, then streets stroke on top. The resulting
-// CanvasTexture is sampled by the terrain shader at each terrain fragment's
-// world XZ, so coordinates in this function correspond 1:1 to the terrain
-// surface underneath — no polygon offsets, no z-fighting.
+// For each source triangle (water/green tri or street ribbon segment),
+// clip to each 2 m block it touches, split along the NW-SE diagonal (so
+// each sub-poly lies inside one terrain triangle), and fan-triangulate.
+// Vertices land at polygon-edge intersection points, preserving polygon-
+// edge detail on the block top — a block can show multiple polygon
+// colours with sharp boundaries between them. Each vertex samples the
+// terrain via sampleTriangulated at its exact position, so the drape sits
+// coplanar with the terrain's rendered block top.
+//
+// Tessellation (clip/fan-triangulate/emit) lives in osmWorker.js so the
+// main thread doesn't spike 500+ ms on tile load. Main keeps the skirt
+// emit + Y-resolution + mesh-finalize stages below, because all three
+// depend on live `terrain.getBlockCorners` lookups that would be ugly to
+// snapshot and ship into the worker.
+//
+// Vertex layout in the returned `topXz`: 7 floats per vertex:
+//   [0]   posX    world X
+//   [1]   posZ    world Z
+//   [2]   gridU   terrain-grid U of this vertex
+//   [3]   gridV   terrain-grid V of this vertex
+//   [4]   blockGx global block index in U direction (integer stored as float)
+//   [5]   blockGz global block index in V direction
+//   [6]   keepNE  1.0 → NE triangle half (tx > tz), 0.0 → SW half (tx ≤ tz)
+// _drapeIntoPositions reads these back and computes Y directly from
+// terrain.getBlockCorners() using the exact same bilinear formula that
+// terrainWorker uses for sampleTriangulated — no world→grid round-trip.
 
-function _rasterizeTile(bounds, data) {
-  const { minX, maxX, minZ, maxZ } = bounds;
-  const w = maxX - minX;
-  const d = maxZ - minZ;
-  const SIZE = TILE_TEXTURE_SIZE;
-  const canvas = document.createElement('canvas');
-  canvas.width  = SIZE;
-  canvas.height = SIZE;
-  const ctx = canvas.getContext('2d');
+// Emit one skirt vertex (7 floats) into `outXZ`. `u, v` is the grid-space
+// position on the block edge; blockGx/blockGz identify which block's corner
+// to look up; cornerIdx selects the corner: 0=NW, 1=NE, 2=SE, 3=SW.
+// Stored as typeFlag = 2 + cornerIdx (≥ 2 signals "skirt" to _drapeIntoPositions).
+// gridU/gridV slots are unused for skirt vertices (always 0).
+function _emitSkirtVert(u, v, blockGx, blockGz, cornerIdx, outXZ) {
+  const [wx, wz] = gridToWorld(u, v);
+  outXZ.push(wx, wz, 0, 0, blockGx, blockGz, 2.0 + cornerIdx);
+}
 
-  // World XZ → canvas pixel coords (flipY=false on the texture, so row 0 is
-  // minZ, row N is maxZ).
-  const sx = SIZE / w;
-  const sz = SIZE / d;
-  const wx2px = (x) => (x - minX) * sx;
-  const wz2py = (z) => (z - minZ) * sz;
+// For each block in `coveredBlocks`, check all four edges. If the home
+// block's corner is higher than the adjacent block's shared corner by more
+// than SKIRT_EPS, emit a vertical quad matching the terrain's cliff face.
+// The threshold mirrors the union-find invariant: if adjacent corners ended
+// up in the same component (no cliff), they have the exact same Y value and
+// the drop is 0 — well below SKIRT_EPS. Any positive drop ≥ SKIRT_EPS means
+// terrain emits a side face there, and we need to cover it with OSM colour.
+//
+// `coveredBlocks` is a flat Int32Array of [gx0, gz0, gx1, gz1, ...] pairs —
+// the worker packs the Set into this layout so the whole buffer ships as a
+// transferable instead of getting deep-cloned.
+function _emitBlockSkirts(coveredBlocks, terrain, outXZ, outwardPush = 0) {
+  if (!terrain?.getBlockCorners || !coveredBlocks) return;
+  for (let bi = 0; bi < coveredBlocks.length; bi += 2) {
+    const gx = coveredBlocks[bi];
+    const gz = coveredBlocks[bi + 1];
+    const home = terrain.getBlockCorners(gx, gz);
+    if (!home) continue;
+    const { yNW, yNE, ySE, ySW } = home;
+    const u0 = gx * BLOCK_STEP, u1 = (gx + 1) * BLOCK_STEP;
+    const v0 = gz * BLOCK_STEP, v1 = (gz + 1) * BLOCK_STEP;
 
-  // LAND base — opaque fill makes the tile read as "inside OSM coverage"
-  // wherever water/green/streets aren't drawn on top.
-  ctx.fillStyle = LAND_COLOR;
-  ctx.fillRect(0, 0, SIZE, SIZE);
+    // North edge — home NW/NE vs nbr (gx, gz-1) SW/SE. Outward = -V.
+    const nN = terrain.getBlockCorners(gx, gz - 1);
+    if (nN && (yNW - nN.ySW > SKIRT_EPS || yNE - nN.ySE > SKIRT_EPS)) {
+      const vP = v0 - outwardPush;
+      _emitSkirtVert(u0, vP, gx,     gz,     0, outXZ);  // home NW  top-L
+      _emitSkirtVert(u1, vP, gx,     gz,     1, outXZ);  // home NE  top-R
+      _emitSkirtVert(u1, vP, gx,     gz - 1, 2, outXZ);  // nbr  SE  bot-R
+      _emitSkirtVert(u0, vP, gx,     gz,     0, outXZ);  // home NW  top-L
+      _emitSkirtVert(u1, vP, gx,     gz - 1, 2, outXZ);  // nbr  SE  bot-R
+      _emitSkirtVert(u0, vP, gx,     gz - 1, 3, outXZ);  // nbr  SW  bot-L
+    }
 
-  if (data.water && data.water.length) {
-    ctx.fillStyle = WATER_COLOR;
-    _drawTriangleList(ctx, data.water, wx2px, wz2py);
+    // South edge — home SW/SE vs nbr (gx, gz+1) NW/NE. Outward = +V.
+    const nS = terrain.getBlockCorners(gx, gz + 1);
+    if (nS && (ySW - nS.yNW > SKIRT_EPS || ySE - nS.yNE > SKIRT_EPS)) {
+      const vP = v1 + outwardPush;
+      _emitSkirtVert(u1, vP, gx,     gz,     2, outXZ);  // home SE  top-R
+      _emitSkirtVert(u0, vP, gx,     gz,     3, outXZ);  // home SW  top-L
+      _emitSkirtVert(u0, vP, gx,     gz + 1, 0, outXZ);  // nbr  NW  bot-L
+      _emitSkirtVert(u1, vP, gx,     gz,     2, outXZ);  // home SE  top-R
+      _emitSkirtVert(u0, vP, gx,     gz + 1, 0, outXZ);  // nbr  NW  bot-L
+      _emitSkirtVert(u1, vP, gx,     gz + 1, 1, outXZ);  // nbr  NE  bot-R
+    }
+
+    // West edge — home NW/SW vs nbr (gx-1, gz) NE/SE. Outward = -U.
+    const nW = terrain.getBlockCorners(gx - 1, gz);
+    if (nW && (yNW - nW.yNE > SKIRT_EPS || ySW - nW.ySE > SKIRT_EPS)) {
+      const uP = u0 - outwardPush;
+      _emitSkirtVert(uP, v1, gx,     gz,     3, outXZ);  // home SW  top-L
+      _emitSkirtVert(uP, v0, gx,     gz,     0, outXZ);  // home NW  top-R
+      _emitSkirtVert(uP, v0, gx - 1, gz,     1, outXZ);  // nbr  NE  bot-R
+      _emitSkirtVert(uP, v1, gx,     gz,     3, outXZ);  // home SW  top-L
+      _emitSkirtVert(uP, v0, gx - 1, gz,     1, outXZ);  // nbr  NE  bot-R
+      _emitSkirtVert(uP, v1, gx - 1, gz,     2, outXZ);  // nbr  SE  bot-L
+    }
+
+    // East edge — home NE/SE vs nbr (gx+1, gz) NW/SW. Outward = +U.
+    const nE = terrain.getBlockCorners(gx + 1, gz);
+    if (nE && (yNE - nE.yNW > SKIRT_EPS || ySE - nE.ySW > SKIRT_EPS)) {
+      const uP = u1 + outwardPush;
+      _emitSkirtVert(uP, v0, gx,     gz,     1, outXZ);  // home NE  top-L
+      _emitSkirtVert(uP, v1, gx,     gz,     2, outXZ);  // home SE  top-R
+      _emitSkirtVert(uP, v1, gx + 1, gz,     3, outXZ);  // nbr  SW  bot-R
+      _emitSkirtVert(uP, v0, gx,     gz,     1, outXZ);  // home NE  top-L
+      _emitSkirtVert(uP, v1, gx + 1, gz,     3, outXZ);  // nbr  SW  bot-R
+      _emitSkirtVert(uP, v0, gx + 1, gz,     0, outXZ);  // nbr  NW  bot-L
+    }
   }
+}
 
-  if (data.green && data.green.length) {
-    ctx.fillStyle = GREEN_COLOR;
-    _drawTriangleList(ctx, data.green, wx2px, wz2py);
+// Build a draped THREE.Mesh from an interleaved per-vertex 7-float array
+// (see the "Vertex layout" comment up top for the field breakdown). `xzOwn`
+// is kept on the returned mesh's drapable record so we can rewrite Y
+// values later when a covering terrain tile streams in.
+function _finalizeDrapedMesh(xzOwn, material, renderOrder, terrain, yOffset, drapables) {
+  if (xzOwn.length === 0) return null;
+  const vertCount = xzOwn.length / 7;
+  const positions = new Float32Array(vertCount * 3);
+  _drapeIntoPositions(xzOwn, terrain, yOffset, positions);
+  const geo = new THREE.BufferGeometry();
+  // DynamicDrawUsage: redrapeOverBounds rewrites Y on every terrain-cell
+  // load, so position is updated frequently. Default StaticDrawUsage makes
+  // some WebGL drivers allocate fresh VBOs per update, accumulating stale
+  // buffers — contributes to memory bloat during the initial terrain
+  // stream when dozens of cells arrive in quick succession.
+  const posAttr = new THREE.BufferAttribute(positions, 3);
+  posAttr.setUsage(THREE.DynamicDrawUsage);
+  geo.setAttribute('position', posAttr);
+  // Non-indexed triangle soup → each tri gets its own face normal on
+  // all three of its verts (flat shading). Every drape vertex is a top
+  // face so normals come out (0, 1, 0) modulo the per-block tilt.
+  geo.computeVertexNormals();
+  const mesh = new THREE.Mesh(geo, material);
+  mesh.renderOrder = renderOrder;
+  drapables.push({ mesh, xz: xzOwn, yOffset });
+  return mesh;
+}
+
+// Walk the 7-float-per-vertex array and write XYZ into `positions` (3
+// floats/vert). typeFlag (slot [6]) distinguishes two vertex kinds:
+//   < 2 → top vertex: bilinear interpolation from home block's 4 corners.
+//         0.0 = SW half (tx ≤ tz), 1.0 = NE half (tx > tz).
+//   ≥ 2 → skirt vertex: look up one corner directly.
+//         2=NW, 3=NE, 4=SE, 5=SW of the block stored in slots [4..5].
+function _drapeIntoPositions(xzOwn, terrain, yOffset, positions) {
+  const vertCount = xzOwn.length / 7;
+  for (let i = 0; i < vertCount; i++) {
+    const b = i * 7;
+    const posX     = xzOwn[b    ];
+    const posZ     = xzOwn[b + 1];
+    const gridU    = xzOwn[b + 2];
+    const gridV    = xzOwn[b + 3];
+    const blockGx  = xzOwn[b + 4];
+    const blockGz  = xzOwn[b + 5];
+    const typeFlag = xzOwn[b + 6];
+
+    let y = yOffset;
+    if (terrain) {
+      const corners = terrain.getBlockCorners
+        ? terrain.getBlockCorners(blockGx, blockGz)
+        : null;
+      if (corners !== null) {
+        if (typeFlag < 2.0) {
+          // Top vertex — bilinear over the home block's two triangles.
+          const tx = (gridU - blockGx * BLOCK_STEP) / BLOCK_STEP;
+          const tz = (gridV - blockGz * BLOCK_STEP) / BLOCK_STEP;
+          const { yNW, yNE, ySE, ySW } = corners;
+          y = (typeFlag > 0.5
+            ? yNW + (yNE - yNW) * tx + (ySE - yNE) * tz
+            : yNW + (ySE - ySW) * tx + (ySW - yNW) * tz
+          ) + yOffset;
+        } else {
+          // Skirt vertex — single corner direct lookup.
+          // cornerIdx: 0=NW, 1=NE, 2=SE, 3=SW
+          const ci = Math.round(typeFlag) - 2;
+          y = [corners.yNW, corners.yNE, corners.ySE, corners.ySW][ci] + yOffset;
+        }
+      }
+    }
+
+    const pi = i * 3;
+    positions[pi    ] = posX;
+    positions[pi + 1] = y;
+    positions[pi + 2] = posZ;
   }
+}
 
-  if (data.streets && data.streets.length) {
-    _drawStreets(ctx, data.streets, wx2px, wz2py, sx);
-  }
+// Apply one layer's worker output (topXz + covered-block list) to the scene.
+// Emits the layer's skirt quads against live terrain state, finalizes both
+// tops and skirts as THREE meshes, and adds them to `group`. Used for all
+// three layers (water/green/streets) — the caller routes materials +
+// skirtOut to pick the right stack ordering.
+function _applyDrapeLayer(layer, topMat, skirtMat, renderOrder, terrain, yOffset, drapables, group, skirtOut) {
+  const topXz = layer.topXz;
+  const skirtXz = [];
+  _emitBlockSkirts(layer.coveredBlocks, terrain, skirtXz, skirtOut);
+  const topMesh = topXz.length > 0
+    ? _finalizeDrapedMesh(topXz, topMat, renderOrder, terrain, yOffset, drapables)
+    : null;
+  const skirtMesh = skirtXz.length > 0
+    ? _finalizeDrapedMesh(new Float32Array(skirtXz), skirtMat, renderOrder, terrain, yOffset, drapables)
+    : null;
+  if (topMesh)   group.add(topMesh);
+  if (skirtMesh) group.add(skirtMesh);
+}
 
-  return canvas;
+// Re-sample terrain at every xz pair and rewrite the mesh's Y column in
+// place. Called from redrapeOverBounds when a new terrain tile lands under
+// an OSM tile that was already loaded.
+//
+// We deliberately DON'T recompute vertex normals here — it's an O(N) walk
+// per tile and gets triggered on every terrain-cell load, so a full
+// radius of streaming terrain fires it hundreds of times at hundreds of
+// KB each. The initial normals (computed at mesh build) stay close
+// enough as Y values shift by a few cm from the initial guess.
+function _redrapeMesh({ mesh, xz, yOffset }, terrain) {
+  const pos = mesh.geometry.attributes.position;
+  _drapeIntoPositions(xz, terrain, yOffset, pos.array);
+  pos.needsUpdate = true;
 }
 
 // ── Flat-mode mesh builders (pre-terrain behaviour) ───────────────────────────
@@ -501,23 +1001,17 @@ function _buildPolygonMesh(polygons, y, material, renderOrder) {
   return mesh;
 }
 
-// Street polylines → extruded ribbon with miter joins at each interior vertex.
-// Without joins, adjacent rectangles leave V-shaped gaps on the outside of a
-// turn — very visible on curved roads approximated by short straight segments.
-function _buildStreetMesh(streets, y, material, renderOrder) {
-  if (!streets.length) return null;
-
-  let segCount = 0;
-  for (const s of streets) if (s.points && s.points.length >= 2) segCount += s.points.length - 1;
-  if (segCount === 0) return null;
-
-  // 2 triangles × 3 verts × 3 floats per segment. Miter joins still produce
-  // exactly 2 tris per segment — they just shift the shared vertex outward.
-  const positions = new Float32Array(segCount * 18);
-  let o = 0;
+// Street polylines → extruded ribbon with miter joins at each interior
+// vertex. Without joins, adjacent rectangles leave V-shaped gaps on the
+// outside of a turn — very visible on curved roads approximated by short
+// straight segments. Writes 2 triangles × 3 verts × 2 floats = 12 floats
+// per segment into `outXZ` (pairs of x,z in triangle order). Used by the
+// flat-mode geometry builder (`_buildStreetMesh`). The terrain-mode drape
+// path duplicates this function inside osmWorker.js so main doesn't have
+// to tessellate.
+function _emitStreetTrisXZ(streets, outXZ) {
   const offX = [];
   const offZ = [];
-
   for (const s of streets) {
     const width = TYPE_WIDTH[s.type] ?? DEFAULT_WIDTH;
     const half  = width * 0.5;
@@ -589,16 +1083,32 @@ function _buildStreetMesh(streets, y, material, renderOrder) {
       const o0x = offX[i],     o0z = offZ[i];
       const o1x = offX[i + 1], o1z = offZ[i + 1];
 
-      positions[o++] = x0 + o0x; positions[o++] = y; positions[o++] = z0 + o0z;
-      positions[o++] = x0 - o0x; positions[o++] = y; positions[o++] = z0 - o0z;
-      positions[o++] = x1 - o1x; positions[o++] = y; positions[o++] = z1 - o1z;
-
-      positions[o++] = x0 + o0x; positions[o++] = y; positions[o++] = z0 + o0z;
-      positions[o++] = x1 - o1x; positions[o++] = y; positions[o++] = z1 - o1z;
-      positions[o++] = x1 + o1x; positions[o++] = y; positions[o++] = z1 + o1z;
+      outXZ.push(
+        x0 + o0x, z0 + o0z,
+        x0 - o0x, z0 - o0z,
+        x1 - o1x, z1 - o1z,
+        x0 + o0x, z0 + o0z,
+        x1 - o1x, z1 - o1z,
+        x1 + o1x, z1 + o1z,
+      );
     }
   }
+}
 
+// Flat-mode wrapper around `_emitStreetTrisXZ`: plants every vertex at the
+// given Y plane. Terrain mode uses `_buildDrapedStreetMesh` instead.
+function _buildStreetMesh(streets, y, material, renderOrder) {
+  if (!streets.length) return null;
+  const xz = [];
+  _emitStreetTrisXZ(streets, xz);
+  if (xz.length === 0) return null;
+  const vertCount = xz.length / 2;
+  const positions = new Float32Array(vertCount * 3);
+  for (let i = 0; i < vertCount; i++) {
+    positions[i * 3    ] = xz[i * 2];
+    positions[i * 3 + 1] = y;
+    positions[i * 3 + 2] = xz[i * 2 + 1];
+  }
   const geo = new THREE.BufferGeometry();
   geo.setAttribute('position', new THREE.BufferAttribute(positions, 3));
   const mesh = new THREE.Mesh(geo, material);
@@ -606,36 +1116,9 @@ function _buildStreetMesh(streets, y, material, renderOrder) {
   return mesh;
 }
 
-function _drawTriangleList(ctx, polygons, wx2px, wz2py) {
-  for (const flat of polygons) {
-    for (let i = 0; i < flat.length; i += 6) {
-      ctx.beginPath();
-      ctx.moveTo(wx2px(flat[i]),     wz2py(flat[i + 1]));
-      ctx.lineTo(wx2px(flat[i + 2]), wz2py(flat[i + 3]));
-      ctx.lineTo(wx2px(flat[i + 4]), wz2py(flat[i + 5]));
-      ctx.closePath();
-      ctx.fill();
-    }
-  }
-}
-
-function _drawStreets(ctx, streets, wx2px, wz2py, pxPerM) {
-  ctx.strokeStyle = STREET_COLOR;
-  ctx.lineCap  = 'round';
-  ctx.lineJoin = 'round';
-  for (const s of streets) {
-    const pts = s.points;
-    if (!pts || pts.length < 2) continue;
-    const width = TYPE_WIDTH[s.type] ?? DEFAULT_WIDTH;
-    ctx.lineWidth = Math.max(1, width * pxPerM);
-    ctx.beginPath();
-    ctx.moveTo(wx2px(pts[0][0]), wz2py(pts[0][1]));
-    for (let i = 1; i < pts.length; i++) {
-      ctx.lineTo(wx2px(pts[i][0]), wz2py(pts[i][1]));
-    }
-    ctx.stroke();
-  }
-}
+// (Canvas2D rasterisation helpers lived here — removed with the class-ID
+// texture approach. If we ever want raster debug overlays again, pull
+// _drawTriangleList / _drawStreets back from git.)
 
 // Build (or fetch cached) flat ShapeGeometry for a street name. Glyphs come
 // from the bundled typeface font so text stays sharp at any zoom — unlike a
@@ -667,8 +1150,10 @@ function _getLabelAsset(name) {
 
 // For each named street, pick its longest segment and lay a flat label plane
 // along it. One mesh per street — the material/texture come from the shared
-// _labelCache, so repeat names across tiles add only geometry cost.
-function _buildStreetLabels(streets, parentGroup, terrain) {
+// _labelCache, so repeat names across tiles add only geometry cost. Pushes
+// each created mesh into `outLabels` (with its anchor XZ stamped on userData)
+// so OsmManager.updateLabelVisibility can toggle them by player distance.
+function _buildStreetLabels(streets, parentGroup, terrain, outLabels) {
   for (const s of streets) {
     if (!s.name) continue;
     const pts = s.points;
@@ -712,6 +1197,9 @@ function _buildStreetLabels(streets, parentGroup, terrain) {
     mesh.scale.set(scale, scale, scale);
     mesh.renderOrder = 4;
     mesh.userData.sharedGeometry = true;
+    mesh.userData.anchorX = cx;
+    mesh.userData.anchorZ = cz;
     parentGroup.add(mesh);
+    outLabels.push(mesh);
   }
 }

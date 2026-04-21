@@ -1,6 +1,14 @@
 const TILE_ENDPOINT    = '/api/paint';
 const SAVE_DEBOUNCE_MS  = 1500;
 
+// Sentinel cellKey written to a tile's paint JSON once seedTileCells has
+// applied every mesh's seeds without being abandoned mid-way. Presence of
+// this key on the next load means the tile's seed pattern is locked; absence
+// (even if other cells exist) means seeding was interrupted and the next
+// visit should keep rolling. The key intentionally doesn't match the real
+// cellKey shape so it can't collide with a building.
+const SEED_COMPLETE_KEY = '__seed_complete__';
+
 /**
  * Stores painted cell state, sliced per tile, backed by the dev server's
  * file-based paint endpoint (see scripts/tile-paint-plugin.js).
@@ -36,7 +44,7 @@ class PaintStore {
     this._tileOfBuilding     = new Map();  // buildingKey → tileId
     this._cellsByTile        = new Map();  // tileId → Set<cellKey>
     this._loadedTiles        = new Set();  // tileIds we've fetched (skip re-fetch on reload)
-    this._tilesWithSavedData = new Set();  // tileIds whose GET returned a non-empty payload
+    this._seedCompleteTiles  = new Set();  // tileIds with the seed-complete sentinel on disk
     this._dirtyTiles         = new Set();  // tiles with unsaved changes
     this._saveTimer          = null;
 
@@ -80,22 +88,36 @@ class PaintStore {
     if (!this._loadedTiles.has(tileId)) return;
 
     const keys = Object.keys(payload);
-    if (keys.length > 0) this._tilesWithSavedData.add(tileId);
 
     let set = this._cellsByTile.get(tileId);
     if (!set) { set = new Set(); this._cellsByTile.set(tileId, set); }
 
     for (const k of keys) {
+      if (k === SEED_COMPLETE_KEY) {
+        // Sentinel marker, not a real cell. Track it separately and don't let
+        // it leak into cells / _byBuilding / _cellsByTile.
+        this._seedCompleteTiles.add(tileId);
+        continue;
+      }
       this.cells.set(k, payload[k]);
       this._indexAdd(k);
       set.add(k);
     }
   }
 
-  /** True if this tile's GET returned at least one cell. Used by seedTileCells
-   *  to skip new seed rolls on tiles whose pattern is already locked in on disk. */
-  tileHasSavedData(tileId) {
-    return this._tilesWithSavedData.has(tileId);
+  /** True if this tile's paint JSON carries the seed-complete sentinel (i.e.
+   *  a previous session's seedTileCells made it through every mesh). */
+  isTileSeedComplete(tileId) {
+    return this._seedCompleteTiles.has(tileId);
+  }
+
+  /** Mark this tile seed-complete. Schedules a save so the sentinel reaches
+   *  disk; idempotent after the first call. */
+  markTileSeedComplete(tileId) {
+    if (this._seedCompleteTiles.has(tileId)) return;
+    this._seedCompleteTiles.add(tileId);
+    this._dirtyTiles.add(tileId);
+    this._scheduleSave();
   }
 
   /** Resolve the tileId for a cell's building. Returns undefined if not registered. */
@@ -123,7 +145,7 @@ class PaintStore {
     }
     for (const bk of buildingKeys) this._tileOfBuilding.delete(bk);
     this._loadedTiles.delete(tileId);
-    this._tilesWithSavedData.delete(tileId);
+    this._seedCompleteTiles.delete(tileId);
   }
 
   paint(cellKey, cellData) {
@@ -278,12 +300,19 @@ class PaintStore {
   }
 
   _payloadForTile(tileId) {
-    const set = this._cellsByTile.get(tileId);
     const out = {};
-    if (!set) return out;
-    for (const k of set) {
-      const v = this.cells.get(k);
-      if (v !== undefined) out[k] = v;
+    const set = this._cellsByTile.get(tileId);
+    if (set) {
+      for (const k of set) {
+        const v = this.cells.get(k);
+        if (v !== undefined) out[k] = v;
+      }
+    }
+    // Re-emit the sentinel alongside real cells so the server's full-body PUT
+    // preserves it. Without this, any paint action after markTileSeedComplete
+    // would rewrite the file and drop the sentinel.
+    if (this._seedCompleteTiles.has(tileId)) {
+      out[SEED_COMPLETE_KEY] = { complete: true };
     }
     return out;
   }

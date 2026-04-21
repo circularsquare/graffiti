@@ -1,196 +1,236 @@
 import * as THREE from 'three';
+import { paintStore } from './paintStore.js';
+import { LAND_COLOR } from './OsmManager.js';
+import { worldToGrid } from './geo.js';
+import { injectGridOverlay, enableGridExtensions, GRID_SHADER_CACHE_KEY } from './gridShader.js';
 
-// Terrain streams per-cell heightmaps from public/terrain/cell_{gx}_{gz}.json.
+// The 5 paintable face types exposed per block: the top quad plus the four
+// cardinal sides (only emitted by the worker when the block is taller than
+// the neighbour on that side). Terrain paint cells key off these five names
+// exactly the way building cells key off 'roof' / 'wall'.
+export const TERRAIN_MESH_TYPES = ['top', 'sideN', 'sideS', 'sideE', 'sideW'];
+
+// Terrain streams per-cell heightmaps from public/terrain/cell_{gx}_{gz}.bin.
 // Unlike building / OSM tiles we don't download a manifest — cells live on a
 // uniform 125 m grid with deterministic URLs, and we treat a 404 as "no
 // terrain for this cell" and cache the miss. Saves ~10 MB of startup download
 // plus the 55 K-entry spatial index build.
 //
-// See scripts/bake_terrain.py for the emit side.
+// Rendering is blocky: each DEM sample becomes a rectangular prism. Adjacent
+// cells within a 20 % slope share averaged corner heights, so gentle slopes
+// read as tilted quads instead of 23 cm steps; cliffs keep their vertical
+// drop. All geometry is built in terrainWorker.js so the main thread only
+// wraps the returned typed arrays into THREE geometry and handles material /
+// OSM wiring. See terrainWorker.js for the slope-smoothing algorithm.
 
-// Must match scripts/bake_terrain.py::GRID_SIZE.
+// Must match scripts/bake_terrain.py::GRID_SIZE and terrainWorker.js::CELL_SIZE.
 const CELL_SIZE = 125;
+// Per-block size in metres — a cell is subdivided into BLOCKS_PER_CELL² blocks,
+// each a rectangular prism. Must match scripts/bake_terrain.py::SAMPLES.
+const BLOCKS_PER_CELL = 64;
+const BLOCK_SIZE      = CELL_SIZE / BLOCKS_PER_CELL; // ≈ 1.953 m
 
-// NODATA sentinel from bake_terrain.py. Samples with this value sat outside
-// DEM coverage; we render them at 0 m (close to NAVD88 sea level) so the
-// mesh stays closed — the alternative is a crater.
-const NODATA_CM = -32768;
-
-const DEFAULT_LOAD_RADIUS     = 650;
-const TERRAIN_RADIUS_SCALE    = 1.5;
-const TERRAIN_MIN_LOAD_RADIUS = 650;
-const TERRAIN_UNLOAD_MARGIN   = 100;
+// Fixed load radius — terrain is cheap and its extent is not logically tied to
+// building density, so we don't follow the adaptive building radius. Sized to
+// match the building MAX so ~10% seeded paint cells on terrain top faces stay
+// bounded (at 350m it reached ~10k extra paint quads).
+// UNLOAD_MARGIN is hysteresis past the load edge.
+const LOAD_RADIUS           = 250;
+const TERRAIN_UNLOAD_MARGIN = 60;
 
 // Terrain tiles are small (~4 KB) and the mesh build is trivial, so we keep
 // more in flight than the building/OSM pipelines (which pay worker round-trips
 // + multi-megabyte parses per load).
 const MAX_CONCURRENT_LOADS = 6;
 
-// Base colour for the "outside OSM coverage" terrain surface (matches the
-// main.js FLOOR_Y ground). Inside coverage, the OSM canvas is sampled in
-// the fragment shader and composited over this colour.
-const TERRAIN_COLOR = 0x9b9b9e;
+// Terrain's default base colour is LAND — any stretch of terrain with no
+// draped water/green/street mesh on top reads as land. Keeps the old "OSM
+// paints everywhere" behaviour working without a shader overlay.
 
-// 1×1 fully-transparent placeholder used before a tile's covering OSM
-// texture is available. alpha=0 means the shader's mix(terrain, osm, a)
-// leaves terrain colour untouched.
-const EMPTY_OSM_TEXTURE = (() => {
-  const c = document.createElement('canvas');
-  c.width = 1; c.height = 1;
-  const t = new THREE.CanvasTexture(c);
-  t.magFilter = THREE.NearestFilter;
-  t.minFilter = THREE.NearestFilter;
-  return t;
-})();
+// Flattened shading — before Lambert runs, each vertex's normal is biased
+// toward world-up by (1 − SHADING_STRENGTH). With the current knob, the
+// shading normal sits partway between the true face normal and (0,1,0), so
+// NoL variation across faces shrinks. This compresses contrast without
+// shifting overall brightness (the sun still lights the scene; adjacent
+// faces just differ less). 1.0 = stock shading, 0 = no shading.
+//
+// (The OSM overlay used to be composited in this shader via a class-ID
+// texture + marching-squares AA. That approach was swapped for draped
+// vector-geometry overlays in OsmManager — see _buildDrapedPolygonMesh —
+// so this shader only owns terrain lighting now.)
+const SHADING_STRENGTH = 0.7;
 
-// Shared onBeforeCompile for every terrain material. Each material carries
-// its own uniforms on userData — the shader program is shared across all
-// tiles (via customProgramCacheKey), the uniform values differ per tile.
+// Grid overlay is shared with OsmManager so the grid draws on top of draped
+// OSM meshes too — see src/gridShader.js.
+//
+// Ordering matters: injectGridOverlay captures objectNormal immediately after
+// <beginnormal_vertex>, so the bias must already be inserted there *before*
+// we call the helper. Calling in the other order would put the bias between
+// the include and the grid capture, making the grid sample the flattened
+// normal instead of the true geometric one.
 const _onTerrainCompile = function (shader) {
-  const u = this.userData.uniforms;
-  shader.uniforms.uOsmMap      = u.uOsmMap;
-  shader.uniforms.uOsmOriginXZ = u.uOsmOriginXZ;
-  shader.uniforms.uOsmSizeXZ   = u.uOsmSizeXZ;
-
   shader.vertexShader = shader.vertexShader
-    .replace('#include <common>',
-      '#include <common>\nvarying vec3 vWorldPosT;')
-    .replace('#include <begin_vertex>',
-      '#include <begin_vertex>\nvWorldPosT = (modelMatrix * vec4(position, 1.0)).xyz;');
-
-  shader.fragmentShader = shader.fragmentShader
-    .replace('#include <common>',
-      `#include <common>
-       uniform sampler2D uOsmMap;
-       uniform vec2 uOsmOriginXZ;
-       uniform vec2 uOsmSizeXZ;
-       varying vec3 vWorldPosT;`)
-    .replace('#include <map_fragment>',
-      `#include <map_fragment>
-       float osmAlpha = 0.0;
-       vec2 osmUV = (vWorldPosT.xz - uOsmOriginXZ) / uOsmSizeXZ;
-       if (osmUV.x >= 0.0 && osmUV.x <= 1.0 && osmUV.y >= 0.0 && osmUV.y <= 1.0) {
-         vec4 osm = texture2D(uOsmMap, osmUV);
-         diffuseColor.rgb = mix(diffuseColor.rgb, osm.rgb, osm.a);
-         osmAlpha = osm.a;
-       }
-       // Hydroflat water fallback: NYC rivers/harbours are always -1.34 m in
-       // the DEM. Anywhere below -0.5 m that the OSM canvas didn't cover is
-       // essentially sea level — tint it water-blue so rivers read as water
-       // even outside the OSM coverage radius.
-       if (osmAlpha < 0.5 && vWorldPosT.y < -0.5) {
-         diffuseColor.rgb = vec3(0.498, 0.702, 0.851);
-       }`);
+    .replace('#include <beginnormal_vertex>',
+      `#include <beginnormal_vertex>
+       objectNormal = normalize(mix(vec3(0.0, 1.0, 0.0), objectNormal, ${SHADING_STRENGTH.toFixed(3)}));`);
+  injectGridOverlay(shader);
 };
 
 function _createTerrainMaterial() {
   const mat = new THREE.MeshLambertMaterial({
-    color: TERRAIN_COLOR,
+    color: LAND_COLOR,
     side:  THREE.FrontSide,
   });
-  mat.userData.uniforms = {
-    uOsmMap:      { value: EMPTY_OSM_TEXTURE },
-    uOsmOriginXZ: { value: new THREE.Vector2(0, 0) },
-    uOsmSizeXZ:   { value: new THREE.Vector2(1, 1) },
-  };
   mat.onBeforeCompile = _onTerrainCompile;
-  // Shared program cache key — every terrain tile compiles once, reuses.
-  mat.customProgramCacheKey = () => 'graffiti-terrain-osm';
+  mat.customProgramCacheKey = () => `graffiti-terrain-lambert-v6-${GRID_SHADER_CACHE_KEY}`;
+  enableGridExtensions(mat);
   return mat;
-}
-
-function _applyOsmToMaterial(mat, osmTile) {
-  const u = mat.userData.uniforms;
-  const b = osmTile.bounds;
-  u.uOsmMap.value = osmTile.texture;
-  u.uOsmOriginXZ.value.set(b.minX, b.minZ);
-  u.uOsmSizeXZ.value.set(b.maxX - b.minX, b.maxZ - b.minZ);
-}
-
-function _clearOsmFromMaterial(mat) {
-  mat.userData.uniforms.uOsmMap.value = EMPTY_OSM_TEXTURE;
 }
 
 // Cell state in `_cells`:
 //   undefined  — never attempted
-//   'loading'  — fetch in flight
+//   'loading'  — worker fetch/build in flight
 //   'empty'    — 404, don't retry
-//   object     — { mesh, samples, res, bounds }
+//   object     — { mesh, res, bounds, nwY, neY, seY, swY }
 
 export class TerrainManager {
-  constructor({ scene, group, getLoadRadius, osmLookup } = {}) {
+  constructor({
+    scene, group,
+    // Paint plumbing — all optional so the terrain-off null-object in main.js
+    // doesn't need to supply them. When present, terrain tiles participate in
+    // the shared paint caches so painting on the ground / cliff sides works
+    // exactly like painting on buildings.
+    buildingMeshMap,
+    buildingPaintMeshes,
+    buildingPaintMeshByBuilding,
+    paintGroup,
+    onTerrainLoaded,
+    onTerrainUnloaded,
+  } = {}) {
     this._scene = scene;
     this._group = group ?? new THREE.Group();
     if (!group && scene) scene.add(this._group);
-    this._getLoadRadius = getLoadRadius ?? null;
-    // Optional: (x, z) → OSM tile or null. Used at terrain-tile load time
-    // to wire up the tile's material with the covering OSM texture. Live
-    // OSM load/unload events go through applyOsmTile / removeOsmTile.
-    this._osmLookup = osmLookup ?? null;
+
+    this._buildingMeshMap              = buildingMeshMap             ?? null;
+    this._buildingPaintMeshes          = buildingPaintMeshes         ?? null;
+    this._buildingPaintMeshByBuilding  = buildingPaintMeshByBuilding ?? null;
+    this._paintGroup                   = paintGroup                  ?? null;
+    this._onTerrainLoaded              = onTerrainLoaded              ?? null;
+    this._onTerrainUnloaded            = onTerrainUnloaded            ?? null;
 
     this._cells       = new Map();    // "gx,gz" → state
     this._loadQueue   = [];           // [{ gx, gz, key }, …]
     this._activeLoads = 0;
     this._lastPx      = 0;
     this._lastPz      = 0;
+    // User-facing render-distance multiplier applied to LOAD_RADIUS in tick().
+    this._radiusScale = 1;
+    // key → [resolve,…] for callers blocking on a specific cell's load
+    // (teleport pre-fetch in sampleAsync). Resolved in _doLoad's finally.
+    this._waiters     = new Map();
+
+    this._worker = new Worker(new URL('./terrainWorker.js', import.meta.url), { type: 'module' });
+    this._pendingLoads = new Map(); // key → { resolve, reject }
+    this._worker.onmessage = (e) => {
+      const msg = e.data;
+      if (msg.type === 'loaded') {
+        const pending = this._pendingLoads.get(msg.key);
+        if (!pending) return;
+        this._pendingLoads.delete(msg.key);
+        pending.resolve(msg);
+      } else if (msg.type === 'error') {
+        const pending = this._pendingLoads.get(msg.key);
+        if (!pending) return;
+        this._pendingLoads.delete(msg.key);
+        pending.reject(new Error(msg.error));
+      }
+    };
+    this._worker.onerror = (e) => {
+      console.error('TerrainManager worker error:', e.message);
+    };
   }
+
+  setRadiusScale(s) { this._radiusScale = s; }
 
   tick(px, pz) {
     this._lastPx = px; this._lastPz = pz;
 
-    const loadR = this._getLoadRadius
-      ? Math.max(TERRAIN_MIN_LOAD_RADIUS, this._getLoadRadius() * TERRAIN_RADIUS_SCALE)
-      : DEFAULT_LOAD_RADIUS;
+    const loadR    = LOAD_RADIUS * this._radiusScale;
     const unloadR  = loadR + TERRAIN_UNLOAD_MARGIN;
     const loadR2   = loadR   * loadR;
     const unloadR2 = unloadR * unloadR;
 
-    const minGx = Math.floor((px - loadR) / CELL_SIZE);
-    const maxGx = Math.floor((px + loadR) / CELL_SIZE);
-    const minGz = Math.floor((pz - loadR) / CELL_SIZE);
-    const maxGz = Math.floor((pz + loadR) / CELL_SIZE);
+    // Cells are indexed in grid space (rotated from world by MANHATTAN_GRID_DEG)
+    // so enumerate in grid space too. A circle of radius loadR in world space
+    // is still a circle of radius loadR in grid space — rotation preserves
+    // distance — so the bbox-of-circle enumeration is unchanged apart from
+    // using the rotated player position.
+    const [pu, pv] = worldToGrid(px, pz);
+    const minGx = Math.floor((pu - loadR) / CELL_SIZE);
+    const maxGx = Math.floor((pu + loadR) / CELL_SIZE);
+    const minGz = Math.floor((pv - loadR) / CELL_SIZE);
+    const maxGz = Math.floor((pv + loadR) / CELL_SIZE);
 
-    // Enqueue any in-range cell we haven't tried yet.
     for (let gx = minGx; gx <= maxGx; gx++) {
       for (let gz = minGz; gz <= maxGz; gz++) {
-        if (_cellDist2(px, pz, gx, gz) >= loadR2) continue;
+        if (_cellDist2(pu, pv, gx, gz) >= loadR2) continue;
         const key = `${gx},${gz}`;
         if (this._cells.has(key)) continue;
         this._enqueueLoad(gx, gz, key);
       }
     }
 
-    // Drop queued loads that drifted out of range while waiting.
     if (this._loadQueue.length > 0) {
       for (let i = this._loadQueue.length - 1; i >= 0; i--) {
         const q = this._loadQueue[i];
-        if (_cellDist2(px, pz, q.gx, q.gz) > unloadR2) {
+        if (_cellDist2(pu, pv, q.gx, q.gz) > unloadR2) {
           this._cells.delete(q.key);
           this._loadQueue.splice(i, 1);
         }
       }
     }
 
-    // Unload loaded cells that are now far. Also prune 'empty' entries so
-    // we don't carry them forever — if the player comes back we can re-404
-    // once and recache.
     for (const [key, state] of this._cells) {
       if (state === 'loading') continue;
       const [gx, gz] = _parseKey(key);
-      if (_cellDist2(px, pz, gx, gz) <= unloadR2) continue;
+      if (_cellDist2(pu, pv, gx, gz) <= unloadR2) continue;
       if (state === 'empty') {
         this._cells.delete(key);
       } else if (state && state.mesh) {
+        this._disposePaintArtifacts(state);
         this._group.remove(state.mesh);
         state.mesh.geometry.dispose();
         state.mesh.material.dispose();
         this._cells.delete(key);
-        // Neighbours previously saw this tile as context for edge
-        // smoothing; re-smooth them so their borders don't freeze with
-        // stale data. Clamping kicks in for the side that just unloaded.
-        for (const [dx, dz] of _NEIGHBOUR_OFFSETS) {
-          this._rebuildSmoothed(gx + dx, gz + dz);
+        if (this._buildingMeshMap) {
+          // Flush pending PUT + drop in-memory cells for this tile. Fire-and-
+          // forget; the next loadTile call re-fetches from the server.
+          paintStore.unloadTile(state.tileId, state.buildingKeys);
         }
+        if (this._onTerrainUnloaded) this._onTerrainUnloaded(state);
+      }
+    }
+  }
+
+  /**
+   * Dispose paint overlays + mesh-map entries for a terrain tile being
+   * unloaded. Scoped to the tile's 5 buildingKeys so cleanup is O(keys),
+   * never a full cache scan — mirrors TileManager._unload's per-buildingKey
+   * loop. No-ops if paint wiring wasn't provided (terrain-off null object).
+   */
+  _disposePaintArtifacts(state) {
+    if (!this._buildingMeshMap) return;
+    for (const bk of state.buildingKeys) {
+      this._buildingMeshMap.delete(bk);
+      const meshSet = this._buildingPaintMeshByBuilding.get(bk);
+      if (meshSet) {
+        for (const paintMesh of meshSet) {
+          paintMesh.geometry.dispose();
+          paintMesh.material.dispose();
+          this._paintGroup.remove(paintMesh);
+          this._buildingPaintMeshes.delete(paintMesh.userData.paintMeshKey);
+        }
+        this._buildingPaintMeshByBuilding.delete(bk);
       }
     }
   }
@@ -204,65 +244,107 @@ export class TerrainManager {
   async _doLoad(gx, gz, key) {
     this._activeLoads++;
     try {
-      const res = await fetch(`/terrain/cell_${gx}_${gz}.json`);
-      // Vite's dev server serves /index.html for missing files (200 OK
-      // with text/html). Treat a non-JSON content-type and true 404s as
-      // "no terrain here" — cache and don't retry.
-      const ct = res.headers.get('content-type') || '';
-      if (res.status === 404 || !ct.includes('json')) {
+      const built = await this._fetchCellViaWorker(gx, gz, key);
+      if (built.empty) {
         this._cells.set(key, 'empty');
         return;
       }
-      if (!res.ok) throw new Error(`HTTP ${res.status}`);
-      const data = await res.json();
-      const rawSamples = Int16Array.from(data.samples);
-      fillNoData(rawSamples, data.res); // local neighbor-fill so gaps don't punch holes to y=0
-      // Mesh starts with raw Y values; _rebuildSmoothed will overwrite with
-      // the neighbour-padded Gaussian result right below.
-      const mesh   = buildTerrainMesh(gx, gz, data.res, rawSamples);
-      this._group.add(mesh);
       const bounds = _cellBounds(gx, gz);
+      const tileId = `terrain_${gx}_${gz}`;
+      const buildingKeys = TERRAIN_MESH_TYPES.map(t => `${tileId}:${t}`);
+      const mesh = this._wrapTerrainMesh(built, { gx, gz, bounds, tileId, buildingKeys });
+      // Per-face-type lookup from (ix, iz) → first-vertex index into the mesh's
+      // position attribute, or -1 if that face isn't emitted on this block.
+      // Only built when paint wiring is present — the null-object path (terrain
+      // off) doesn't need it. Worker emits faces in 6-vert quads (2 tris each)
+      // with normals constant across the quad, so one scan classifies each face.
+      const faceStarts = this._buildingMeshMap
+        ? _buildFaceIndex(built, bounds, built.res)
+        : null;
       const state = {
         mesh,
-        rawSamples,
-        samples:    rawSamples.slice(), // smoothed values overwrite below
-        res:        data.res,
+        gx, gz,
+        nwY:       built.nwY,
+        neY:       built.neY,
+        seY:       built.seY,
+        swY:       built.swY,
+        res:       built.res,
         bounds,
-        osmTileId:  null,
+        faceStarts,
+        tileId,
+        buildingKeys,
+        paintLoadPromise: null,
       };
+      this._group.add(mesh);
       this._cells.set(key, state);
 
-      // Smooth this tile with any already-loaded neighbour context, then
-      // re-smooth each cardinal+corner neighbour so their edges pick up the
-      // new data coming from this tile.
-      this._rebuildSmoothed(gx, gz);
-      for (const [dx, dz] of _NEIGHBOUR_OFFSETS) {
-        this._rebuildSmoothed(gx + dx, gz + dz);
+      // Paint wiring is all-or-nothing: either main.js supplied the shared
+      // maps + callbacks (terrain-on path) or it didn't (terrain-off null
+      // object never reaches this code). Register the 5 buildingKey → mesh
+      // lookups and kick the paint fetch in one block so we never leave
+      // half-initialised state that unloadTile would have to clean up.
+      if (this._buildingMeshMap) {
+        for (const bk of buildingKeys) this._buildingMeshMap.set(bk, mesh);
+
+        // Load the tile's persisted cells, then fire onTerrainLoaded so
+        // main.js can rebuild overlays once server state is in paintStore.
+        // Matches TileManager's phase-2 ordering.
+        state.paintLoadPromise = paintStore.loadTile(tileId, buildingKeys);
+        state.paintLoadPromise
+          .catch(e => console.warn(`TerrainManager: paint load for ${tileId} failed:`, e))
+          .then(() => {
+            // Tile may have been unloaded while we awaited the fetch.
+            if (this._cells.get(key) !== state) return;
+            if (this._onTerrainLoaded) this._onTerrainLoaded(state);
+          });
       }
 
-      // If the covering OSM tile is already loaded, wire up the texture now.
-      // Otherwise applyOsmTile will fire when it finishes.
-      if (this._osmLookup) {
-        const cx = (bounds.minX + bounds.maxX) * 0.5;
-        const cz = (bounds.minZ + bounds.maxZ) * 0.5;
-        const osmTile = this._osmLookup(cx, cz);
-        if (osmTile) {
-          _applyOsmToMaterial(mesh.material, osmTile);
-          state.osmTileId = osmTile.id;
-        }
-      }
     } catch (e) {
       console.error(`TerrainManager: failed to load cell ${gx},${gz}:`, e);
-      this._cells.delete(key); // allow retry on next tick
+      this._cells.delete(key);
     } finally {
       this._activeLoads--;
+      const waiters = this._waiters.get(key);
+      if (waiters) {
+        this._waiters.delete(key);
+        for (const resolve of waiters) resolve();
+      }
       this._drainQueue();
     }
   }
 
+  _fetchCellViaWorker(gx, gz, key) {
+    return new Promise((resolve, reject) => {
+      this._pendingLoads.set(key, { resolve, reject });
+      this._worker.postMessage({ type: 'load', gx, gz, key, file: `/terrain/cell_${gx}_${gz}.bin` });
+    });
+  }
+
+  _wrapTerrainMesh(built, meta) {
+    const geom = new THREE.BufferGeometry();
+    geom.setAttribute('position', new THREE.BufferAttribute(built.position, 3));
+    geom.setAttribute('normal', new THREE.BufferAttribute(built.normal, 3));
+    geom.setAttribute('blockCenter', new THREE.BufferAttribute(built.blockCenter, 2));
+    geom.computeBoundingBox();
+    geom.computeBoundingSphere();
+
+    const mesh = new THREE.Mesh(geom, _createTerrainMaterial());
+    mesh.name = 'terrain';
+    // Stash per-tile identity on userData so the paint raycast can recover
+    // the block index from a hit point without consulting a central lookup.
+    // `buildingKeys` lets updateCulling toggle overlay visibility in O(keys)
+    // rather than scanning the paint mesh maps.
+    mesh.userData.terrainKey   = `${meta.gx},${meta.gz}`;
+    mesh.userData.terrainGX    = meta.gx;
+    mesh.userData.terrainGZ    = meta.gz;
+    mesh.userData.terrainTileId = meta.tileId;
+    mesh.userData.bounds       = meta.bounds;
+    mesh.userData.buildingKeys = meta.buildingKeys;
+    return mesh;
+  }
+
   _drainQueue() {
     while (this._activeLoads < MAX_CONCURRENT_LOADS && this._loadQueue.length > 0) {
-      // Pop nearest-to-player first.
       let bestI = 0;
       let bestD2 = _cellDist2(this._lastPx, this._lastPz,
                               this._loadQueue[0].gx, this._loadQueue[0].gz);
@@ -272,185 +354,13 @@ export class TerrainManager {
         if (d2 < bestD2) { bestD2 = d2; bestI = i; }
       }
       const { gx, gz, key } = this._loadQueue.splice(bestI, 1)[0];
-      this._doLoad(gx, gz, key);
+      if (this._cells.get(key) === 'loading') this._doLoad(gx, gz, key);
     }
   }
 
-  /**
-   * Called by OsmManager when an OSM tile finishes loading. Every terrain
-   * cell whose centre falls inside the OSM tile's bounds gets its material
-   * rewired to sample the new texture.
-   */
-  applyOsmTile(osmTile) {
-    const ob = osmTile.bounds;
-    for (const state of this._cells.values()) {
-      if (!state || typeof state !== 'object' || !state.mesh) continue;
-      const b = state.bounds;
-      const cx = (b.minX + b.maxX) * 0.5;
-      const cz = (b.minZ + b.maxZ) * 0.5;
-      if (cx >= ob.minX && cx < ob.maxX && cz >= ob.minZ && cz < ob.maxZ) {
-        _applyOsmToMaterial(state.mesh.material, osmTile);
-        state.osmTileId = osmTile.id;
-      }
-    }
-  }
+  // (applyOsmTile/removeOsmTile removed — OSM is now draped vector geometry
+  // owned by OsmManager, not a texture composited into this material.)
 
-  /** Called before an OSM tile unloads; clears the texture from terrain materials. */
-  removeOsmTile(osmTile) {
-    for (const state of this._cells.values()) {
-      if (!state || typeof state !== 'object') continue;
-      if (state.osmTileId === osmTile.id) {
-        _clearOsmFromMaterial(state.mesh.material);
-        state.osmTileId = null;
-      }
-    }
-  }
-
-  /**
-   * Re-run the Gaussian smoothing for a loaded tile using the 8 neighbour
-   * tiles' raw samples for the padding strip — so the kernel spans the
-   * tile boundary instead of clamping at it. Called on any tile load /
-   * unload that could change the context around (gx, gz). Cheap (~10K
-   * ops per tile) so we fire it for every neighbour unconditionally.
-   */
-  _rebuildSmoothed(gx, gz) {
-    const state = this._cells.get(`${gx},${gz}`);
-    if (!state || typeof state !== 'object' || !state.mesh) return;
-
-    const res  = state.res;
-    const raw  = state.rawSamples;
-    const PAD  = 2;
-    const pRes = res + 2 * PAD;
-    const padded = new Float32Array(pRes * pRes);
-
-    const getRaw = (dx, dz) => {
-      const s = this._cells.get(`${gx + dx},${gz + dz}`);
-      return (s && typeof s === 'object' && s.rawSamples) ? s.rawSamples : null;
-    };
-    const NW = getRaw(-1, -1), N  = getRaw(0, -1), NE = getRaw( 1, -1);
-    const W  = getRaw(-1,  0),                     E  = getRaw( 1,  0);
-    const SW = getRaw(-1,  1), S  = getRaw(0,  1), SE = getRaw( 1,  1);
-
-    for (let pz = 0; pz < pRes; pz++) {
-      for (let px = 0; px < pRes; px++) {
-        padded[pz * pRes + px] = _lookupWithNeighbours(
-          raw, res, px - PAD, pz - PAD, W, E, N, S, NW, NE, SW, SE,
-        );
-      }
-    }
-
-    // Separable 5-tap Gaussian over the padded buffer.
-    const tmp = new Float32Array(padded.length);
-    for (let iz = 0; iz < pRes; iz++) {
-      for (let ix = 0; ix < pRes; ix++) {
-        let sum = 0, w = 0;
-        for (let k = 0; k < 5; k++) {
-          const nx = ix + k - 2;
-          if (nx < 0 || nx >= pRes) continue;
-          sum += padded[iz * pRes + nx] * _GAUSS[k];
-          w   += _GAUSS[k];
-        }
-        tmp[iz * pRes + ix] = sum / w;
-      }
-    }
-    for (let iz = 0; iz < pRes; iz++) {
-      for (let ix = 0; ix < pRes; ix++) {
-        let sum = 0, w = 0;
-        for (let k = 0; k < 5; k++) {
-          const nz = iz + k - 2;
-          if (nz < 0 || nz >= pRes) continue;
-          sum += tmp[nz * pRes + ix] * _GAUSS[k];
-          w   += _GAUSS[k];
-        }
-        padded[iz * pRes + ix] = sum / w;
-      }
-    }
-
-    // Write the center back to the mesh's position attribute.
-    const geom = state.mesh.geometry;
-    const pos  = geom.attributes.position.array;
-    const smoothed = state.samples;
-    for (let iz = 0; iz < res; iz++) {
-      for (let ix = 0; ix < res; ix++) {
-        const v = Math.round(padded[(iz + PAD) * pRes + (ix + PAD)]);
-        smoothed[iz * res + ix] = v;
-        pos[(iz * res + ix) * 3 + 1] = _decode(v);
-      }
-    }
-
-    // Edge matching: the mesh stretches cell-centred samples to span the
-    // full cell bounds, so tile A's rightmost vertex sits at the cell
-    // boundary but carries a Y value sampled 2 m *inside* A, while tile B's
-    // leftmost vertex does the same on its side. Smoothing alone can't
-    // close that gap because each side's kernel is centred at a different
-    // world position. Here we overwrite shared-edge vertices with a
-    // deterministic average of both tiles' raw samples — identical formula
-    // on both sides so the seam closes to the bit. Raw (not smoothed) so
-    // we don't depend on neighbour propagation order.
-    const setY = (ix, iz, cm) => {
-      smoothed[iz * res + ix] = cm;
-      pos[(iz * res + ix) * 3 + 1] = _decode(cm);
-    };
-    // 4-tap kernel [1, 4, 4, 1] / 10 centred on the shared boundary. Uses
-    // two samples from each tile (nearest + one interior step). Weighted
-    // like the interior Gaussian so the edge-to-interior transition is
-    // smooth, while remaining a deterministic formula over raw samples so
-    // both tiles' edge vertices meet exactly.
-    const edgeK = (a1, a2, b1, b2) => Math.round((a1 + 4 * a2 + 4 * b1 + b2) / 10);
-    if (W) {
-      for (let iz = 0; iz < res; iz++) {
-        setY(0, iz, edgeK(
-          W  [iz * res + res - 2], W  [iz * res + res - 1],
-          raw[iz * res + 0      ], raw[iz * res + 1      ],
-        ));
-      }
-    }
-    if (E) {
-      for (let iz = 0; iz < res; iz++) {
-        setY(res - 1, iz, edgeK(
-          raw[iz * res + res - 2], raw[iz * res + res - 1],
-          E  [iz * res + 0      ], E  [iz * res + 1      ],
-        ));
-      }
-    }
-    if (N) {
-      for (let ix = 0; ix < res; ix++) {
-        setY(ix, 0, edgeK(
-          N  [(res - 2) * res + ix], N  [(res - 1) * res + ix],
-          raw[ 0        * res + ix], raw[ 1        * res + ix],
-        ));
-      }
-    }
-    if (S) {
-      for (let ix = 0; ix < res; ix++) {
-        setY(ix, res - 1, edgeK(
-          raw[(res - 2) * res + ix], raw[(res - 1) * res + ix],
-          S  [ 0        * res + ix], S  [ 1        * res + ix],
-        ));
-      }
-    }
-    // Corners — average with up to 3 other tiles. Same deterministic logic:
-    // every participating tile computes the same mean over the same set of
-    // raw samples, so all four corners meet exactly.
-    const cornerAvg = (myIx, myIz, contribs) => {
-      let sum = raw[myIz * res + myIx], n = 1;
-      for (const [nb, nIx, nIz] of contribs) {
-        if (!nb) continue;
-        sum += nb[nIz * res + nIx]; n++;
-      }
-      if (n > 1) setY(myIx, myIz, Math.round(sum / n));
-    };
-    cornerAvg(0,       0,       [[W, res - 1, 0],       [N, 0,       res - 1], [NW, res - 1, res - 1]]);
-    cornerAvg(res - 1, 0,       [[E, 0,       0],       [N, res - 1, res - 1], [NE, 0,       res - 1]]);
-    cornerAvg(0,       res - 1, [[W, res - 1, res - 1], [S, 0,       0],       [SW, res - 1, 0      ]]);
-    cornerAvg(res - 1, res - 1, [[E, 0,       res - 1], [S, res - 1, 0],       [SE, 0,       0      ]]);
-
-    geom.attributes.position.needsUpdate = true;
-    geom.computeVertexNormals();
-    geom.computeBoundingSphere();
-  }
-
-  /** Loaded terrain meshes — used as raycast targets for player collision. */
   meshes() {
     const out = [];
     for (const state of this._cells.values()) {
@@ -460,125 +370,220 @@ export class TerrainManager {
   }
 
   /**
-   * Bilinear-sampled elevation in metres at local (x, z). Returns null if
-   * the covering cell isn't loaded.
+   * Loaded tile state for (gx, gz), or null if not currently loaded. Used by
+   * main.js#buildTerrainCellGeometry to read the block's 4 corner heights
+   * when producing paint-overlay vertices. State is live — callers must not
+   * retain it past a frame (the tile may unload).
+   */
+  getState(gx, gz) {
+    const state = this._cells.get(`${gx},${gz}`);
+    if (!state || typeof state !== 'object') return null;
+    return state;
+  }
+
+  /**
+   * Debug: return the tile + intra-tile sample the given local (x, z) lands
+   * on, plus that sample's 4 smoothed corner Ys. `null` if the tile isn't
+   * loaded. Used by the F3 HUD — not on any hot path.
+   */
+  probe(x, z) {
+    // Cell addressing is in grid space; rotate the world-space input first.
+    const [u, v] = worldToGrid(x, z);
+    const gx = Math.floor(u / CELL_SIZE);
+    const gz = Math.floor(v / CELL_SIZE);
+    const state = this._cells.get(`${gx},${gz}`);
+    if (!state || typeof state !== 'object') return null;
+    const { nwY, neY, seY, swY, res, bounds: b } = state;
+    const step = CELL_SIZE / res;
+    let ix = Math.floor((u - b.minX) / step);
+    let iz = Math.floor((v - b.minZ) / step);
+    if (ix < 0) ix = 0; else if (ix >= res) ix = res - 1;
+    if (iz < 0) iz = 0; else if (iz >= res) iz = res - 1;
+    const i = iz * res + ix;
+    return { gx, gz, ix, iz, res, nw: nwY[i], ne: neY[i], se: seY[i], sw: swY[i] };
+  }
+
+  /**
+   * Elevation in metres at world (x, z), bilinearly interpolated over the
+   * containing cell's 4 corner heights so the player walks smoothly up a
+   * slope cluster and still snaps to a flat top on stepped cells (there all
+   * 4 corners equal the cell centre). Cell addressing happens in grid space.
    */
   sample(x, z) {
-    const gx = Math.floor(x / CELL_SIZE);
-    const gz = Math.floor(z / CELL_SIZE);
+    const [u, v] = worldToGrid(x, z);
+    const gx = Math.floor(u / CELL_SIZE);
+    const gz = Math.floor(v / CELL_SIZE);
     const state = this._cells.get(`${gx},${gz}`);
     if (!state || typeof state !== 'object') return null;
 
-    const { samples, res, bounds: b } = state;
-    const half = CELL_SIZE / (2 * res);
-    const fx = (x - (b.minX + half)) / (CELL_SIZE - 2 * half) * (res - 1);
-    const fz = (z - (b.minZ + half)) / (CELL_SIZE - 2 * half) * (res - 1);
-    const ix0 = Math.max(0, Math.min(res - 1, Math.floor(fx)));
-    const iz0 = Math.max(0, Math.min(res - 1, Math.floor(fz)));
-    const ix1 = Math.min(res - 1, ix0 + 1);
-    const iz1 = Math.min(res - 1, iz0 + 1);
-    const tx  = Math.max(0, Math.min(1, fx - ix0));
-    const tz  = Math.max(0, Math.min(1, fz - iz0));
+    const { nwY, neY, seY, swY, res, bounds: b } = state;
+    const step = CELL_SIZE / res;
+    let ix = Math.floor((u - b.minX) / step);
+    let iz = Math.floor((v - b.minZ) / step);
+    if (ix < 0) ix = 0; else if (ix >= res) ix = res - 1;
+    if (iz < 0) iz = 0; else if (iz >= res) iz = res - 1;
 
-    const v00 = _decode(samples[iz0 * res + ix0]);
-    const v01 = _decode(samples[iz0 * res + ix1]);
-    const v10 = _decode(samples[iz1 * res + ix0]);
-    const v11 = _decode(samples[iz1 * res + ix1]);
-    const top = v00 * (1 - tx) + v01 * tx;
-    const bot = v10 * (1 - tx) + v11 * tx;
-    return top * (1 - tz) + bot * tz;
+    const i = iz * res + ix;
+    const tx = (u - (b.minX + ix * step)) / step;
+    const tz = (v - (b.minZ + iz * step)) / step;
+    const yN = nwY[i] * (1 - tx) + neY[i] * tx;
+    const yS = swY[i] * (1 - tx) + seY[i] * tx;
+    return yN * (1 - tz) + yS * tz;
   }
-}
 
-function _decode(cm) {
-  return cm === NODATA_CM ? 0 : cm * 0.01;
+  /**
+   * Like sample() but returns the Y of the terrain's actual triangulated
+   * top surface instead of the bilinear approximation — i.e. the Y
+   * *rendered* by the terrain mesh at this world-space (x, z), computed
+   * from whichever of the block's two per-cell triangles contains the
+   * point. The terrain emits each block top as two triangles split along
+   * the NW-SE diagonal (see terrainWorker.js emitQuad: NW-SW-SE and
+   * NW-SE-NE). Inside the NW-SW-SE triangle (tx ≤ tz) we interpolate Y
+   * linearly across those three corners; inside NW-SE-NE (tx > tz) across
+   * the other three.
+   *
+   * Use this (instead of sample()) for draping overlay meshes that need
+   * to sit exactly on the rendered terrain surface — bilinear and
+   * triangulated Ys agree only at cell corners and along the diagonal;
+   * elsewhere they disagree by up to the cell's height variation, which
+   * on a tilted cell is enough to make overlay polygons pierce through
+   * the terrain or float above it.
+   */
+  sampleTriangulated(x, z) {
+    const [u, v] = worldToGrid(x, z);
+    const gx = Math.floor(u / CELL_SIZE);
+    const gz = Math.floor(v / CELL_SIZE);
+    const state = this._cells.get(`${gx},${gz}`);
+    if (!state || typeof state !== 'object') return null;
+
+    const { nwY, neY, seY, swY, res, bounds: b } = state;
+    const step = CELL_SIZE / res;
+    let ix = Math.floor((u - b.minX) / step);
+    let iz = Math.floor((v - b.minZ) / step);
+    if (ix < 0) ix = 0; else if (ix >= res) ix = res - 1;
+    if (iz < 0) iz = 0; else if (iz >= res) iz = res - 1;
+
+    const i = iz * res + ix;
+    const tx = (u - (b.minX + ix * step)) / step;
+    const tz = (v - (b.minZ + iz * step)) / step;
+    const yNW = nwY[i], yNE = neY[i], ySE = seY[i], ySW = swY[i];
+    if (tx <= tz) {
+      // NW-SW-SE triangle (diagonal = NW-SE, SW side)
+      return yNW + (ySE - ySW) * tx + (ySW - yNW) * tz;
+    }
+    // NW-SE-NE triangle (diagonal = NW-SE, NE side)
+    return yNW + (yNE - yNW) * tx + (ySE - yNE) * tz;
+  }
+
+  /**
+   * Like sample() but waits for the cell at (x, z) to finish loading before
+   * reading. Used by teleport to know the spawn Y before revealing the view.
+   * If the cell has never been seen, kicks off a priority load that bypasses
+   * the load queue (a one-off teleport fetch won't meaningfully contend with
+   * the streaming pipeline). Resolves to null if the cell is a 404.
+   */
+  async sampleAsync(x, z) {
+    const [u, v] = worldToGrid(x, z);
+    const gx = Math.floor(u / CELL_SIZE);
+    const gz = Math.floor(v / CELL_SIZE);
+    const key = `${gx},${gz}`;
+    const state = this._cells.get(key);
+
+    if (state && typeof state === 'object') return this.sample(x, z);
+    if (state === 'empty') return null;
+
+    if (state === undefined) {
+      // Never touched — start the load directly. Bypassing _enqueueLoad's
+      // MAX_CONCURRENT_LOADS gate is intentional; teleport latency trumps
+      // keeping the streamer's concurrency limit pristine for one fetch.
+      this._cells.set(key, 'loading');
+      this._doLoad(gx, gz, key);
+    }
+    // state === 'loading' → already in flight or queued; fall through and wait.
+
+    await new Promise(resolve => {
+      let arr = this._waiters.get(key);
+      if (!arr) { arr = []; this._waiters.set(key, arr); }
+      arr.push(resolve);
+    });
+
+    return this.sample(x, z);
+  }
+
+  /**
+   * Return the 4 union-find-smoothed corner Ys for the terrain block at
+   * global block indices (bx, bz) — the same integer coordinate system
+   * OsmManager's tessellator uses for `gx/gz`. Returns null if the
+   * covering terrain cell isn't loaded yet.
+   *
+   * Block → cell mapping: cellGx = floor(bx / BLOCKS_PER_CELL), and
+   * local ix = bx − cellGx * BLOCKS_PER_CELL.  Integer indices up to
+   * ~2000 are safely representable as Float32, so callers may pass values
+   * read back from a Float32Array without precision loss.
+   */
+  getBlockCorners(bx, bz) {
+    const ibx = Math.round(bx);
+    const ibz = Math.round(bz);
+    const cellGx = Math.floor(ibx / BLOCKS_PER_CELL);
+    const cellGz = Math.floor(ibz / BLOCKS_PER_CELL);
+    const state = this._cells.get(`${cellGx},${cellGz}`);
+    if (!state || typeof state !== 'object') return null;
+    const ix = ibx - cellGx * BLOCKS_PER_CELL;
+    const iz = ibz - cellGz * BLOCKS_PER_CELL;
+    const i  = iz * state.res + ix;
+    return {
+      yNW: state.nwY[i],
+      yNE: state.neY[i],
+      ySE: state.seY[i],
+      ySW: state.swY[i],
+    };
+  }
 }
 
 /**
- * Replace NODATA samples in-place by iteratively averaging each hole's up-to-4
- * filled neighbours. Gaps from a lidar's water-classified pixel fill with a
- * value that flows smoothly with the surrounding terrain, instead of punching
- * a hole to y=0 (where OSM at y=0.15 would poke through). Converges in
- * O(max-gap-width) passes — for scattered shoreline specks that's 1-2.
- *
- * Falls back to cell-mean for any NODATA the dilation can't reach (e.g. an
- * entire missing row at a tile edge — rare but possible).
+ * Classify each 6-vertex quad emitted by terrainWorker.buildBlockyTerrainGeometry
+ * by face type and owning block, and return a `{ top, sideN, sideS, sideE, sideW }`
+ * dict of Int32Arrays mapping `iz*res+ix` → first vertex index (or -1). This is
+ * the only per-face identity the paint pipeline needs — the actual vertex
+ * positions come straight out of the mesh's position attribute at paint time.
  */
-function fillNoData(samples, res) {
-  let remaining = 0;
-  let sum = 0, count = 0;
-  for (let i = 0; i < samples.length; i++) {
-    if (samples[i] === NODATA_CM) remaining++;
-    else { sum += samples[i]; count++; }
+function _buildFaceIndex(built, bounds, res) {
+  const pos = built.position;
+  const nrm = built.normal;
+  const bc  = built.blockCenter;
+  const step = CELL_SIZE / res;
+
+  const idx = {};
+  for (const t of TERRAIN_MESH_TYPES) {
+    idx[t] = new Int32Array(res * res);
+    idx[t].fill(-1);
   }
-  if (remaining === 0) return;
-  if (count === 0) { samples.fill(0); return; }
 
-  let guard = 0;
-  while (remaining > 0 && guard++ < 32) {
-    let filled = 0;
-    for (let iz = 0; iz < res; iz++) {
-      for (let ix = 0; ix < res; ix++) {
-        const i = iz * res + ix;
-        if (samples[i] !== NODATA_CM) continue;
-        let s = 0, c = 0, v;
-        if (ix > 0)       { v = samples[i - 1];     if (v !== NODATA_CM) { s += v; c++; } }
-        if (ix < res - 1) { v = samples[i + 1];     if (v !== NODATA_CM) { s += v; c++; } }
-        if (iz > 0)       { v = samples[i - res];   if (v !== NODATA_CM) { s += v; c++; } }
-        if (iz < res - 1) { v = samples[i + res];   if (v !== NODATA_CM) { s += v; c++; } }
-        if (c > 0) { samples[i] = Math.round(s / c); filled++; }
-      }
-    }
-    if (filled === 0) break;
-    remaining -= filled;
+  // Normals and block centres are in world space (the worker rotates them at
+  // emit). `bounds` is grid space. To classify side faces by cardinal
+  // direction and to compute (ix, iz) from the block centre, inverse-rotate
+  // both back to grid space — that's what worldToGrid does.
+  const QUAD_VERTS = 6;
+  const nQuads = (pos.length / 3) / QUAD_VERTS;
+  for (let q = 0; q < nQuads; q++) {
+    const vi = q * QUAD_VERTS;
+    const wnx = nrm[vi * 3], ny = nrm[vi * 3 + 1], wnz = nrm[vi * 3 + 2];
+    const [gnx, gnz] = worldToGrid(wnx, wnz);
+    const [gcx, gcz] = worldToGrid(bc[vi * 2], bc[vi * 2 + 1]);
+    const ix = Math.floor((gcx - bounds.minX) / step);
+    const iz = Math.floor((gcz - bounds.minZ) / step);
+    if (ix < 0 || ix >= res || iz < 0 || iz >= res) continue;
+
+    let type;
+    if      (ny  >  0.5) type = 'top';
+    else if (gnx < -0.5) type = 'sideW';
+    else if (gnx >  0.5) type = 'sideE';
+    else if (gnz < -0.5) type = 'sideN';
+    else                 type = 'sideS';
+
+    idx[type][iz * res + ix] = vi;
   }
-  if (remaining > 0) {
-    const mean = Math.round(sum / count);
-    for (let i = 0; i < samples.length; i++) {
-      if (samples[i] === NODATA_CM) samples[i] = mean;
-    }
-  }
-}
-
-// Separable 5-tap Gaussian kernel. Weights [1,4,6,4,1] give a
-// rotationally-symmetric low-pass when applied horizontally then
-// vertically — the smoothing is grid-orientation-agnostic, which is what
-// hides PlaneGeometry's consistent diagonal triangulation on slopes.
-// Used by _rebuildSmoothed on a padded buffer so the kernel spans tile
-// seams instead of clamping at them.
-const _GAUSS = [1, 4, 6, 4, 1];
-
-// The 8 neighbouring-cell deltas in (gx, gz) order. Used by rebuild loops
-// so a new tile refreshes the smoothing of its neighbours' edges.
-const _NEIGHBOUR_OFFSETS = [
-  [-1, -1], [0, -1], [1, -1],
-  [-1,  0],          [1,  0],
-  [-1,  1], [0,  1], [1,  1],
-];
-
-// Fetch a sample at (ix, iz) in a tile-local coordinate system where
-// [0, res) is the tile itself and values outside that range come from the
-// appropriate neighbour's raw samples (remapped to its own 0..res-1). If
-// the neighbour isn't loaded we clamp to this tile's edge — the Gaussian
-// just degrades to the previous "no-context" behaviour at that side.
-function _lookupWithNeighbours(raw, res, ix, iz, W, E, N, S, NW, NE, SW, SE) {
-  let src, lix = ix, liz = iz;
-  if      (ix < 0   && iz < 0  ) { src = NW; lix = ix + res; liz = iz + res; }
-  else if (ix >= res && iz < 0 ) { src = NE; lix = ix - res; liz = iz + res; }
-  else if (ix < 0   && iz >= res) { src = SW; lix = ix + res; liz = iz - res; }
-  else if (ix >= res && iz >= res) { src = SE; lix = ix - res; liz = iz - res; }
-  else if (ix < 0   )            { src = W;  lix = ix + res;                }
-  else if (ix >= res)            { src = E;  lix = ix - res;                }
-  else if (iz < 0   )            { src = N;  liz = iz + res;                }
-  else if (iz >= res)            { src = S;  liz = iz - res;                }
-  else                           { src = raw; }
-
-  if (!src) {
-    const cix = ix < 0 ? 0 : ix >= res ? res - 1 : ix;
-    const ciz = iz < 0 ? 0 : iz >= res ? res - 1 : iz;
-    return raw[ciz * res + cix];
-  }
-  return src[liz * res + lix];
+  return idx;
 }
 
 function _cellBounds(gx, gz) {
@@ -602,30 +607,4 @@ function _cellDist2(px, pz, gx, gz) {
 function _parseKey(key) {
   const i = key.indexOf(',');
   return [+key.slice(0, i), +key.slice(i + 1)];
-}
-
-function buildTerrainMesh(gx, gz, res, samples) {
-  const b = _cellBounds(gx, gz);
-  const w = b.maxX - b.minX;
-  const d = b.maxZ - b.minZ;
-  const geom = new THREE.PlaneGeometry(w, d, res - 1, res - 1);
-  geom.rotateX(-Math.PI / 2);
-
-  const pos = geom.attributes.position.array;
-  for (let i = 0, n = res * res; i < n; i++) {
-    pos[i * 3 + 1] = _decode(samples[i]);
-  }
-
-  geom.computeVertexNormals();
-  geom.computeBoundingBox();
-  geom.computeBoundingSphere();
-
-  const mesh = new THREE.Mesh(geom, _createTerrainMaterial());
-  mesh.position.set(
-    (b.minX + b.maxX) / 2,
-    0,
-    (b.minZ + b.maxZ) / 2,
-  );
-  mesh.name = 'terrain';
-  return mesh;
 }

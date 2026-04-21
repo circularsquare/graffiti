@@ -71,6 +71,26 @@
       cursor: default;
     }
 
+    #render-distance {
+      position: fixed;
+      top: 302px; right: 16px;
+      width: 234px;
+      padding: 6px 8px;
+      font-family: monospace;
+      font-size: 11px;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.55);
+      border: 2px solid rgba(255,255,255,0.25);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+      pointer-events: auto;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      gap: 4px;
+    }
+    #render-distance-label { display: flex; justify-content: space-between; }
+    #render-distance input { width: 100%; cursor: pointer; accent-color: #fff; }
+
     #crosshair {
       position: fixed;
       top: 50%; left: 50%;
@@ -94,12 +114,41 @@
       pointer-events: none;
     }
 
+    #loading-indicator {
+      position: fixed;
+      bottom: 16px;
+      left: 16px;
+      color: rgba(255,255,255,0.85);
+      font-family: monospace;
+      font-size: 12px;
+      pointer-events: none;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      gap: 3px;
+      text-shadow: 0 1px 2px rgba(0,0,0,0.9);
+    }
+    #loading-indicator > div { display: flex; align-items: center; gap: 6px; }
+    #loading-indicator > div.hidden { display: none; }
+    #loading-indicator > div::before {
+      content: '';
+      width: 7px; height: 7px;
+      border-radius: 50%;
+      background: #ffd24d;
+      box-shadow: 0 0 3px rgba(0,0,0,0.8);
+      animation: loading-pulse 1s ease-in-out infinite;
+    }
+    @keyframes loading-pulse {
+      0%, 100% { opacity: 1; }
+      50%      { opacity: 0.25; }
+    }
+
     #colorbar {
       position: fixed;
       top: 16px;
       left: 16px;
-      display: flex;
-      flex-direction: column;
+      display: grid;
+      grid-template-columns: repeat(2, 28px);
       gap: 3px;
       z-index: 10;
       pointer-events: auto;
@@ -118,6 +167,10 @@
       color: #aaa;
       flex-shrink: 0;
     }
+    .color-swatch.erase {
+      grid-column: 1 / -1;
+      width: auto;
+    }
     .color-swatch.active {
       border: 2px solid #fff;
       box-shadow: 0 0 0 1px rgba(0,0,0,0.8), 0 1px 3px rgba(0,0,0,0.6);
@@ -134,11 +187,20 @@
   <div id="crosshair"></div>
   <div id="colorbar"></div>
   <div id="hud">Graffiti NYC</div>
+  <div id="loading-indicator">
+    <div id="loading-buildings" class="hidden">Loading buildings...</div>
+    <div id="loading-osm" class="hidden">Loading OSM...</div>
+    <div id="loading-terrain" class="hidden">Loading terrain...</div>
+  </div>
   <div id="minimap-wrap">
     <canvas id="minimap" width="234" height="234"></canvas>
   </div>
   <div id="minimap-attr">© OpenStreetMap contributors</div>
   <button id="minimap-random" disabled>Random location</button>
+  <div id="render-distance">
+    <div id="render-distance-label"><span>Render distance</span><span id="render-distance-val">1.00×</span></div>
+    <input id="render-distance-slider" type="range" min="0.5" max="1.6" step="0.05" value="1">
+  </div>
   <script type="module" src="/src/main.js"></script>
 </body>
 </html>

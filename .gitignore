@@ -3,9 +3,8 @@ dist/
 __pycache__/
 *.pyc
 
-# Large data files — regenerate with scripts/convert_citygml.py or npm run build-tiles
+# Large data files — regenerate with npm run build-tiles / build-osm / bake-terrain
 data/
-public/buildings.json
 public/tiles/
 public/osm/
 public/terrain/

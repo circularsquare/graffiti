@@ -37,8 +37,8 @@ TNM_CACHE         = os.path.join(OUTPUT_DIR, '_tnm_response.json')
 TNM_ENDPOINT = 'https://tnmaccess.nationalmap.gov/api/v1/products'
 TNM_DATASET  = 'Digital Elevation Model (DEM) 1 meter'
 
-# Proximity grid — same 250 m cells the OSM fetcher uses for building-adjacency
-# checks. A 4-cell pad (1 km) around any building cell is enough to avoid
+# Proximity grid — 250 m cells for building-adjacency checks. A 4-cell pad
+# (1 km) around any building cell is enough to avoid
 # coverage holes at the edges while still dropping NJ, open harbour, and
 # open-ocean DEM tiles that would otherwise come back from a rectangular bbox
 # query. Used both to tighten the TNM bbox and to cull the response.

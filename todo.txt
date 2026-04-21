@@ -1,25 +1,16 @@
 meoww!
 
-- draw on floor 
-
-- topography
-- increase load dist if theres like no buildings nearby
 - add bridges...
   - statue of liberty
   - trains??
   - see if there are any huge buildings in the data? break them up? merge small ones?
+- clouds
 
-- cylinder tweak / thin faces?
-- build time face merging?
-
-- terrain 
-  - stitch holes on tile borders 
-
-is movement speed dependent on frame rate?
+- topography
+  - terrain 1m?
 
 
-file size
-bldng tile 0.2mb - 10mb, osm 0.03mb - 8mb (??)
+
 
 
 

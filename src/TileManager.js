@@ -2,25 +2,12 @@ import * as THREE from 'three';
 import { wrapMeshData } from './loadCityGML.js';
 import { paintStore } from './paintStore.js';
 
-// Adaptive load radius. The effective radius each frame is the greatest
-// distance r in [MIN, MAX] such that the sum of cellEstimate over tiles within
-// r of the player stays under CELL_BUDGET — so sparse suburbs stretch out to
-// MAX while dense midtown clamps to MIN. CELL_BUDGET is expressed in paint
-// cells (~2 m squares) because that's what actually drives render/memory cost;
-// a handful of skyscrapers can cost as much as a whole neighbourhood of
-// brownstones by that measure.
-const MIN_LOAD_RADIUS = 200;     // metres — never shrink below this
-const MAX_LOAD_RADIUS = 800;     // metres — never grow beyond this
-const CELL_BUDGET     = 120_000; // paint cells — tuned against FiDi density
-const UNLOAD_MARGIN   = 75;      // metres of hysteresis past the effective radius
-// The nearest N tiles always load regardless of budget so the teleport gate
-// has something deterministic to wait on, and so the view never collapses
-// below "a couple of tiles around the player" even if they happen to be huge.
-const TELEPORT_GATE_TILES = 4;
-// Fallback cell cost for tiles whose manifest entry predates build_tiles.py's
-// cellEstimate field. Overwritten after the tile's cellData arrives with the
-// real cell count from the worker.
-const FALLBACK_CELLS_PER_BUILDING = 100;
+// Fixed load radius. Previously adaptive between 150–250m driven by a paint-
+// cell budget; dropped once terrain seeding put ~400 extra cells on every
+// block's top face and the density-sensitive radius felt more confusing than
+// useful. The slider (setRadiusScale) still scales this linearly.
+const LOAD_RADIUS   = 150;
+const UNLOAD_MARGIN = 50; // metres of hysteresis past the load radius
 
 // Spatial index: coarse grid cell size. tick() checks a 5×5 neighbourhood of
 // coarse cells (~2500 m reach), so up to ~25 cells × a handful of tiles each
@@ -35,11 +22,9 @@ const MAX_CONCURRENT_LOADS = 3;
 /**
  * Manages dynamic loading and unloading of building tiles as the player moves.
  *
- * The load radius is adaptive: each tick() recomputes an effective radius by
- * budgeting nearby tiles' cellEstimate (paint-cell count, from the manifest
- * or a runtime fallback) against CELL_BUDGET. Tiles within that radius load;
- * tiles past it by UNLOAD_MARGIN unload. In dense areas the radius clamps to
- * MIN_LOAD_RADIUS; in sparse ones it stretches out to MAX_LOAD_RADIUS.
+ * Tiles within LOAD_RADIUS × radiusScale load; sticky per-tile hysteresis
+ * keeps them loaded until the player has moved UNLOAD_MARGIN past each tile's
+ * admit distance, so mid-flight slider tweaks and grazing passes don't thrash.
  *
  * Paint data is fetched per tile from /api/paint/:tileId when a tile loads
  * (see paintStore.loadTile) and flushed back with a PUT when a tile unloads,
@@ -84,10 +69,8 @@ export class TileManager {
     // Map<tileId, TileState>
     this._tiles = new Map();
 
-    // Spatial index: Map<"gx,gz", tile[]> — only tiles with finite bounds.
-    // Tiles with infinite bounds (fallback synthetic tile) go in _alwaysCheck.
+    // Spatial index: Map<"gx,gz", tile[]>.
     this._spatialIndex = new Map();
-    this._alwaysCheck  = [];
 
     // Concurrent load tracking.
     this._activeLoads = 0;
@@ -95,10 +78,14 @@ export class TileManager {
     this._lastPx = 0;  // most recent player XZ, used to prioritise the queue by distance
     this._lastPz = 0;
 
-    // Current adaptive load radius (metres). Recomputed in tick(). Starts at
-    // MIN so the very first tick — which runs before any tile has landed — is
-    // conservative; it'll widen out once cell estimates settle.
-    this._effectiveLoadRadius = MIN_LOAD_RADIUS;
+    // Effective load radius exposed to main.js for fog / camera.far / cull.
+    // Normally equals LOAD_RADIUS × _radiusScale, but extended each tick to
+    // cover the farthest corner of any sticky-held tile past that band so
+    // loaded meshes never sit outside the cull radius.
+    this._effectiveLoadRadius = LOAD_RADIUS;
+
+    // User-facing render-distance multiplier. 1 = LOAD_RADIUS metres.
+    this._radiusScale = 1;
 
     // Scratch containers reused across ticks to avoid per-frame allocation.
     this._tickCandidates = [];
@@ -160,9 +147,7 @@ export class TileManager {
     for (const m of tile.meshes) {
       meshByBuildingId.set(m.userData.buildingId, m);
     }
-    let actualCellCount = 0;
     for (const cd of cellData) {
-      actualCellCount += cd.cellKeys.length;
       const mesh = meshByBuildingId.get(cd.buildingId);
       if (!mesh) continue;
       if (!mesh.userData.cellDataByType) mesh.userData.cellDataByType = {};
@@ -173,11 +158,6 @@ export class TileManager {
         cellGroups: cd.cellGroups,
       };
     }
-    // Replace the initial estimate with the authoritative count from the
-    // worker. Subsequent tick()s budget against the real cost, so if the
-    // manifest's cellEstimate was off (or the fallback heuristic misfired),
-    // the effective radius corrects itself on the next frame.
-    tile.cellEstimate = actualCellCount;
 
     // Wait for server-saved paint to land before letting seedTileCells run —
     // otherwise fresh seeds get saved as authoritative state and any cells
@@ -200,61 +180,25 @@ export class TileManager {
 
   /**
    * Load the tile manifest and kick off the initial tick.
-   * Falls back to a single synthetic tile (/buildings.json) if the manifest
-   * is missing — keeps the game working before build_tiles.py has been run.
    */
   async init(manifestUrl = '/tiles/manifest.json') {
-    // ?buildings=lod2 swaps in the parallel TUM-LoD2 tile pipeline
-    // (build_tiles_lod2.py output). ?buildings=doitt forces a single-file
-    // FiDi load, bypassing both tile systems for a quick A/B.
-    const params = new URLSearchParams(typeof location !== 'undefined' ? location.search : '');
-    const override = params.get('buildings');
-    if (override === 'lod2') {
-      manifestUrl = '/tiles_lod2/manifest.json';
-      console.log(`TileManager: ?buildings=lod2 → ${manifestUrl}`);
-    }
-
-    let entries;
-    if (override === 'doitt') {
-      console.log('TileManager: ?buildings=doitt → single-file /buildings.json');
-      entries = [{
-        id:    'override-doitt',
-        file:  '/buildings.json',
-        bounds: { minX: -Infinity, maxX: Infinity, minZ: -Infinity, maxZ: Infinity },
-        buildingCount: 0,
-      }];
-    } else {
-      try {
-        const res = await fetch(manifestUrl);
-        if (!res.ok) throw new Error(`HTTP ${res.status}`);
-        entries = await res.json();
-      } catch (e) {
-        console.warn(`TileManager: manifest not found (${e.message}), falling back to /buildings.json`);
-        entries = [{
-          id:    'fallback',
-          file:  '/buildings.json',
-          bounds: { minX: -Infinity, maxX: Infinity, minZ: -Infinity, maxZ: Infinity },
-          buildingCount: 0,
-        }];
-      }
-    }
+    const res = await fetch(manifestUrl);
+    if (!res.ok) throw new Error(`TileManager: manifest fetch failed (HTTP ${res.status})`);
+    const entries = await res.json();
 
     for (const entry of entries) {
-      // cellEstimate from the manifest is authoritative; fall back to a rough
-      // buildingCount-based guess if the manifest predates that field. The
-      // estimate is replaced with the worker's actual cell count once the
-      // tile loads, so the initial guess only matters for the first load
-      // decision against this tile.
-      const fallback = (entry.buildingCount ?? 1) * FALLBACK_CELLS_PER_BUILDING;
+      // The manifest carries only (gx, gz, bounds); id and file are derived
+      // from the grid coord since tiles live on a deterministic URL.
+      const id   = `cell_${entry.gx}_${entry.gz}`;
+      const file = `/tiles/cell_${entry.gx}_${entry.gz}.bin`;
       const tile = {
-        id:     entry.id,
-        file:   entry.file,
+        id,
+        file,
         bounds: entry.bounds,
         status: 'unloaded', // 'unloaded' | 'loading' | 'loaded'
         meshes: [],
-        cellEstimate: entry.cellEstimate ?? fallback,
       };
-      this._tiles.set(entry.id, tile);
+      this._tiles.set(id, tile);
       this._indexTile(tile);
     }
 
@@ -273,16 +217,33 @@ export class TileManager {
   getLoadRadius() { return this._effectiveLoadRadius; }
 
   /**
+   * Set the user-facing render-distance multiplier (see _radiusScale). A
+   * shrinking scale forcibly unloads tiles outside the new scaled radius
+   * (bypassing sticky hysteresis) — sticky hysteresis is there to smooth
+   * grazing passes, not deliberate user actions.
+   */
+  setRadiusScale(s) {
+    const shrinking = s < this._radiusScale;
+    this._radiusScale = s;
+    if (shrinking) {
+      const cutoff = (LOAD_RADIUS * s + UNLOAD_MARGIN) ** 2;
+      const doomed = [];
+      for (const tile of this._loadedTiles) {
+        if (!isFinite(tile.bounds.minX)) continue;
+        const d2 = _closestDist2(this._lastPx, this._lastPz, tile.bounds);
+        if (d2 > cutoff) doomed.push(tile);
+      }
+      for (const tile of doomed) this._unload(tile);
+    }
+  }
+
+  /**
    * True when the TELEPORT_GATE_TILES finite-bounds tiles nearest (px, pz) are
-   * all loaded (or fewer exist within MAX_LOAD_RADIUS, in which case all of
-   * them). Decoupled from the adaptive load radius — otherwise teleports into
-   * sparse areas would stall the overlay waiting on distant tiles that the
-   * budget-based loader willingly fetches, but the player doesn't need to
-   * *see* before the overlay clears.
+   * all loaded (or fewer exist within LOAD_RADIUS, in which case all of them).
    */
   allNearbyTilesLoaded(px, pz) {
     const TELEPORT_GATE_TILES = 4;
-    const maxR2 = MAX_LOAD_RADIUS ** 2;
+    const maxR2 = LOAD_RADIUS ** 2;
     const pgx = Math.floor(px / COARSE_GRID);
     const pgz = Math.floor(pz / COARSE_GRID);
     const nearest = [];
@@ -309,20 +270,11 @@ export class TileManager {
     return true;
   }
 
-  /**
-   * Pick a random XZ position inside a random manifest tile with finite bounds.
-   * Returns null if only the infinite fallback tile is available.
-   */
+  /** Pick a random XZ position inside a random manifest tile. */
   randomLocation() {
-    const finite = [];
-    for (const tile of this._tiles.values()) {
-      const b = tile.bounds;
-      if (isFinite(b.minX) && isFinite(b.maxX) && isFinite(b.minZ) && isFinite(b.maxZ)) {
-        finite.push(b);
-      }
-    }
-    if (finite.length === 0) return null;
-    const b = finite[Math.floor(Math.random() * finite.length)];
+    const tiles = [...this._tiles.values()];
+    if (tiles.length === 0) return null;
+    const b = tiles[Math.floor(Math.random() * tiles.length)].bounds;
     return {
       x: b.minX + Math.random() * (b.maxX - b.minX),
       z: b.minZ + Math.random() * (b.maxZ - b.minZ),
@@ -373,7 +325,11 @@ export class TileManager {
     const candidates = this._tickCandidates;
     candidates.length = 0;
 
-    const maxR2 = MAX_LOAD_RADIUS ** 2;
+    const scale       = this._radiusScale;
+    const scaledMin   = MIN_LOAD_RADIUS * scale;
+    const scaledMax   = MAX_LOAD_RADIUS * scale;
+    const scaledBudget = CELL_BUDGET * scale * scale;
+    const maxR2 = scaledMax ** 2;
     const pgx = Math.floor(px / COARSE_GRID);
     const pgz = Math.floor(pz / COARSE_GRID);
     const visited = new Set();
@@ -402,14 +358,14 @@ export class TileManager {
 
     const toLoad = this._toLoadScratch;
     toLoad.clear();
-    const minR2 = MIN_LOAD_RADIUS ** 2;
+    const minR2 = scaledMin ** 2;
     let budgetR2 = minR2;
     let cost = 0;
     for (let i = 0; i < candidates.length; i++) {
       const { tile, d2 } = candidates[i];
       const tileCost = tile.cellEstimate || 0;
       const forced = i < TELEPORT_GATE_TILES;
-      if (!forced && cost + tileCost > CELL_BUDGET) break;
+      if (!forced && cost + tileCost > scaledBudget) break;
       cost += tileCost;
       toLoad.add(tile);
       if (d2 > budgetR2) budgetR2 = d2;
@@ -424,9 +380,11 @@ export class TileManager {
     if (this._loadQueue.length > 0) {
       for (let i = this._loadQueue.length - 1; i >= 0; i--) {
         const tile = this._loadQueue[i];
-        if (_closestDist2(px, pz, tile.bounds) > _stickyUnloadR2(tile)) {
+        const qd2 = _closestDist2(px, pz, tile.bounds);
+        if (qd2 > _stickyUnloadR2(tile, scaledMax)) {
           tile.status = 'unloaded';
           tile.admittedAtD2 = 0;
+          tile.lastUnloadD2 = qd2;
           this._loadQueue.splice(i, 1);
         }
       }
@@ -436,11 +394,20 @@ export class TileManager {
     // tile records its admit distance on enqueue, and is only unloaded when
     // the player has moved past admitDistance + UNLOAD_MARGIN — decoupled
     // from the budget radius so tiles you've already seen don't disappear.
+    //
+    // Re-admit gate (lastUnloadD2): a tile that just unloaded at distance D is
+    // blocked from re-admission until the player is closer than D. Without
+    // this, flying past a tile can trigger render → unload (sticky) → render
+    // again, because the unload threshold (admit + UNLOAD_MARGIN) sits well
+    // inside MAX_LOAD_RADIUS and the budget happily re-admits.
     for (let i = 0; i < candidates.length; i++) {
       const { tile, d2 } = candidates[i];
       if (toLoad.has(tile)) {
-        if (tile.status === 'unloaded') this._enqueueLoad(tile, d2);
-      } else if (tile.status === 'loaded' && d2 > _stickyUnloadR2(tile)) {
+        if (tile.status === 'unloaded') {
+          if (tile.lastUnloadD2 != null && d2 >= tile.lastUnloadD2) continue;
+          this._enqueueLoad(tile, d2);
+        }
+      } else if (tile.status === 'loaded' && d2 > _stickyUnloadR2(tile, scaledMax)) {
         this._unload(tile);
       }
     }
@@ -449,32 +416,27 @@ export class TileManager {
     // need to unload. Same sticky threshold applies.
     for (const tile of this._loadedTiles) {
       if (visited.has(tile)) continue; // already handled above
-      if (!isFinite(tile.bounds.minX)) continue;
       const d2 = _closestDist2(px, pz, tile.bounds);
-      if (d2 > _stickyUnloadR2(tile)) this._unload(tile);
-    }
-
-    // Always check tiles with infinite/special bounds (fallback tile) — these
-    // never participate in the budget; d2 is 0 when the player is inside the
-    // infinite AABB, so they always load on the first tick.
-    for (const tile of this._alwaysCheck) {
-      const d2 = _closestDist2(px, pz, tile.bounds);
-      this._checkTile(tile, budgetR2, _stickyUnloadR2(tile), d2);
+      if (d2 > _stickyUnloadR2(tile, scaledMax)) this._unload(tile);
     }
 
     // Publish the effective radius AFTER unload decisions, extended to cover
     // any sticky-loaded tiles that sit past budgetR2. main.js uses this for
-    // the cull radius, fog density, and camera.far — if it were just the
-    // budget radius, meshes the loader intentionally kept would get culled or
-    // fogged out. Recomputing here (rather than tracking incrementally) costs
-    // one loop over _loadedTiles, which is bounded by the budget.
+    // the cull radius, fog density, and camera.far.
+    //
+    // Use each loaded tile's FARTHEST AABB corner, not the closest point. The
+    // per-mesh cull in main.js compares mesh *center* distance to r; a mesh
+    // center is inside its tile's AABB, so its distance ≥ the AABB's closest
+    // distance. If r only covered the closest point, the boundary tile's own
+    // meshes would sit right at (or past) r and flicker in/out as small player
+    // motion shifted r by a few metres — especially visible in sparse areas
+    // where one tile dominates the outer edge. Covering the farthest corner
+    // guarantees r ≥ any mesh center within any loaded tile.
     let effectiveR2 = budgetR2;
     for (const tile of this._loadedTiles) {
-      if (!isFinite(tile.bounds.minX)) continue;
-      const d2 = _closestDist2(px, pz, tile.bounds);
+      const d2 = _farthestDist2(px, pz, tile.bounds);
       if (d2 > effectiveR2) effectiveR2 = d2;
     }
-    if (effectiveR2 > maxR2) effectiveR2 = maxR2;
     this._effectiveLoadRadius = Math.sqrt(effectiveR2);
   }
 
@@ -491,13 +453,9 @@ export class TileManager {
 
   // ── Private ──────────────────────────────────────────────────────────────────
 
-  /** Insert a tile into the spatial index (or _alwaysCheck for infinite bounds). */
+  /** Insert a tile into the spatial index. */
   _indexTile(tile) {
     const { minX, maxX, minZ, maxZ } = tile.bounds;
-    if (!isFinite(minX) || !isFinite(maxX) || !isFinite(minZ) || !isFinite(maxZ)) {
-      this._alwaysCheck.push(tile);
-      return;
-    }
     const gx0 = Math.floor(minX / COARSE_GRID);
     const gx1 = Math.floor(maxX / COARSE_GRID);
     const gz0 = Math.floor(minZ / COARSE_GRID);
@@ -562,6 +520,20 @@ export class TileManager {
       const tReceived = performance.now();
       performance.measure('tile:wait', { start: tLoad, end: tReceived });
 
+      // If the player flew past this tile's sticky threshold while the worker
+      // was busy, adding the meshes would cause a load→immediate-unload flash.
+      // Bail before touching the scene; the pass-3 re-admit gate (lastUnloadD2)
+      // then keeps us from re-queuing this tile while still flying away.
+      const d2Now = _closestDist2(this._lastPx, this._lastPz, tile.bounds);
+      const scaledMax = MAX_LOAD_RADIUS * this._radiusScale;
+      if (d2Now > _stickyUnloadR2(tile, scaledMax)) {
+        tile.status = 'unloaded';
+        tile.admittedAtD2 = 0;
+        tile.lastUnloadD2 = d2Now;
+        tile._pendingCellData = null;
+        return;
+      }
+
       // One Group per tile lets the renderer short-circuit scene traversal for
       // out-of-range tiles via a single group.visible=false (main.js#updateCulling),
       // instead of walking every invisible mesh individually every frame.
@@ -593,6 +565,7 @@ export class TileManager {
 
       tile.meshes = meshes;
       tile.status = 'loaded';
+      tile.lastUnloadD2 = null;
       this._loadedTiles.add(tile);
 
       // Kick off the paint fetch in parallel with phase 2. _applyCellDataToTile
@@ -691,6 +664,7 @@ export class TileManager {
     tile.meshes = [];
     tile.status = 'unloaded';
     tile.admittedAtD2 = 0;
+    tile.lastUnloadD2 = _closestDist2(this._lastPx, this._lastPz, tile.bounds);
     this._loadedTiles.delete(tile);
 
     // Flush any pending save for this tile and drop its cells from paintStore.
@@ -716,6 +690,17 @@ function _closestDist2(px, pz, bounds) {
   return (px - cx) ** 2 + (pz - cz) ** 2;
 }
 
+/**
+ * Squared distance from point (px, pz) to the *farthest* corner of AABB
+ * bounds. Used to compute a cull radius that covers every mesh center inside
+ * every loaded tile — see the effective-radius comment in tick().
+ */
+function _farthestDist2(px, pz, bounds) {
+  const dx = Math.max(Math.abs(px - bounds.minX), Math.abs(px - bounds.maxX));
+  const dz = Math.max(Math.abs(pz - bounds.minZ), Math.abs(pz - bounds.maxZ));
+  return dx * dx + dz * dz;
+}
+
 function _byDist2(a, b) { return a.d2 - b.d2; }
 
 /**
@@ -724,11 +709,16 @@ function _byDist2(a, b) { return a.d2 - b.d2; }
  * adaptive budget radius shrinks under it — so mid-approach cellEstimate
  * corrections can't evict buildings you're flying toward.
  *
+ * `maxR` caps the admit distance at the current scaled MAX_LOAD_RADIUS. Without
+ * this cap, dropping the render-distance slider wouldn't drop already-loaded
+ * far tiles: their historical admit distance would keep the threshold inflated
+ * indefinitely.
+ *
  * Tiles that were never admitted (admittedAtD2 is 0/undefined) fall back to
  * UNLOAD_MARGIN², which matches the prior behaviour at the inner edge.
  */
-function _stickyUnloadR2(tile) {
-  const admittedR = Math.sqrt(tile.admittedAtD2 || 0);
+function _stickyUnloadR2(tile, maxR) {
+  const admittedR = Math.min(Math.sqrt(tile.admittedAtD2 || 0), maxR);
   const r = admittedR + UNLOAD_MARGIN;
   return r * r;
 }

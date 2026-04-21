@@ -5,6 +5,8 @@ import { TileManager } from './TileManager.js';
 import { OsmManager } from './OsmManager.js';
 import { TerrainManager } from './TerrainManager.js';
 import { paintStore } from './paintStore.js';
+import { worldToGrid, gridToWorld } from './geo.js';
+import { BLOCK_SIZE } from './gridShader.js';
 import {
   initMinimap, updateMinimap, setMinimapSize,
   adjustMinimapZoom, adjustMinimapPan, resetMinimapPan,
@@ -79,9 +81,9 @@ window.addEventListener('resize', () => {
 
 // ─── Lights ───────────────────────────────────────────────────────────────────
 
-scene.add(new THREE.AmbientLight(0xffffff, 0.35));
+scene.add(new THREE.AmbientLight(0xffffff, 1));
 
-const sun = new THREE.DirectionalLight(0xfff8e7, 1.8);
+const sun = new THREE.DirectionalLight(0xfff8e7, 1.2);
 sun.position.set(150, 300, 100);
 sun.castShadow = false;
 scene.add(sun);
@@ -100,11 +102,11 @@ const FLOOR_Y = TERRAIN_ENABLED ? -5 : -0.1;
 // The ground plane follows the player every frame — cheaper and more robust
 // than making it arena-sized (which runs into depth precision issues at the
 // horizon) and guarantees a floor exists wherever the random-teleport drops us.
-// Cooler, greyer than the OSM LAND_MAT colour so the border between
-// "inside 5-borough coverage" and "no OSM data here" is visible.
+// Matches OSM WATER_COLOR (#9cc4e2) so areas outside the 5-borough coverage
+// read as open water rather than a grey void.
 const ground = new THREE.Mesh(
   new THREE.PlaneGeometry(20000, 20000),
-  new THREE.MeshLambertMaterial({ color: 0x9b9b9e }),
+  new THREE.MeshLambertMaterial({ color: 0x9cc4e2 }),
 );
 ground.rotation.x = -Math.PI / 2;
 ground.position.set(0, FLOOR_Y, 0);
@@ -124,10 +126,38 @@ const buildingMeshes = [];      // buildings only (for wall collision)
 // together keeps the visual edge consistent when sparsity widens the ring.
 function cullRadius() { return tileManager.getLoadRadius(); }
 
+// Convert a terrain cell's grid-space AABB to a world-space AABB (the
+// AABB of the 4 rotated corners). Terrain indexes cells in grid space
+// (Manhattan rotation) while OSM tile bounds are world-space, so any
+// cross-system overlap check has to go through this first.
+function _gridBoundsToWorldAABB(b) {
+  const corners = [
+    gridToWorld(b.minX, b.minZ),
+    gridToWorld(b.maxX, b.minZ),
+    gridToWorld(b.maxX, b.maxZ),
+    gridToWorld(b.minX, b.maxZ),
+  ];
+  let minX =  Infinity, maxX = -Infinity;
+  let minZ =  Infinity, maxZ = -Infinity;
+  for (const [x, z] of corners) {
+    if (x < minX) minX = x; if (x > maxX) maxX = x;
+    if (z < minZ) minZ = z; if (z > maxZ) maxZ = z;
+  }
+  return { minX, maxX, minZ, maxZ };
+}
+
 // Filtered views rebuilt by updateCulling() whenever the player moves enough
 // or the load radius shifts past CULL_HYSTERESIS.
 let nearBuildingMeshes = [];
 let nearCollidables    = [ground];
+// Same contents as nearCollidables but without terrain meshes. Walk-mode
+// floor detection raycasts against this list and reads terrain height via
+// `terrainManager.sample()` instead — that sample is a bilinear interp of
+// the same 4 corner heights the mesh's top quad uses, so Y moves smoothly
+// across a slope. Raycasting the blocky mesh directly produced frame-to-
+// frame jitter because the 8 ring rays hit the mesh at slightly different
+// heights and the MAX-picker kept swapping which one won.
+let nearRayCollidables = [ground];
 
 let _cullX = NaN, _cullZ = NaN;
 let _cullR = 0;
@@ -136,7 +166,6 @@ function updateCulling() {
   const px = camera.position.x, pz = camera.position.z;
   _cullX = px; _cullZ = pz;
   _cullR = cullRadius();
-  updateViewFalloff(_cullR);
   const r2 = _cullR * _cullR;
   nearBuildingMeshes = [];
 
@@ -167,6 +196,9 @@ function updateCulling() {
     }
   }
   nearCollidables = [ground, ...nearBuildingMeshes, ...terrainManager.meshes()];
+  nearRayCollidables = [ground, ...nearBuildingMeshes];
+
+  osmManager.updateLabelVisibility(px, pz);
 }
 
 // Only re-cull when the player has moved at least this far (metres).
@@ -185,31 +217,65 @@ function maybeCull() {
 // scales inversely (less fog when the radius widens, so distant buildings
 // stay visible) and far sits a short margin past the cull edge so we don't
 // waste depth precision on geometry nothing will ever reach.
-const BASE_RADIUS     = 200;
+const BASE_RADIUS     = 180;
 const BASE_FOG_DENSITY = 0.003;
-const FAR_MARGIN       = 400;
-function updateViewFalloff(r) {
-  scene.fog.density = BASE_FOG_DENSITY * (BASE_RADIUS / Math.max(r, 1));
-  camera.far        = r + FAR_MARGIN;
-  camera.updateProjectionMatrix();
+const FAR_MARGIN       = 350;
+// Compresses the fog ramp into the far ~30% of the view instead of spreading
+// it across the full radius — scales density so FogExp2 reaches the same
+// opacity at FOG_START_FRAC×_falloffR that it used to reach at _falloffR.
+const FOG_START_FRAC  = 0.7;
+// Smoothed tracking of the load radius. The raw value jumps whenever a tile
+// loads/unloads or the adaptive budget shifts; applying those jumps directly
+// to fog density and camera.far makes the horizon appear to jerk during
+// flight. Lerping toward the target each frame (FALLOFF_LERP per frame) turns
+// a step into a short ramp that the eye reads as smooth.
+const FALLOFF_LERP = 0.08;
+// Projection-matrix update is O(handful of matrix math + per-material uniform
+// re-upload next frame) — cheap individually but runs every frame. Once the
+// lerp converges (stable fog/far), we can skip the matrix write without any
+// visible effect. 5 cm is below any depth/fog threshold for a ~500 m far
+// plane, so the check triggers only at steady-state. Deliberately small so
+// the lerp remains responsive while running — we skip only once it's
+// genuinely done.
+const FALLOFF_EPS = 0.05;
+let _falloffR = BASE_RADIUS;
+let _lastAppliedFalloffR = BASE_RADIUS;
+function updateViewFalloff(targetR) {
+  _falloffR += (targetR - _falloffR) * FALLOFF_LERP;
+  scene.fog.density = BASE_FOG_DENSITY * (BASE_RADIUS / Math.max(_falloffR * FOG_START_FRAC, 1));
+  if (Math.abs(_falloffR - _lastAppliedFalloffR) > FALLOFF_EPS) {
+    camera.far = _falloffR + FAR_MARGIN;
+    camera.updateProjectionMatrix();
+    _lastAppliedFalloffR = _falloffR;
+  }
 }
 
 let isFlying    = _savedPlayer ? !!_savedPlayer.flying : false;
 let lastSpaceTap = 0;
 const DOUBLE_TAP_MS = 280;
 
-const WALK_HEIGHT   = 3.0;  // eye height above surface
+// Player scale — all lengths/speeds/accelerations below sit ×0.6 against a
+// prior ~3 m-tall "giant" pass so proportions vs. city geometry feel natural
+// (human ≈ 1.8 m tall, walks ~5 m/s sprinting).
+const WALK_HEIGHT   = 1.8;  // eye height above surface
 const MIN_EYE_Y     = FLOOR_Y + WALK_HEIGHT; // camera clamp when standing on the default floor (no building underfoot)
-const WALK_SPEED    = 8;
-const SPRINT_SPEED  = 24;
-const FLY_SPEED     = 22;
-const FLY_VERT      = 14;
-const PLAYER_RADIUS = 1.5;  // body collision radius; also used as spawn clearance
-const STEP_UP_HEIGHT = 0.4; // max lip the player auto-climbs when walking
-const GRAVITY       = 22;   // m/s²
-const TERMINAL_VEL  = -50;
+const WALK_SPEED    = 4.8;
+const SPRINT_SPEED  = 14.4;
+const FLY_SPEED     = 13.2;
+const FLY_VERT      = 8.4;
+const PLAYER_RADIUS = 0.9;  // body collision radius; also used as spawn clearance
+const STEP_UP_HEIGHT = 1.0;  // max lip the player auto-climbs when walking
+const GRAVITY       = 26.4; // m/s²
+const TERMINAL_VEL  = -30;
+const JUMP_HEIGHT   = 2.0;  // peak of a standing jump above the ground
+const JUMP_VEL      = Math.sqrt(2 * GRAVITY * JUMP_HEIGHT); // v² = 2gh
 
 let velY = 0;
+// Edge-triggered jump. Set on a Space keydown that isn't the second half of
+// a double-tap fly toggle, consumed (whether or not we actually jumped) on
+// the next walking-mode frame so held Space doesn't rebounce and so a stale
+// first tap doesn't fire after the fly toggle.
+let jumpRequested = false;
 
 // ─── Controls ─────────────────────────────────────────────────────────────────
 
@@ -246,11 +312,14 @@ let minimapBig = false;
 function applyMinimapLayout() {
   const px = minimapBig ? minimapBigSize() : MINIMAP_SIZE_SMALL;
   setMinimapSize(px);
-  // Keep the random-location button anchored just below the map so the big
-  // map doesn't visually swallow it. The wrap sits at top: 28px; the button
-  // follows at (28 + size + 6)px.
-  const btn = document.getElementById('minimap-random');
-  if (btn) btn.style.top = (28 + px + 6) + 'px';
+  // Keep the random-location button and render-distance slider anchored just
+  // below the map so the big map doesn't visually swallow them. Map sits at
+  // top: 28px; button follows at (28 + size + 6)px; slider follows the button.
+  const btn    = document.getElementById('minimap-random');
+  const slider = document.getElementById('render-distance');
+  const btnTop = 28 + px + 6;
+  if (btn)    btn.style.top    = btnTop + 'px';
+  if (slider) slider.style.top = (btnTop + 34) + 'px';
 }
 function toggleMinimapBig() {
   minimapBig = !minimapBig;
@@ -317,16 +386,55 @@ async function pickStreetSpawn(maxTileTries = 20, pointsPerTile = 4) {
 
 const _teleportEuler = new THREE.Euler(0, 0, 0, 'YXZ');
 
-// Mirror the first-page-load experience: move the player, unlock pointer,
-// show the dimmed "loading" overlay, and wait for nearby tiles to finish
-// loading before letting the user click in. Shared by the random-location
-// button and map-click teleport.
-function fastTravelTo(x, z) {
+// Rising counter so a second fastTravelTo() started before the first's
+// sampleAsync resolves can abandon the stale one. Compared by the awaited
+// callback only; no races possible between set and check on the main thread.
+let _teleportId = 0;
+
+// Mirror the first-page-load experience: unlock pointer, show the dimmed
+// "loading" overlay, fetch the destination's terrain height, then place the
+// player and wait for nearby tiles to finish loading before letting the user
+// click in. Shared by the random-location button and map-click teleport.
+//
+// Order matters: the overlay is only 40% opaque, so if we moved the camera
+// before the terrain cell finished loading, the player would briefly see
+// themselves underground (camera at MIN_EYE_Y ≈ -3, terrain usually +3 m).
+// sampleAsync triggers a priority fetch for the destination cell so we know
+// the ground height before revealing the view.
+async function fastTravelTo(x, z) {
   if (!firstTileLoaded) return;
   // Intentionally not gated on `teleporting`: a fresh teleport preempts the
   // in-flight one. The gate check in onTileLoaded runs against the current
   // camera position, so only tiles around the latest destination matter.
-  camera.position.set(x, MIN_EYE_Y, z);
+  const myId = ++_teleportId;
+
+  teleporting = true;
+  overlay.classList.add('loading');
+  overlayPrompt.textContent = 'Loading data...';
+  colorPickMode = false;
+  if (controls.isLocked) controls.unlock();
+  else overlay.classList.remove('hidden');
+  randomBtn.disabled = true;
+
+  // Close the big map if it was open so the loading overlay is actually
+  // visible; resetMinimapPan() runs via toggleMinimapBig.
+  if (minimapBig) toggleMinimapBig();
+
+  // Resolve the spawn Y before moving the camera. Falls back to MIN_EYE_Y if
+  // terrain is disabled or the destination cell is a 404.
+  let spawnY = MIN_EYE_Y;
+  if (TERRAIN_ENABLED) {
+    try {
+      const terrainY = await terrainManager.sampleAsync(x, z);
+      if (terrainY !== null) spawnY = terrainY + WALK_HEIGHT;
+    } catch {
+      // Leave spawnY at MIN_EYE_Y — the walk-mode terrain rescue will snap
+      // us up once a covering tile arrives.
+    }
+    if (myId !== _teleportId) return;
+  }
+
+  camera.position.set(x, spawnY, z);
   velY = 0;
   // Keep the current yaw but pitch the view 20° above horizontal so the player
   // lands looking at the skyline, not their feet. YXZ Euler + positive X = up.
@@ -335,17 +443,6 @@ function fastTravelTo(x, z) {
   _teleportEuler.z = 0;
   camera.quaternion.setFromEuler(_teleportEuler);
   updateCulling();
-
-  teleporting = true;
-  overlay.classList.add('loading');
-  overlayPrompt.textContent = 'Loading data...';
-  colorPickMode = false;
-  if (controls.isLocked) controls.unlock();
-  else overlay.classList.remove('hidden');
-
-  // Close the big map if it was open so the loading overlay is actually
-  // visible; resetMinimapPan() runs via toggleMinimapBig.
-  if (minimapBig) toggleMinimapBig();
 
   // Kick the tile manager now so any fresh loads are in-flight before the
   // next frame, and so we can detect the "nothing new to load" case (e.g.
@@ -464,10 +561,20 @@ document.addEventListener('keydown', e => {
   }
 
   // F3: toggle the debug HUD. Prevent the browser's default search action.
+  // Also force-clears a stuck loading gate (first-load or teleport) so the
+  // player can escape when no tiles are reachable near the current position.
   if (e.code === 'F3') {
     e.preventDefault();
     debugHudOn = !debugHudOn;
     debugHud.style.display = debugHudOn ? 'block' : 'none';
+    if (!firstTileLoaded || teleporting) {
+      firstTileLoaded = true;
+      teleporting = false;
+      overlay.classList.remove('loading');
+      overlayPrompt.textContent = 'Click to explore';
+      randomBtn.disabled = false;
+      snapToSafeStart();
+    }
     return;
   }
 
@@ -478,9 +585,17 @@ document.addEventListener('keydown', e => {
   if (e.code === 'Space' && controls.isLocked && !wasDown) {
     e.preventDefault();
     const now = performance.now();
-    if (now - lastSpaceTap < DOUBLE_TAP_MS) {
+    const isDoubleTap = now - lastSpaceTap < DOUBLE_TAP_MS;
+    if (isDoubleTap) {
       isFlying = !isFlying;
       if (!isFlying) velY = 0; // start falling cleanly when leaving fly mode
+      // Clear any pending jump from the first tap so the player doesn't
+      // hop the instant they leave fly mode.
+      jumpRequested = false;
+    } else if (!isFlying) {
+      // First tap in walking — queue a jump for updateMovement. If a second
+      // tap arrives within DOUBLE_TAP_MS the branch above will clear this.
+      jumpRequested = true;
     }
     lastSpaceTap = now;
   }
@@ -585,10 +700,16 @@ const RING_OFFSETS = (() => {
 function surfaceBelow(pos, maxDrop) {
   let bestY = null;
 
+  // Ray inputs exclude terrain meshes — they're blocky and the 8 ring rays
+  // at ±PLAYER_RADIUS produce frame-to-frame jitter as different rings win
+  // the MAX on a slope. The terrain-sample read below is the authoritative
+  // terrain height (continuous bilinear interp of the mesh's corner heights),
+  // and buildings/ground are still raycast because the mesh IS the surface
+  // of record there.
   _surfOrig.set(pos.x, pos.y - WALK_HEIGHT + STEP_UP_HEIGHT + 0.15, pos.z);
   downRay.set(_surfOrig, DOWN);
   downRay.far = maxDrop + STEP_UP_HEIGHT + 0.15;
-  const centerHits = downRay.intersectObjects(nearCollidables, false);
+  const centerHits = downRay.intersectObjects(nearRayCollidables, false);
   if (centerHits.length > 0) bestY = centerHits[0].point.y;
 
   for (let i = 0; i < RING_OFFSETS.length; i++) {
@@ -596,10 +717,27 @@ function surfaceBelow(pos, maxDrop) {
     _surfOrig.set(pos.x + ox, pos.y - WALK_HEIGHT + 0.15, pos.z + oz);
     downRay.set(_surfOrig, DOWN);
     downRay.far = maxDrop + 0.15;
-    const hits = downRay.intersectObjects(nearCollidables, false);
+    const hits = downRay.intersectObjects(nearRayCollidables, false);
     if (hits.length > 0) {
       const y = hits[0].point.y;
       if (bestY === null || y > bestY) bestY = y;
+    }
+  }
+
+  // Blocky terrain has vertical step walls. When the player clips into one,
+  // the raycast origin sits inside the block and backface culling makes every
+  // ray miss — the foot falls through into the ground plane at FLOOR_Y.
+  // Consult the heightmap directly so the top of the step is always a
+  // candidate surface, whether or not a ray can see it. Only offer it when
+  // it's within the normal step-up/drop window so we don't teleport onto a
+  // faraway cliff top while the player is standing on a rooftop.
+  const terrainY = terrainManager.sample(pos.x, pos.z);
+  if (terrainY !== null) {
+    const feetY = pos.y - WALK_HEIGHT;
+    if (terrainY >= feetY - maxDrop - 0.15 &&
+        terrainY <= feetY + STEP_UP_HEIGHT + 0.15 &&
+        (bestY === null || terrainY > bestY)) {
+      bestY = terrainY;
     }
   }
   return bestY;
@@ -607,27 +745,45 @@ function surfaceBelow(pos, maxDrop) {
 
 // ─── Colors ───────────────────────────────────────────────────────────────────
 
+// Based on sweet24 (by bess, lospec.com/palette-list/sweet24), with: shifted
+// red, true orange replacing the mustard, added yellow + blue + indigo, dark
+// brown/purple removed. 26 colors total, roughly hue-sorted: neutrals → pinks →
+// red → oranges → yellow → browns → greens → blues → purple.
 const COLORS = [
   { name: 'erase',       hex: null,       css: '#555',     isErase: true  },
-  { name: 'white',       hex: 0xffffff,   css: '#ffffff'                  },
-  { name: 'gray',        hex: 0x888888,   css: '#888888'                  },
-  { name: 'black',       hex: 0x111111,   css: '#111111'                  },
-  { name: 'red',         hex: 0xff2222,   css: '#ff2222'                  },
-  { name: 'orange',      hex: 0xff8800,   css: '#ff8800'                  },
-  { name: 'yellow',      hex: 0xffee00,   css: '#ffee00'                  },
-  { name: 'yellowgreen', hex: 0x88cc00,   css: '#88cc00'                  },
-  { name: 'green',       hex: 0x22cc44,   css: '#22cc44'                  },
-  { name: 'teal',        hex: 0x00bbaa,   css: '#00bbaa'                  },
-  { name: 'lightblue',   hex: 0x66ccff,   css: '#66ccff'                  },
-  { name: 'blue',        hex: 0x2255ff,   css: '#2255ff'                  },
-  { name: 'purple',      hex: 0x9933ff,   css: '#9933ff'                  },
-  { name: 'pink',        hex: 0xff66bb,   css: '#ff66bb'                  },
-  { name: 'brown',       hex: 0x885522,   css: '#885522'                  },
+  { name: 'black',       hex: 0x1d1b24,   css: '#1d1b24'                  },
+  { name: 'dark gray',   hex: 0x46464d,   css: '#46464d'                  },
+  { name: 'gray',        hex: 0x7a7576,   css: '#7a7576'                  },
+  { name: 'cream',       hex: 0xcec7b1,   css: '#cec7b1'                  },
+  { name: 'white',       hex: 0xedefe2,   css: '#edefe2'                  },
+  { name: 'pink',        hex: 0xf594aa,   css: '#f594aa'                  },
+  { name: 'red',         hex: 0xd6403a,   css: '#d6403a'                  },
+  { name: 'salmon',      hex: 0xe68556,   css: '#e68556'                  },
+  { name: 'orange',      hex: 0xd66c1c,   css: '#d66c1c'                  },
+  { name: 'sand',        hex: 0xe1bf7d,   css: '#e1bf7d'                  },
+  { name: 'brown',       hex: 0x936a4d,   css: '#936a4d'                  },
+  { name: 'dark brown',  hex: 0x5e3b2f,   css: '#5e3b2f'                  },
+  { name: 'gold',        hex: 0xe0a41c,   css: '#e0a41c'                  },
+  { name: 'yellow',      hex: 0xf7d020,   css: '#f7d020'                  },
+  { name: 'lime',        hex: 0xb9d850,   css: '#b9d850'                  },
+  { name: 'bright green',hex: 0x5fc242,   css: '#5fc242'                  },
+  { name: 'green',       hex: 0x66a650,   css: '#66a650'                  },
+  { name: 'deep teal',   hex: 0x325c4e,   css: '#325c4e'                  },
+  { name: 'aqua',        hex: 0x82dcd7,   css: '#82dcd7'                  },
+  { name: 'turquoise',   hex: 0x22b4ac,   css: '#22b4ac'                  },
+  { name: 'sky',         hex: 0x1c7aa0,   css: '#1c7aa0'                  },
+  { name: 'navy',        hex: 0x2d4068,   css: '#2d4068'                  },
+  { name: 'blue',        hex: 0x4269c0,   css: '#4269c0'                  },
+  { name: 'indigo',      hex: 0x5946b9,   css: '#5946b9'                  },
+  { name: 'lavender',    hex: 0xac90cc,   css: '#ac90cc'                  },
+  { name: 'dark purple', hex: 0x5e2a6f,   css: '#5e2a6f'                  },
+  { name: 'magenta',     hex: 0xa04070,   css: '#a04070'                  },
+  { name: 'wine',        hex: 0x6d2047,   css: '#6d2047'                  },
 ];
 const SEED_COLORS = COLORS.filter(c => !c.isErase);
 const SEED_COLOR_HEX = SEED_COLORS.map(c => c.hex); // flat hex array forwarded to the tile worker
 
-let activeColorIdx = 4; // start on red
+let activeColorIdx = 7; // start on red
 let colorPickMode  = false;
 
 const colorBar = document.getElementById('colorbar');
@@ -636,7 +792,10 @@ const swatchEls = COLORS.map((c, i) => {
   el.className = 'color-swatch' + (i === activeColorIdx ? ' active' : '');
   el.title = c.name;
   el.style.background = c.css;
-  if (c.isErase) el.textContent = '✕';
+  if (c.isErase) {
+    el.textContent = '✕';
+    el.classList.add('erase'); // spans both columns in the 2-col grid
+  }
   el.addEventListener('click', () => {
     setActiveColor(i);
     colorPickMode = false;
@@ -705,9 +864,49 @@ document.body.appendChild(debugHud);
 function updateDebugHud() {
   if (!debugHudOn) return;
   const fpsLine = `fps      ${_fpsValue.toFixed(1)}`;
+  // renderer.info is updated each render(); values here reflect the *previous*
+  // frame's draw. Useful for spotting draw-call growth as paint/buildings
+  // accumulate and for ruling in/out fragment-bound vs. call-bound GPU cost.
+  const r = renderer.info.render;
+  // Scene-wide mesh counts split by category so the `calls` number above is
+  // attributable: buildings (tile-loaded + merged per-building), paint
+  // (per bucket `buildingId:meshType|color` — grows as you paint), terrain
+  // (one per loaded cell). If `calls` climbs while only `paint` grows, paint
+  // consolidation is the next lever; if `bldg` dominates at load, tightening
+  // view radius is.
+  const bldgCount    = buildingMeshes.length;
+  const paintCount   = buildingPaintMeshes.size;
+  const terrainCount = terrainManager.meshes().length;
+  const renderLine =
+    `draw     ${r.calls} calls   ${r.triangles.toLocaleString()} tris\n` +
+    `         bldg ${bldgCount}   paint ${paintCount}   terrain ${terrainCount}`;
   debugRay.setFromCamera(new THREE.Vector2(0, 0), camera);
+
+  // Separate terrain line so we can show the floor height under the crosshair
+  // even when the ray is also hitting a building (useful for debugging the
+  // fly-mode terrain rescue). `sample()` reads the DEM heightmap directly and
+  // is authoritative — the raycast just gives us an XZ to sample at.
+  const terrainHits = debugRay.intersectObjects(terrainManager.meshes(), false);
+  const terrainLines = [];
+  if (terrainHits.length > 0) {
+    const tp   = terrainHits[0].point;
+    const sY   = terrainManager.sample(tp.x, tp.z);
+    const sStr = sY !== null ? `${sY.toFixed(2)} m` : '—';
+    terrainLines.push(`terrain  y ${sStr}   hit ${tp.y.toFixed(2)} m   dist ${terrainHits[0].distance.toFixed(1)} m`);
+    const probe = terrainManager.probe(tp.x, tp.z);
+    if (probe) {
+      terrainLines.push(`  tile   (${probe.gx}, ${probe.gz})   sample (${probe.ix}, ${probe.iz}) / ${probe.res}`);
+      terrainLines.push(`  corner NW ${probe.nw.toFixed(2)}  NE ${probe.ne.toFixed(2)}  SE ${probe.se.toFixed(2)}  SW ${probe.sw.toFixed(2)}`);
+    }
+  }
+
   const hits = debugRay.intersectObjects(nearBuildingMeshes, false);
-  if (!hits.length) { debugHud.textContent = fpsLine + '\n(no hit)'; return; }
+  if (!hits.length) {
+    debugHud.textContent = terrainLines.length
+      ? [fpsLine, renderLine, ...terrainLines].join('\n')
+      : [fpsLine, renderLine, '(no hit)'].join('\n');
+    return;
+  }
   const hit     = hits[0];
   const mesh    = hit.object;
   const ud      = mesh.userData;
@@ -746,8 +945,9 @@ function updateDebugHud() {
   const group       = cellGroups.get(cellKey);
   const groupSize   = group ? group.size : 1;
 
-  debugHud.textContent = [
+  const lines = [
     fpsLine,
+    renderLine,
     `bldg     ${ud.buildingId}`,
     `mesh     ${meshType}   tri ${faceIdx}   face ${fi}`,
     `cell     (${cu}, ${cv})   pdKey ${pdKey}`,
@@ -759,7 +959,9 @@ function updateDebugHud() {
     `planeD   ${paintPD.toFixed(3)}${pdMismatch ? `   (tri ${triPD.toFixed(3)} — MISMATCH)` : ''}`,
     `normal   (${triNormal.x.toFixed(2)}, ${triNormal.y.toFixed(2)}, ${triNormal.z.toFixed(2)})`,
     `dist     ${hit.distance.toFixed(1)} m`,
-  ].join('\n');
+  ];
+  if (terrainLines.length) lines.push(...terrainLines);
+  debugHud.textContent = lines.join('\n');
 }
 const buildingPaintMeshes         = new Map(); // "buildingId:meshType|color" → mesh
 const buildingPaintMeshByBuilding = new Map(); // "buildingId:meshType" → Set<mesh>
@@ -835,7 +1037,7 @@ function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD, meshType) 
   const faces   = srcMesh.userData.faces;
   const triFace = srcMesh.userData.triFace;
   const verts = [];
-  const OFFSET        = 0.025;
+  const OFFSET        = 0.012;
   const COPLANAR_TOL  = 0.15; // 15 cm — rejects steps/ledges, accepts tessellation seams
   const cn = [cellNormal.x, cellNormal.y, cellNormal.z];
 
@@ -910,6 +1112,105 @@ function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD, meshType) 
   return verts;
 }
 
+// Terrain paint cells are simple block faces — no clipping, no cellGeomCache.
+// Each face's 6 vertices (2 tris) already exist in the terrain mesh's
+// position buffer; the worker emits quads in a known order and TerrainManager
+// precomputes a (meshType, ix, iz) → first-vertex-index lookup at tile load.
+// We just copy the 18 floats out and offset by the face normal × OFFSET.
+// Empty Float32Array if the face isn't emitted on this block (e.g. a cliff
+// side pointing at a taller neighbour), which lets the rebuild loop skip it.
+function buildTerrainCellGeometry(state, meshType, ix, iz, iy) {
+  if (!state || !state.faceStarts) return new Float32Array(0);
+  const faceIdx = state.faceStarts[meshType];
+  if (!faceIdx) return new Float32Array(0);
+  const vi = faceIdx[iz * state.res + ix];
+  if (vi < 0) return new Float32Array(0);
+
+  const OFFSET = 0.012;
+  const pos = state.mesh.geometry.attributes.position.array;
+  const nrm = state.mesh.geometry.attributes.normal.array;
+  const nx = nrm[vi * 3], ny = nrm[vi * 3 + 1], nz = nrm[vi * 3 + 2];
+  const ox = nx * OFFSET, oy = ny * OFFSET, oz = nz * OFFSET;
+  const base = vi * 3;
+
+  // Top face: single cell per (ix, iz), copy the 2-tri quad as-is.
+  if (meshType === 'top') {
+    const out = new Float32Array(18);
+    for (let k = 0; k < 6; k++) {
+      out[k * 3    ] = pos[base + k * 3    ] + ox;
+      out[k * 3 + 1] = pos[base + k * 3 + 1] + oy;
+      out[k * 3 + 2] = pos[base + k * 3 + 2] + oz;
+    }
+    return out;
+  }
+
+  // Side face: clip the quad to the Y band [iy*BLOCK_SIZE, (iy+1)*BLOCK_SIZE]
+  // so paint matches the visible grid cell the user clicked. The worker emits
+  // each side as 2 tris (p0,p1,p2 / p0,p2,p3) with p0 at vert 0, p1 at 1,
+  // p2 at 2, p3 at 5 — see terrainWorker.js::emitQuad. Winding differs per
+  // face (west is top,bot,bot,top; east/N/S are top,top,bot,bot) — both are
+  // valid convex perimeters, which is all Sutherland–Hodgman needs.
+  const p0 = [pos[base +  0], pos[base +  1], pos[base +  2]];
+  const p1 = [pos[base +  3], pos[base +  4], pos[base +  5]];
+  const p2 = [pos[base +  6], pos[base +  7], pos[base +  8]];
+  const p3 = [pos[base + 15], pos[base + 16], pos[base + 17]];
+  const poly = [p0, p1, p2, p3];
+
+  const yLo = iy * BLOCK_SIZE;
+  const yHi = yLo + BLOCK_SIZE;
+
+  // Sutherland–Hodgman clip of a convex polygon against one half-plane on
+  // the Y axis. keepBelow=true keeps points with y <= threshold.
+  function clipY(inPoly, threshold, keepBelow) {
+    const out = [];
+    const n = inPoly.length;
+    if (n === 0) return out;
+    for (let i = 0; i < n; i++) {
+      const curr = inPoly[i];
+      const prev = inPoly[(i - 1 + n) % n];
+      const currIn = keepBelow ? curr[1] <= threshold : curr[1] >= threshold;
+      const prevIn = keepBelow ? prev[1] <= threshold : prev[1] >= threshold;
+      if (currIn !== prevIn) {
+        const t = (threshold - prev[1]) / (curr[1] - prev[1]);
+        out.push([
+          prev[0] + (curr[0] - prev[0]) * t,
+          threshold,
+          prev[2] + (curr[2] - prev[2]) * t,
+        ]);
+      }
+      if (currIn) out.push(curr);
+    }
+    return out;
+  }
+
+  const clipped = clipY(clipY(poly, yHi, true), yLo, false);
+  if (clipped.length < 3) return new Float32Array(0);
+
+  // Triangulate as a fan from vertex 0. Output is (n-2) triangles = (n-2)*9
+  // floats. For a quad sliced by 2 horizontal planes, n ≤ 6.
+  const triCount = clipped.length - 2;
+  const out = new Float32Array(triCount * 9);
+  let o = 0;
+  const writeVert = (p) => {
+    out[o++] = p[0] + ox;
+    out[o++] = p[1] + oy;
+    out[o++] = p[2] + oz;
+  };
+  for (let i = 1; i <= triCount; i++) {
+    writeVert(clipped[0]);
+    writeVert(clipped[i]);
+    writeVert(clipped[i + 1]);
+  }
+  return out;
+}
+
+// Parse `terrain_{gx}_{gz}:{meshType}` → { gx, gz } (or null if not terrain).
+// Robust to negative coordinates (e.g. terrain_-3_-32:top).
+function _parseTerrainBuildingKey(buildingKey) {
+  const m = /^terrain_(-?\d+)_(-?\d+):/.exec(buildingKey);
+  return m ? { gx: +m[1], gz: +m[2] } : null;
+}
+
 // ── Per-building merged paint mesh ────────────────────────────────────────────
 //
 // cellGeomCache: cellKey → Float32Array of pre-offset vertex triples.
@@ -955,22 +1256,39 @@ function rebuildBuildingPaint(srcMesh, buildingKey) {
   // of cells are seeded across other buildings.
   const byColor = new Map(); // colorHex → Float32Array[]
 
+  // Terrain cells bypass cellGeomCache: their geometry is trivially derivable
+  // from the terrain mesh's position buffer + a (meshType, ix, iz)-indexed
+  // face lookup maintained on the tile state. Caching 20k × simple quads per
+  // tile would waste ~100 MB at steady state for zero compute gain.
+  const terrainCoords = _parseTerrainBuildingKey(buildingKey);
+  const terrainState  = terrainCoords
+    ? terrainManager.getState(terrainCoords.gx, terrainCoords.gz)
+    : null;
+  if (terrainCoords && !terrainState) return; // tile unloaded between paint and rebuild
+
   for (const k of paintStore.cellsForBuilding(buildingKey)) {
     const v = paintStore.cells.get(k);
     if (!v) continue;
 
-    if (!cellGeomCache.has(k)) {
+    let arr;
+    if (terrainState) {
       const parts = k.slice(prefix.length).split(':');
-      const cu = parseInt(parts[0]), cv = parseInt(parts[1]);
-      const verts = buildCellGeometry(srcMesh, cu, cv, new THREE.Vector3(...v.normal), v.planeD, meshType);
-      cellGeomCache.set(k, new Float32Array(verts));
-      let geomSet = cellGeomByBuilding.get(buildingKey);
-      if (!geomSet) { geomSet = new Set(); cellGeomByBuilding.set(buildingKey, geomSet); }
-      geomSet.add(k);
+      const ix = parseInt(parts[0]), iz = parseInt(parts[1]);
+      const iy = parseInt(parts[2]);
+      arr = buildTerrainCellGeometry(terrainState, meshType, ix, iz, iy);
+    } else {
+      if (!cellGeomCache.has(k)) {
+        const parts = k.slice(prefix.length).split(':');
+        const cu = parseInt(parts[0]), cv = parseInt(parts[1]);
+        const verts = buildCellGeometry(srcMesh, cu, cv, new THREE.Vector3(...v.normal), v.planeD, meshType);
+        cellGeomCache.set(k, new Float32Array(verts));
+        let geomSet = cellGeomByBuilding.get(buildingKey);
+        if (!geomSet) { geomSet = new Set(); cellGeomByBuilding.set(buildingKey, geomSet); }
+        geomSet.add(k);
+      }
+      arr = cellGeomCache.get(k);
     }
-
-    const arr = cellGeomCache.get(k);
-    if (!arr.length) continue;
+    if (!arr || !arr.length) continue;
 
     const c = v.color;
     if (!byColor.has(c)) byColor.set(c, []);
@@ -985,7 +1303,11 @@ function rebuildBuildingPaint(srcMesh, buildingKey) {
 
     const geo = new THREE.BufferGeometry();
     geo.setAttribute('position', new THREE.Float32BufferAttribute(allVerts, 3));
-    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({ color: colorHex, side: THREE.DoubleSide }));
+    // polygonOffset beats any OSM layer's (-1/-6) so paint wins the depth test vs draped OSM at grazing angles (9 mm geometric margin alone isn't enough).
+    const mesh = new THREE.Mesh(geo, new THREE.MeshBasicMaterial({
+      color: colorHex, side: THREE.DoubleSide,
+      polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -24,
+    }));
     mesh.visible = srcMesh.visible;
     const pmKey = `${buildingKey}|${colorHex}`;
     mesh.userData.paintMeshKey = pmKey; // stashed so TileManager._unload can delete by lookup
@@ -1015,12 +1337,18 @@ async function seedTileCells(meshes) {
   const now        = Date.now();
   const tSeed      = performance.now();
 
+  // Tile is "seed-locked" only after every mesh has been processed without
+  // being abandoned mid-way (see abandoned flag below). Resolved lazily from
+  // the first mesh we touch since seedTileCells takes meshes, not a tileId.
+  let tileId    = null;
+  let abandoned = false;
+
   for (let start = 0; start < meshes.length; start += SEED_CHUNK) {
     const end = Math.min(start + SEED_CHUNK, meshes.length);
 
     for (let mi = start; mi < end; mi++) {
       const srcMesh = meshes[mi];
-      if (!srcMesh.parent) continue; // tile was unloaded before we got here
+      if (!srcMesh.parent) { abandoned = true; continue; } // tile unloaded before we got here
 
       const perType = srcMesh.userData.cellDataByType;
       if (!perType) continue; // already applied, or wrapped without worker data
@@ -1032,6 +1360,7 @@ async function seedTileCells(meshes) {
       for (const meshType in perType) {
         const cellData = perType[meshType];
         const bk = `${buildingId}:${meshType}`;
+        if (!tileId) tileId = paintStore.tileIdOfBuilding(bk);
 
         let geomSet = cellGeomByBuilding.get(bk);
         if (!geomSet) { geomSet = new Set(); cellGeomByBuilding.set(bk, geomSet); }
@@ -1055,11 +1384,11 @@ async function seedTileCells(meshes) {
           }
         }
 
-        // Once a tile has any persisted cells, its seed pattern is locked in —
-        // skip fresh rolls from the worker so reloads don't grow the coverage
-        // with a new ~16% every session.
-        const tileId = paintStore.tileIdOfBuilding(bk);
-        const tileLocked = tileId && paintStore.tileHasSavedData(tileId);
+        // Skip seed rolls once the tile is marked complete on disk — the
+        // pattern is locked in and further rolls would grow coverage past
+        // the intended ~10%. Partial tiles (never reached the sentinel) stay
+        // unlocked and get another shot on every reload.
+        const tileLocked = tileId && paintStore.isTileSeedComplete(tileId);
 
         if (!tileLocked) {
           for (const s of seeds) {
@@ -1081,10 +1410,59 @@ async function seedTileCells(meshes) {
       srcMesh.userData.cellDataByType = null;
     }
 
-    if (end < meshes.length) await new Promise(r => requestIdleCallback(r, { timeout: 2000 }));
+    // rAF instead of requestIdleCallback: idle time can starve to zero under
+    // continuous movement, which was the original "bottom third seeded, rest
+    // empty" symptom. rAF fires every frame so seeding makes steady progress.
+    if (end < meshes.length) await new Promise(r => requestAnimationFrame(r));
   }
 
+  // Only mark the tile seed-complete if we made it through every mesh without
+  // abandonment. If any mesh was skipped because its parent was gone, the tile
+  // stays unlocked and the next load gets another shot.
+  if (tileId && !abandoned) paintStore.markTileSeedComplete(tileId);
+
   performance.measure('tile:seed', { start: tSeed, end: performance.now() });
+}
+
+// Seed ~SEED_FRACTION of terrain top-face cells per tile, gated by the same
+// persistent seed-complete sentinel as buildings. Sides are stacked in iy
+// bands we'd need the block's Y range to sample correctly; top faces exist
+// on every block and give uniform coverage, so this is top-only.
+//
+// Runs synchronously — one tile is ~4096 top faces, which is fast enough
+// that the tile can't unload mid-seed (unload only happens on tick()).
+// Caller (onTerrainLoaded) invokes this before its rebuild pass so a single
+// rebuildBuildingPaint call covers server-persisted cells and fresh seeds
+// together.
+function seedTerrainCells(state) {
+  if (!state.faceStarts) return;
+  if (paintStore.isTileSeedComplete(state.tileId)) return;
+
+  const meshType = 'top';
+  const faceIdx  = state.faceStarts[meshType];
+  if (!faceIdx) { paintStore.markTileSeedComplete(state.tileId); return; }
+
+  const bk  = `${state.tileId}:${meshType}`;
+  const res = state.res;
+  const now = Date.now();
+
+  for (let iz = 0; iz < res; iz++) {
+    for (let ix = 0; ix < res; ix++) {
+      if (faceIdx[iz * res + ix] < 0) continue;
+      if (Math.random() >= SEED_FRACTION) continue;
+      const cellKey = `${bk}:${ix}:${iz}:0`;
+      if (paintStore.cells.has(cellKey)) continue; // preserve user paint / prior seed
+      const color = SEED_COLOR_HEX[(Math.random() * SEED_COLOR_HEX.length) | 0];
+      paintStore.seed(cellKey, {
+        color,
+        normal:    [0, 1, 0],
+        planeD:    0,
+        paintedAt: now,
+      });
+    }
+  }
+
+  paintStore.markTileSeedComplete(state.tileId);
 }
 
 // ── Paint / erase actions ─────────────────────────────────────────────────────
@@ -1116,10 +1494,81 @@ function canonicalCellKey(buildingKey, cu, cv, pdKey) {
 
 function hitCell() {
   paintRay.setFromCamera(new THREE.Vector2(0, 0), camera);
-  const hits = paintRay.intersectObjects(nearBuildingMeshes, false);
-  if (!hits.length || hits[0].distance > PAINT_DIST || !hits[0].uv) return null;
+  // Terrain meshes are always raycast targets alongside the building near-set.
+  // Distance filter below handles PAINT_DIST; terrain hits pass through the
+  // terrain branch further down.
+  const hits = paintRay.intersectObjects(
+    [...nearBuildingMeshes, ...terrainManager.meshes()], false,
+  );
+  if (!hits.length || hits[0].distance > PAINT_DIST) return null;
   const hit  = hits[0];
   const mesh = hit.object;
+
+  // Terrain branch — one block face per cell, no UVs, no planeDKey. The tile's
+  // buildingKeys cover all 5 face types; we pick the one matching the hit
+  // normal and index by (ix, iz) within the tile. The cellKey is already
+  // canonical (the tile owns exactly one cell per face per block).
+  if (mesh.name === 'terrain') {
+    const ud = mesh.userData;
+    const b  = ud.bounds;
+    if (!b) return null;
+    const state = terrainManager.getState(ud.terrainGX, ud.terrainGZ);
+    if (!state) return null;
+    // Terrain cells live in grid space; the raycast hit is in world space and
+    // `b` is the cell's grid-space AABB. Rotate the hit point into grid space
+    // and classify the side-face normal against grid-cardinal axes.
+    const step = (b.maxX - b.minX) / state.res;
+    const [hu, hv] = worldToGrid(hit.point.x, hit.point.z);
+
+    const tNormal = hit.face.normal.clone().transformDirection(mesh.matrixWorld).normalize();
+    const [gnx, gnz] = worldToGrid(tNormal.x, tNormal.z);
+    let tMeshType;
+    if      (tNormal.y >  0.5) tMeshType = 'top';
+    else if (gnx < -0.5) tMeshType = 'sideW';
+    else if (gnx >  0.5) tMeshType = 'sideE';
+    else if (gnz < -0.5) tMeshType = 'sideN';
+    else                 tMeshType = 'sideS';
+
+    // Side-face quads sit exactly on cell boundaries in grid space (west at
+    // x = ix·step, east at x = (ix+1)·step, etc.). Flooring the raw hit point
+    // is ambiguous at that boundary — for sideE/sideS it deterministically
+    // lands one cell past the owning block, and for sideW/sideN float ε can
+    // flip either way. Nudge the probe inward (along the inward face normal)
+    // so we always classify into the block that actually owns the face.
+    let probeU = hu, probeV = hv;
+    const nudge = step * 0.5;
+    if      (tMeshType === 'sideW') probeU += nudge;
+    else if (tMeshType === 'sideE') probeU -= nudge;
+    else if (tMeshType === 'sideN') probeV += nudge;
+    else if (tMeshType === 'sideS') probeV -= nudge;
+
+    let ix = Math.floor((probeU - b.minX) / step);
+    let iz = Math.floor((probeV - b.minZ) / step);
+    if (ix < 0) ix = 0; else if (ix >= state.res) ix = state.res - 1;
+    if (iz < 0) iz = 0; else if (iz >= state.res) iz = state.res - 1;
+
+    // Cliff sides split into vertical strips aligned with the Y grid lines
+    // drawn by gridShader, so one paint cell corresponds to one visible grid
+    // square. Top faces stay single-cell (iy = 0) — their grid is already
+    // supplied by (ix, iz) on the horizontal.
+    const iy = tMeshType === 'top'
+      ? 0
+      : Math.floor(hit.point.y / BLOCK_SIZE);
+
+    const tBuildingKey = `${ud.terrainTileId}:${tMeshType}`;
+    const tCellKey = `${tBuildingKey}:${ix}:${iz}:${iy}`;
+    return {
+      cellU: ix, cellV: iz,
+      normal: tNormal,
+      planeD: 0,
+      mesh,
+      cellKey: tCellKey,
+    };
+  }
+
+  // Buildings require UVs — reject if the raycast landed on a degenerate tri
+  // that didn't produce UV coords.
+  if (!hit.uv) return null;
 
   // Prefer the face's averaged normal + planeD when available. The worker's
   // seed cache generates cellKeys from face.planeD; using per-triangle planeD
@@ -1204,8 +1653,9 @@ const _right = new THREE.Vector3();
 
 // Y offsets from the eye at which we sample the capsule. Each sample resolves
 // as a sphere of PLAYER_RADIUS against nearby triangles — together they span
-// eye → near-feet so short ledges and low overhangs are caught.
-const CAPSULE_SAMPLE_OFFSETS = [0, -0.9, -1.8, -(WALK_HEIGHT - 0.15)];
+// eye → near-feet so short ledges and low overhangs are caught. Expressed as
+// fractions of WALK_HEIGHT so they track player scale automatically.
+const CAPSULE_SAMPLE_OFFSETS = [0, -0.3 * WALK_HEIGHT, -0.6 * WALK_HEIGHT, -(WALK_HEIGHT - 0.15)];
 
 // Reusable temps for resolveCapsule.
 const _capA = new THREE.Vector3();
@@ -1233,7 +1683,14 @@ function resolveCapsule(pos) {
     const capMinY = pos.y + lastOff - r;
     const capMaxY = pos.y + r;
 
-    for (const mesh of nearBuildingMeshes) {
+    // Buildings and terrain both get pushed out of the capsule the same
+    // way — including terrain meshes here is how cliffs block at
+    // PLAYER_RADIUS and slide on diagonals without any special-case code.
+    // nearCollidables is [ground, ...buildings, ...terrainMeshes]; ground's
+    // PlaneGeometry has no computed bounding box so it no-ops on the bb
+    // check below. Horizontal terrain tops pass the 30°-from-horizontal
+    // filter and are skipped, so only vertical cliff sides contribute.
+    for (const mesh of nearCollidables) {
       const bb = mesh.geometry.boundingBox;
       if (!bb) continue;
       if (capMaxX < bb.min.x || capMinX > bb.max.x) continue;
@@ -1404,20 +1861,47 @@ function updateMovement() {
       downRay.set(footOrigin, DOWN);
       downRay.far = drop + 0.1;
       const hits = downRay.intersectObjects(nearCollidables, false);
-      if (hits.length === 0 || hits[0].distance > drop) camera.position.y += dy;
-      else _flyVel.y = 0;
+      const rayBlocked = hits.length > 0 && hits[0].distance <= drop;
+      // Heightmap gate for stepped terrain: raycast misses when the foot
+      // origin is already inside a block (backface-culled from below), so we
+      // also consult the DEM directly. Either source is enough to block.
+      const terrainY = terrainManager.sample(camera.position.x, camera.position.z);
+      const terrainBlocks = terrainY !== null &&
+        camera.position.y + dy - WALK_HEIGHT < terrainY;
+      if (rayBlocked || terrainBlocks) _flyVel.y = 0;
+      else camera.position.y += dy;
+    }
+    // Buried-below-terrain rescue. Cliff blocking/sliding is handled by
+    // resolveCapsule (terrain meshes are iterated alongside buildings), so
+    // the only case left is the player's feet ending up below the terrain
+    // heightmap — typically from a save/teleport that landed inside a
+    // block, or numerical drift where the downward ray missed the top face.
+    // Snap Y up to the surface so gravity finds it next frame.
+    const terrainYRescue = terrainManager.sample(camera.position.x, camera.position.z);
+    if (terrainYRescue !== null && camera.position.y - WALK_HEIGHT < terrainYRescue) {
+      camera.position.y = terrainYRescue + WALK_HEIGHT;
+      _flyVel.y = 0;
     }
     camera.position.y = Math.max(MIN_EYE_Y, camera.position.y);
   } else {
-    // Rescue: if the player is saved-loaded or spawned below the terrain
-    // (e.g. old save from before terrain existed, or a teleport beat terrain
-    // streaming), the downward surfaceBelow ray starts inside the mesh and
-    // misses. Snap up so gravity finds the surface on the next frame.
+    // Buried-below-terrain rescue — cliff blocking/sliding is handled by
+    // resolveCapsule since terrain meshes are now iterated alongside
+    // buildings. The remaining case is feet below the heightmap from a
+    // save/teleport or a surfaceBelow ray that missed because its origin
+    // was inside the block. Snap Y up so gravity re-grounds next frame.
     const terrainY = terrainManager.sample(camera.position.x, camera.position.z);
-    if (terrainY !== null && camera.position.y - WALK_HEIGHT < terrainY - 0.5) {
+    if (terrainY !== null && camera.position.y - WALK_HEIGHT < terrainY) {
       camera.position.y = terrainY + WALK_HEIGHT;
       velY = 0;
     }
+
+    // Jump — edge-triggered via jumpRequested, which the Space keydown
+    // handler sets only on a first tap (not the second tap of a double-tap
+    // fly toggle). The landing branch below zeros velY on every touchdown,
+    // so velY === 0 is the grounded test. Consume the flag unconditionally
+    // so a mid-air tap doesn't get banked for the next landing.
+    if (jumpRequested && velY === 0) velY = JUMP_VEL;
+    jumpRequested = false;
 
     // Gravity
     velY = Math.max(velY - GRAVITY * dt, TERMINAL_VEL);
@@ -1438,8 +1922,11 @@ function updateMovement() {
           velY = 0;
         }
       }
+    } else if (dY > 0) {
+      // Ascending from a jump. Ceilings don't block — matches fly mode's
+      // upward-is-free rule so players can't get trapped under overhangs.
+      camera.position.y += dY;
     }
-    // (No upward velocity in walk mode — no jump yet)
   }
 
   // ── HUD ─────────────────────────────────────────────────────────────────────
@@ -1466,6 +1953,18 @@ function positionIsClear(x, z) {
   return true;
 }
 
+// True if (x, z) sits directly under any building polygon — a downward ray
+// from well above Manhattan's tallest skyscraper hits a building mesh. Catches
+// the big-interior case that positionIsClear misses (its 1.6 m ring rays can
+// run clean through an empty atrium without ever touching a wall).
+const _skyOrigin = new THREE.Vector3();
+function positionIsUnderBuilding(x, z) {
+  _skyOrigin.set(x, 2000, z);
+  snapRay.set(_skyOrigin, DOWN);
+  snapRay.far = 2100;
+  return snapRay.intersectObjects(nearBuildingMeshes, false).length > 0;
+}
+
 // After buildings load, make sure the camera isn't spawned inside one.
 // Tries expanding rings of candidate positions until a clear spot is found.
 // When the position is already clear, the saved Y is left alone so rooftop
@@ -1489,6 +1988,28 @@ function snapToSafeStart() {
   }
 }
 
+// Teleport-specific: shift horizontally if the landing spot is under a
+// building polygon. Kept separate from snapToSafeStart so rooftop *saves*
+// (initial page load) aren't ejected — teleport always lands at terrain
+// level, so "under building" there means "inside the building".
+function snapOutOfBuildingFootprint() {
+  const cx = camera.position.x, cz = camera.position.z;
+  if (!positionIsUnderBuilding(cx, cz)) return;
+
+  for (let r = 5; r <= 120; r += 5) {
+    const steps = Math.max(8, Math.round(r * 1.2));
+    for (let i = 0; i < steps; i++) {
+      const angle = (i / steps) * Math.PI * 2;
+      const x = cx + Math.cos(angle) * r;
+      const z = cz + Math.sin(angle) * r;
+      if (!positionIsUnderBuilding(x, z)) {
+        placeOnGround(x, z);
+        return;
+      }
+    }
+  }
+}
+
 function placeOnGround(x, z) {
   const terrainY = terrainManager.sample(x, z);
   const y = terrainY !== null ? terrainY + WALK_HEIGHT : MIN_EYE_Y;
@@ -1500,10 +2021,7 @@ function placeOnGround(x, z) {
 
 let firstTileLoaded = false;
 let tilesLoadedCount = 0;
-// ?buildings=doitt is the only single-tile override (?=lod2 now loads a real
-// tile manifest from /tiles_lod2/). Drop the 4-tile gate to 1 in that case so
-// the loading overlay clears on the single tile.
-const TILES_NEEDED = new URLSearchParams(location.search).get('buildings') === 'doitt' ? 1 : 4;
+const TILES_NEEDED = 4;
 
 // Teleport loading state — the random-location button re-enters the same
 // "Loading tiles…" overlay as the initial page load, cleared when every
@@ -1516,6 +2034,7 @@ function finishTeleportLoad() {
   overlay.classList.remove('loading');
   overlayPrompt.textContent = 'Click to explore';
   randomBtn.disabled = false;
+  snapOutOfBuildingFootprint();
   snapToSafeStart();
 }
 
@@ -1561,8 +2080,8 @@ const tileManager = new TileManager({
 tileManager.init('/tiles/manifest.json');
 
 // OSM overlay — streets, water, and green spaces rendered as flat meshes on
-// the ground. OSM radius tracks TileManager's adaptive radius so the overlay
-// widens alongside buildings in sparse areas.
+// the ground. OSM and terrain share a fixed load radius independent of the
+// adaptive building radius.
 // Terrain-on: DEM heightfields stream in, OSM textures composite in the
 // terrain shader.
 // Terrain-off (VITE_TERRAIN=0, e.g. `npm run dev:flat`): no DEM loading,
@@ -1574,26 +2093,81 @@ tileManager.init('/tiles/manifest.json');
 const terrainManager = TERRAIN_ENABLED
   ? new TerrainManager({
       scene,
-      getLoadRadius: () => tileManager.getLoadRadius(),
-      osmLookup:     (x, z) => osmManager.getLoadedTileAt(x, z),
+      // Paint plumbing — lets terrain tiles register their 5 face-type
+      // buildingKeys in the shared paint caches. Same maps the building
+      // pipeline uses; rebuildBuildingPaint picks the terrain path when
+      // the buildingKey starts with "terrain_".
+      buildingMeshMap,
+      buildingPaintMeshes,
+      buildingPaintMeshByBuilding,
+      paintGroup,
+      // Fires once per terrain-tile load after the server paint fetch
+      // resolves. Rebuilds paint overlays for any face-type that has cells
+      // so persisted graffiti appears as soon as you re-enter the tile.
+      // Also nudges OsmManager to re-drape any OSM overlay meshes whose
+      // vertices fall inside this terrain cell — they would have been
+      // pinned at y=offset if they loaded before the covering terrain
+      // cell did.
+      onTerrainLoaded(state) {
+        seedTerrainCells(state);
+        for (const bk of state.buildingKeys) {
+          const cells = paintStore.cellsForBuilding(bk);
+          if (cells && cells.size > 0) rebuildBuildingPaint(state.mesh, bk);
+        }
+        // state.bounds is GRID space (rotated ~29° from world); OSM tile
+        // bounds are world space. Convert the 4 grid corners to world XZ
+        // and take their AABB so OsmManager's axis-aligned overlap check
+        // against world-space tile bounds is coherent — otherwise the
+        // redrape misses OSM tiles whose world-space footprint intersects
+        // this terrain cell but whose world-coords happen to fall outside
+        // the grid-space interval, leaving their drape pinned at yOffset
+        // (buried in terrain, invisible). Bug was latent when drape
+        // geometry extended far past tile bounds; post-bake-clip the
+        // drape is tight to the tile and the misses become visible holes.
+        osmManager.redrapeOverBounds(_gridBoundsToWorldAABB(state.bounds));
+      },
+      onTerrainUnloaded() {
+        updateCulling();
+      },
     })
   : {
       tick() {},
       sample() { return null; },
+      sampleAsync() { return Promise.resolve(null); },
       meshes() { return []; },
-      applyOsmTile() {},
-      removeOsmTile() {},
+      getState() { return null; },
+      setRadiusScale() {},
     };
 
+// In terrain mode, OSM features render as draped vector geometry: streets as
+// miter-joined ribbons, water/green as triangulated polygons, every triangle
+// tessellated to the terrain block grid and planted on per-vertex terrain
+// samples. The terrain material is LAND-coloured so uncovered stretches
+// already read as land — no land mesh needed. Street labels drape via
+// terrain.sample() so they sit on the street surface.
 const osmManager = new OsmManager({
   scene,
-  getLoadRadius: () => tileManager.getLoadRadius(),
-  terrain:       TERRAIN_ENABLED ? terrainManager : null, // labels still drape
-  flatMode:      !TERRAIN_ENABLED,                        // render own flat planes with texture
-  onTileReady:   (tile) => terrainManager.applyOsmTile(tile),
-  onTileUnready: (tile) => terrainManager.removeOsmTile(tile),
+  terrain:    TERRAIN_ENABLED ? terrainManager : null,
+  flatMode:   !TERRAIN_ENABLED,
+  showLabels: true,
 });
 osmManager.init('/osm/manifest.json');
+
+// Render-distance slider — scales building/OSM/terrain load radii together.
+// Building radius is adaptive (budget-driven) so the scale is applied to both
+// its MIN/MAX and its cell budget; OSM/terrain scale linearly off a fixed base.
+{
+  const slider = document.getElementById('render-distance-slider');
+  const label  = document.getElementById('render-distance-val');
+  const apply = (v) => {
+    tileManager.setRadiusScale(v);
+    osmManager.setRadiusScale(v);
+    terrainManager.setRadiusScale(v);
+    label.textContent = v.toFixed(2) + '×';
+  };
+  slider.addEventListener('input', () => apply(parseFloat(slider.value)));
+  apply(parseFloat(slider.value));
+}
 
 // ─── Render loop ──────────────────────────────────────────────────────────────
 
@@ -1609,6 +2183,29 @@ const _minimapDir = new THREE.Vector3();
 const FRAME_INTERVAL = 1000 / 60 - 0.5;
 let _lastFrameTime = 0;
 
+// Loading indicator — shows one row per data source whose fetch pipeline is
+// currently busy. Each row has a short minimum-on time so a tile that finishes
+// in a single frame still registers visually instead of flickering.
+const _loadingRows = [
+  { el: document.getElementById('loading-buildings'), mgr: tileManager,    showUntil: 0 },
+  { el: document.getElementById('loading-osm'),       mgr: osmManager,     showUntil: 0 },
+  { el: document.getElementById('loading-terrain'),   mgr: terrainManager, showUntil: 0 },
+];
+const LOADING_MIN_VISIBLE_MS = 250;
+function updateLoadingIndicator(now) {
+  // Startup overlay already says "Loading data..." — suppress the bottom-left
+  // rows until the overlay is dismissed so we don't say the same thing twice.
+  const overlayVisible = !overlay.classList.contains('hidden');
+  for (const row of _loadingRows) {
+    const busy = row.mgr._activeLoads > 0 || row.mgr._loadQueue.length > 0;
+    if (busy) row.showUntil = now + LOADING_MIN_VISIBLE_MS;
+    const shouldShow = !overlayVisible && now < row.showUntil;
+    const isHidden   = row.el.classList.contains('hidden');
+    if (shouldShow && isHidden)        row.el.classList.remove('hidden');
+    else if (!shouldShow && !isHidden) row.el.classList.add('hidden');
+  }
+}
+
 function animate(now) {
   requestAnimationFrame(animate);
   if (now - _lastFrameTime < FRAME_INTERVAL) return;
@@ -1618,6 +2215,7 @@ function animate(now) {
   tileManager.tick(camera.position.x, camera.position.z);
   osmManager.tick(camera.position.x, camera.position.z);
   terrainManager.tick(camera.position.x, camera.position.z);
+  updateViewFalloff(cullRadius());
   maybeCull();
   updateMovement();
   ground.position.x = camera.position.x;
@@ -1625,6 +2223,7 @@ function animate(now) {
   camera.getWorldDirection(_minimapDir);
   updateMinimap(camera.position.x, camera.position.z, Math.atan2(_minimapDir.x, -_minimapDir.z));
   updateDebugHud();
+  updateLoadingIndicator(now);
   renderer.render(scene, camera);
 }
 

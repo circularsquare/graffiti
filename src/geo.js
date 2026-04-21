@@ -22,3 +22,27 @@ export function localToLngLat(x, z) {
   const lat = REF_LAT - z / METERS_PER_LAT;
   return [lng, lat];
 }
+
+// ── Manhattan-grid rotation (terrain only) ───────────────────────────────────
+// Manhattan's avenues run ~29° east of true north. The TERRAIN grid is rotated
+// by this angle so its blocky step walls align with the dominant street
+// direction north of Canal. Buildings, OSM, world XZ, and the minimap are all
+// untouched — only terrain cell indexing and mesh emission live in grid space.
+//
+// If the visible alignment is wrong after the first bake (e.g. blocks run
+// perpendicular to avenues instead of along them), flip the sign of this
+// constant — DO NOT change the transform math. Must stay in sync with
+// scripts/bake_terrain.py::MANHATTAN_GRID_DEG.
+export const MANHATTAN_GRID_DEG = 29.0;
+const _GRID_A   = MANHATTAN_GRID_DEG * Math.PI / 180;
+const _GRID_COS = Math.cos(_GRID_A);
+const _GRID_SIN = Math.sin(_GRID_A);
+
+/** World XZ (buildings, OSM, player) → terrain grid UV. */
+export function worldToGrid(x, z) {
+  return [ x * _GRID_COS + z * _GRID_SIN, -x * _GRID_SIN + z * _GRID_COS ];
+}
+/** Terrain grid UV → world XZ. Inverse of worldToGrid. */
+export function gridToWorld(u, v) {
+  return [ u * _GRID_COS - v * _GRID_SIN,  u * _GRID_SIN + v * _GRID_COS ];
+}

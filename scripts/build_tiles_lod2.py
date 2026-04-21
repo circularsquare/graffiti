@@ -32,10 +32,10 @@ try:
 except AttributeError:
     pass
 
-# Match build_tiles.py — runtime expects 125 m cells and computes cellEstimate
+# Match build_tiles.py — runtime expects 100 m cells and computes cellEstimate
 # from surface area / paint-cell-size².
-GRID_SIZE       = 125
-PAINT_CELL_SIZE = 2.0
+GRID_SIZE       = 100
+PAINT_CELL_SIZE = 1.0
 
 DEFAULT_INPUT  = 'data/tum_lod2/NYC_Buildings_LoD2_CityGML.gml'
 DEFAULT_OUTPUT = 'public/tiles_lod2'
@@ -198,19 +198,18 @@ def main():
             json.dump(entry['buildings'], f, separators=(',', ':'))
         total_size_kb += os.path.getsize(out_path) / 1024
         manifest.append({
-            'id':            tile_id,
-            'file':          f'/tiles_lod2/{tile_id}.json',
+            'gx': gx,
+            'gz': gz,
             'bounds': {
                 'minX': entry['min_x'], 'maxX': entry['max_x'],
                 'minZ': entry['min_z'], 'maxZ': entry['max_z'],
             },
-            'buildingCount': len(entry['buildings']),
             'cellEstimate':  int(round(entry['area'] / (PAINT_CELL_SIZE ** 2))),
         })
         entry['buildings'] = None  # free as we go
 
     with open(os.path.join(args.out, 'manifest.json'), 'w') as f:
-        json.dump(manifest, f, indent=2)
+        json.dump(manifest, f, separators=(',', ':'))
 
     print(f'  Tiles written: {len(manifest):,}', flush=True)
     print(f'  Total size:    {total_size_kb / 1024:.1f} MB', flush=True)

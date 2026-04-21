@@ -43,7 +43,7 @@
 //     seeds:     Array<{ idx, color, normal: [x,y,z], planeD }>,
 //     cellGroups: Array<Array<cellKey>>  // paint-groups of size >= 2; singletons implicit }
 
-const GRID_SIZE    = 2.0;
+const GRID_SIZE    = 1.0;
 const OFFSET       = 0.025; // 2.5 cm outward offset along face normal (keep in sync with main.js)
 const COPLANAR_TOL = 0.15;  // 15 cm — rejects stepped/ledged faces from matching a cell
 // Face-equivalence thresholds. Two values per axis (normal + distance), used
@@ -73,7 +73,61 @@ const FACE_NDOT_LOOSE = 0.99;   // ~8°
 const FACE_DIST_TIGHT = 0.15;   // 15 cm
 const FACE_DIST_LOOSE = 0.30;   // 30 cm
 
-self.onmessage = async (e) => {
+// Binary tile format. See scripts/build_tiles.py for the encoder + format spec.
+// Coords inside the file are tile-local for X/Z and absolute for Y; the
+// runtime positions the tile's THREE.Group at the cell origin so Three.js
+// re-applies the world transform.
+const TILE_MAGIC   = 0x49544647; // 'GFTI' little-endian
+const TILE_VERSION = 1;
+const _idDecoder   = new TextDecoder();
+
+function decodeTile(arrayBuffer) {
+  if (arrayBuffer.byteLength < 8) throw new Error('NOT_READY');
+  const dv = new DataView(arrayBuffer);
+  if (dv.getUint32(0, true) !== TILE_MAGIC) throw new Error('NOT_READY');
+  const version = dv.getUint8(4);
+  if (version !== TILE_VERSION) throw new Error(`tile version ${version} unsupported`);
+  const buildingCount = dv.getUint16(6, true);
+
+  // Pass 1: read per-building metadata, accumulate id strings + tri counts.
+  let off = 8;
+  const meta = new Array(buildingCount);
+  let totalFloats = 0;
+  for (let i = 0; i < buildingCount; i++) {
+    const roofTris = dv.getUint16(off, true); off += 2;
+    const wallTris = dv.getUint16(off, true); off += 2;
+    const idLen    = dv.getUint8(off);        off += 1;
+    const id       = _idDecoder.decode(new Uint8Array(arrayBuffer, off, idLen));
+    off += idLen;
+    const roofFloats = roofTris * 9;
+    const wallFloats = wallTris * 9;
+    meta[i] = { id, roofFloats, wallFloats };
+    totalFloats += roofFloats + wallFloats;
+  }
+
+  // Skip alignment padding so the float blob starts on a 4-byte boundary.
+  off = (off + 3) & ~3;
+
+  // Pass 2: view the whole vertex blob as one Float32Array, slice per building.
+  const allFloats = new Float32Array(arrayBuffer, off, totalFloats);
+  let foff = 0;
+  const buildings = new Array(buildingCount);
+  for (let i = 0; i < buildingCount; i++) {
+    const m = meta[i];
+    const roof  = allFloats.subarray(foff, foff + m.roofFloats); foff += m.roofFloats;
+    const walls = allFloats.subarray(foff, foff + m.wallFloats); foff += m.wallFloats;
+    buildings[i] = { id: m.id, roof, walls };
+  }
+  return buildings;
+}
+
+// Guarded so this module can be imported from Node (scripts/bake_seeds.js)
+// without triggering the worker handler — Node has no `self`.
+if (typeof self !== 'undefined' && typeof self.postMessage === 'function') {
+  self.onmessage = onLoadMessage;
+}
+
+async function onLoadMessage(e) {
   const msg = e.data;
   if (!msg || msg.type !== 'load') return;
 
@@ -84,12 +138,11 @@ self.onmessage = async (e) => {
     if (!res.ok) throw new Error(res.status === 404 ? 'NOT_READY' : `HTTP ${res.status}`);
     // Dev servers (Vite) fall back to serving index.html for missing static
     // files, so a 200 with HTML body means the tile hasn't been built yet.
-    // Detect via content-type before JSON.parse so we can report it cleanly
-    // instead of a spammy "Unexpected token '<'" error.
-    const ct = res.headers.get('content-type') || '';
-    if (!ct.includes('json')) throw new Error('NOT_READY');
+    // The binary tile format starts with a magic number; the decoder checks
+    // it and throws NOT_READY on mismatch (covers HTML fallback responses).
     const t1 = performance.now();
-    const buildings = await res.json();
+    const buf = await res.arrayBuffer();
+    const buildings = decodeTile(buf);
     const t2 = performance.now();
 
     // Phase 1 — mesh build. Roof + wall get merged into ONE meshData per
@@ -170,7 +223,10 @@ self.onmessage = async (e) => {
   } catch (err) {
     self.postMessage({ type: 'error', tileId, error: err.message });
   }
-};
+}
+
+// Exports for scripts/bake_seeds.js — reuses the same scan pipeline off-browser.
+export { decodeTile, buildMeshDataFromBuilding, scanCells };
 
 // ── Mesh construction ─────────────────────────────────────────────────────────
 
@@ -1076,7 +1132,7 @@ function dedupOverlappingCells(discovered) {
 
 const SLIVER_AREA           = GRID_SIZE * GRID_SIZE * 0.5;  // 2.0 m² — half a normal cell. Catches narrow-but-tall cylinder facet cells (not just edge slivers).
 const MAX_GROUP_LEN         = GRID_SIZE + 0.2;              // 2.2 m
-const CROSS_FACE_NARROW_MAX = 0.1;                          // sliver's short-dim cap for cross-face merges (m)
+const CROSS_FACE_NARROW_MAX = 0.05;                         // sliver's short-dim cap for cross-face merges (m)
 const GROUP_NDOT_MIN        = Math.cos(20 * Math.PI / 180); // ≈ 0.9397 — 20° cap
 const LONGEST_EDGE_TOL      = 0.9;                          // shared-edge tolerance
 
@@ -1389,7 +1445,13 @@ function computeLineCoords(verts, faceIds) {
   // tight and produced phantom borders. Building-scale features are never
   // closer than a centimetre, so 1 cm is safe.
   const ROUND    = 100;
-  const BIG      = 1e6;
+  // Sentinel for "this component should never win min()". Must be > halfWidth
+  // (0.03 m in the shader) so interior fragments stay outside the smoothstep
+  // band. A huge value (1e6) blows up fwidth(_lineDist) on distant triangles
+  // and tints the whole face; ~typical hb (perpendicular height to a diagonal)
+  // minimises the interpolation gradient and keeps fwidth bounded across
+  // realistic face sizes.
+  const BIG      = 2.0;
 
   const edgeMap  = new Map();   // edgeKey → faceIds[]
   const edgeKeys = new Array(triCount * 3);
