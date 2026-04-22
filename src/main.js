@@ -334,7 +334,7 @@ function applyMinimapLayout() {
   const btn    = document.getElementById('minimap-random');
   const slider = document.getElementById('render-distance');
   const hint   = document.getElementById('minimap-teleport-hint');
-  const hintTop = 28 + px + 4;
+  const hintTop = 28 + px + 12;
   const btnTop  = hintTop + 22;
   if (hint)   hint.style.top   = hintTop + 'px';
   if (btn)    btn.style.top    = btnTop + 'px';

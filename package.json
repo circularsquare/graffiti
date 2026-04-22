@@ -6,6 +6,7 @@
     "dev":      "vite",
     "dev:flat": "vite --mode flat",
     "build":    "vite build",
+    "deploy":   "vite build && rm -rf dist/tiles dist/osm dist/terrain dist/trees dist/trees.json && wrangler pages deploy dist --project-name graffiti --commit-dirty=true",
     "build-tiles": "python scripts/build_tiles.py",
     "build-osm":   "python scripts/fetch_osm_features.py",
     "bake-seeds":  "node scripts/bake_seeds.js"
