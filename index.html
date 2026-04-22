@@ -23,11 +23,63 @@
       background: rgba(0,0,0,0.4);
       cursor: pointer;
     }
-    #overlay small { font-size: 13px; opacity: 0.6; }
     #overlay.hidden { display: none; }
     #overlay.loading { cursor: default; }
     #overlay.loading #overlay-prompt { opacity: 0.35; }
+    #overlay.loading #overlay-controls { display: none; }
     #overlay.startup { background: rgba(0,0,0,1); }
+
+    #overlay-main {
+      display: flex;
+      flex-direction: column;
+      align-items: center;
+      gap: 12px;
+    }
+    .overlay-title { font-size: 24px; letter-spacing: 0.04em; }
+    #overlay-prompt { font-size: 16px; opacity: 0.85; }
+
+    #overlay-controls {
+      position: absolute;
+      bottom: 24px;
+      left: 24px;
+      display: flex;
+      gap: 36px;
+      font-family: monospace;
+      font-size: 12px;
+      color: rgba(255,255,255,0.85);
+      text-align: left;
+      pointer-events: none;
+    }
+    #overlay-controls .ctrl-col {
+      display: flex;
+      flex-direction: column;
+      gap: 5px;
+    }
+    #overlay-controls .ctrl-heading {
+      font-size: 10px;
+      letter-spacing: 0.15em;
+      text-transform: uppercase;
+      color: rgba(255,255,255,0.5);
+      margin-bottom: 4px;
+    }
+    #overlay-controls .ctrl-heading-gap { margin-top: 14px; }
+    #overlay-controls .ctrl-row {
+      display: flex;
+      align-items: center;
+      gap: 8px;
+    }
+    #overlay-controls .ctrl-key {
+      display: inline-block;
+      min-width: 58px;
+      padding: 2px 6px;
+      font-family: monospace;
+      font-size: 10px;
+      color: rgba(255,255,255,0.9);
+      background: rgba(255,255,255,0.1);
+      border: 1px solid rgba(255,255,255,0.25);
+      border-radius: 3px;
+      text-align: center;
+    }
 
     #minimap-wrap {
       position: fixed;
@@ -40,6 +92,7 @@
     }
     #minimap-wrap.big { pointer-events: auto; cursor: grab; }
     #minimap-wrap.big.dragging { cursor: grabbing; }
+    #minimap-wrap.escaped:not(.big) { pointer-events: auto; cursor: pointer; }
     #minimap-wrap canvas { display: block; }
     #minimap-teleport-hint {
       display: none;
@@ -102,6 +155,20 @@
     #render-distance-label { display: flex; justify-content: space-between; }
     #render-distance input { width: 100%; cursor: pointer; accent-color: #fff; }
 
+    #esc-hint {
+      position: fixed;
+      top: 16px; left: 50%;
+      transform: translateX(-50%);
+      font-family: monospace;
+      font-size: 12px;
+      letter-spacing: 0.08em;
+      color: rgba(255,255,255,0.85);
+      -webkit-text-stroke: 2px rgba(0,0,0,0.9);
+      paint-order: stroke fill;
+      pointer-events: none;
+      z-index: 10;
+    }
+
     #crosshair {
       position: fixed;
       top: 50%; left: 50%;
@@ -118,30 +185,34 @@
       position: fixed;
       bottom: 16px;
       left: 16px;
-      color: rgba(0,0,0,0.85);
+      color: #fff;
       font-family: monospace;
-      font-size: 15px;
+      font-size: 13px;
       pointer-events: none;
       z-index: 10;
       display: flex;
       flex-direction: column;
       gap: 4px;
-      text-shadow: 0 1px 2px rgba(255,255,255,0.6);
+      text-shadow:
+        -1px -1px 0 rgba(0,0,0,0.9),
+         1px -1px 0 rgba(0,0,0,0.9),
+        -1px  1px 0 rgba(0,0,0,0.9),
+         1px  1px 0 rgba(0,0,0,0.9);
     }
     #loading-indicator > div { display: flex; align-items: center; gap: 8px; }
     #loading-indicator > div.hidden { display: none; }
     #loading-indicator > div::before {
       content: '';
-      width: 9px; height: 9px;
+      width: 10px; height: 10px;
       border-radius: 50%;
-      background: #ffd24d;
-      box-shadow: 0 0 3px rgba(0,0,0,0.5);
+      background: #ff4b3b;
+      box-shadow: 0 0 4px rgba(0,0,0,0.7);
       flex-shrink: 0;
       animation: loading-pulse 1s ease-in-out infinite;
     }
     @keyframes loading-pulse {
       0%, 100% { opacity: 1; }
-      50%      { opacity: 0.25; }
+      50%      { opacity: 0.65; }
     }
 
     #colorbar {
@@ -180,11 +251,37 @@
 </head>
 <body>
   <div id="overlay" class="loading startup">
-    <div>Graffiti NYC</div>
-    <div id="overlay-prompt">Loading data...</div>
-    <small>WASD · mouse look · Q to sprint · M to open map · ESC to exit</small>
-    <small>Tab to cycle colors · C to pick color · I to eyedrop</small>
+    <div id="overlay-main">
+      <div class="overlay-title">Graffiti NYC</div>
+      <div id="overlay-prompt">Loading data...</div>
+    </div>
+    <div id="overlay-controls">
+      <div class="ctrl-col">
+        <div class="ctrl-heading">Move</div>
+        <div class="ctrl-row"><span class="ctrl-key">WASD</span><span>walk / fly</span></div>
+        <div class="ctrl-row"><span class="ctrl-key">mouse</span><span>look</span></div>
+        <div class="ctrl-row"><span class="ctrl-key">Q</span><span>sprint</span></div>
+        <div class="ctrl-row"><span class="ctrl-key">space</span><span>jump / up</span></div>
+        <div class="ctrl-row"><span class="ctrl-key">space &times;2</span><span>toggle fly</span></div>
+      </div>
+      <div class="ctrl-col">
+        <div class="ctrl-heading">Paint</div>
+        <div class="ctrl-row"><span class="ctrl-key">click</span><span>paint</span></div>
+        <div class="ctrl-row"><span class="ctrl-key">right-click</span><span>erase</span></div>
+        <div class="ctrl-row"><span class="ctrl-key">tab</span><span>cycle color</span></div>
+        <div class="ctrl-row"><span class="ctrl-key">C</span><span>color picker</span></div>
+        <div class="ctrl-row"><span class="ctrl-key">I</span><span>eyedrop</span></div>
+        <div class="ctrl-row"><span class="ctrl-key">ctrl+Z</span><span>undo</span></div>
+      </div>
+      <div class="ctrl-col">
+        <div class="ctrl-row"><span class="ctrl-key">ESC</span><span>pause</span></div>
+        <div class="ctrl-heading ctrl-heading-gap">Map</div>
+        <div class="ctrl-row"><span class="ctrl-key">M</span><span>toggle map</span></div>
+        <div class="ctrl-row"><span class="ctrl-key">click map</span><span>fast travel</span></div>
+      </div>
+    </div>
   </div>
+  <div id="esc-hint">ESC to escape</div>
   <div id="crosshair"></div>
   <div id="colorbar"></div>
 <div id="loading-indicator">

@@ -21,7 +21,8 @@
       "WebFetch(domain:www.nature.com)",
       "WebFetch(domain:figshare.com)",
       "WebFetch(domain:api.figshare.com)",
-      "Read(//c/Users/anita/Downloads/**)"
+      "Read(//c/Users/anita/Downloads/**)",
+      "Bash(xargs wc *)"
     ],
     "additionalDirectories": [
       "C:\\Users\\anita\\.claude"

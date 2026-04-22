@@ -1,5 +1,10 @@
 meoww!
 
+deploy (anita.garden):
+  - code change (JS/HTML/CSS):   npm run deploy
+  - new/updated tiles (public/): rclone copy public/ r2:graffiti-static --progress --transfers 16 --checkers 32
+  - worker change (worker/):     cd worker && npx wrangler deploy
+
 - add bridges...
   - statue of liberty
   - trains??
@@ -11,8 +16,17 @@ meoww!
 
 - just have all tiles render on both sides?  or side facing player?
 - undo button
+- make undo undo more
 
+- accounts / id tracking 
+- mobile controls 
+- favicon, link pictures, title
+- have controls always visible 
+- online count 
+- periodic refresh to load other peoples updates?
+- colors different on apple?
 
+- glitch through walls if flying fast
 
 
 
