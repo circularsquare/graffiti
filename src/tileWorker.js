@@ -893,12 +893,22 @@ function computeFlatNormals(verts) {
 // same discovery pass also rolls the random seed dice for each cell so the
 // main thread doesn't have to iterate cells again.
 //
-// Cell identity (face normal + planeD) comes from the triangle's face, not
-// the triangle itself, so all triangles in a face contribute to the same
-// cells without the per-triangle normal noise the CityGML source can have.
-// planeDKey = Math.round(facePlaneD * 2) → 50 cm buckets; parallel faces
-// < 50 cm apart on the same building share a key (rare in FiDi). Must match
-// canonicalCellKey() in main.js.
+// Cell identity (face normal + planeD + face centroid) comes from the
+// triangle's face, not the triangle itself, so all triangles in a face
+// contribute to the same cells without the per-triangle normal noise the
+// CityGML source can have.
+//
+// planeDKey = Math.round(facePlaneD * 2) → 50 cm buckets. Without the
+// centroidKey below, two parallel faces on the same building < 50 cm apart
+// perpendicular to their normal would share a cellKey, even if laterally
+// separated by tens of metres — planeD is a scalar that only measures
+// perpendicular offset from the origin. centroidKey adds the face's world-
+// space centroid (cm precision) so laterally-distinct faces get distinct keys.
+// Must match cellKeyFor() / canonicalCellKey() in main.js.
+
+function centroidKey(c) {
+  return `${Math.round(c[0] * 100)}_${Math.round(c[1] * 100)}_${Math.round(c[2] * 100)}`;
+}
 
 function scanCells(pos, uv, buildingId, meshType, seedConfig, faces, triFace, horizU) {
   const triCount = (pos.length / 9) | 0;
@@ -919,6 +929,7 @@ function scanCells(pos, uv, buildingId, meshType, seedConfig, faces, triFace, ho
     ];
 
     const pdKey = Math.round(facePlaneD * 2);
+    const ck    = centroidKey(face.centroid);
     const u0 = tri[0].uv[0], u1 = tri[1].uv[0], u2 = tri[2].uv[0];
     const v0 = tri[0].uv[1], v1 = tri[1].uv[1], v2 = tri[2].uv[1];
     const uMin = Math.floor(Math.min(u0, u1, u2));
@@ -928,7 +939,7 @@ function scanCells(pos, uv, buildingId, meshType, seedConfig, faces, triFace, ho
 
     for (let cu = uMin; cu <= uMax; cu++) {
       for (let cv = vMin; cv <= vMax; cv++) {
-        const cellKey = `${buildingId}:${meshType}:${cu}:${cv}:${pdKey}`;
+        const cellKey = `${buildingId}:${meshType}:${cu}:${cv}:${ck}:${pdKey}`;
 
         let entry = discovered.get(cellKey);
         if (!entry) {
@@ -1003,7 +1014,7 @@ function scanCells(pos, uv, buildingId, meshType, seedConfig, faces, triFace, ho
   for (const [cellKey, entry] of discovered) {
     cellKeys[idx]  = cellKey;
     cellGeoms[idx] = new Float32Array(entry.verts);
-    if (seedColors && Math.random() < seedFraction) {
+    if (seedColors && seedFraction > 0 && Math.random() < seedFraction) {
       const color = seedColors[(Math.random() * seedColors.length) | 0];
       seeds.push({ idx, color, normal: entry.normal, planeD: entry.planeD });
     }
@@ -1016,19 +1027,20 @@ function scanCells(pos, uv, buildingId, meshType, seedConfig, faces, triFace, ho
 // ── Cell overlap dedupe ─────────────────────────────────────────────────────
 //
 // Near-coplanar faces that weren't post-merged (normal/plane deltas just
-// outside the face thresholds) can still produce cells at the same (cu, cv)
-// with different pdKeys. This pass groups cells by (buildingId:meshType:cu:cv),
-// chains them into near-coplanar sets (plane distance ≤ FACE_DIST_LOOSE,
-// normal-dot ≥ FACE_NDOT_LOOSE, centroid distance ≤ CELL_CENTROID_MAX_DIST
-// against the chain's anchor), and merges each chain into a single entry so
-// exactly one cell owns each visual position.
+// outside the face thresholds) can still produce cells at the same
+// (cu, cv, centroidKey) with different pdKeys. This pass groups cells by
+// everything except the trailing pdKey — so it merges across pdKey buckets
+// but never across distinct face centroids — then chains entries in each
+// group into near-coplanar sets (plane distance ≤ FACE_DIST_LOOSE, normal-dot
+// ≥ FACE_NDOT_LOOSE, centroid distance ≤ CELL_CENTROID_MAX_DIST against the
+// chain's anchor), and merges each chain into a single entry so exactly one
+// cell owns each visual position.
 //
-// The centroid check is what distinguishes "same visual cell on adjacent
-// faces" from "two cells that share (cu, cv) purely because each face has its
-// own UV origin (computeGridUVs shiftU/shiftV) but live far apart in world
-// space." Without it, two coplanar wall segments on the same facade line —
-// separated by several metres — could both produce cell (cu, cv) and get
-// fused, painting a single click across both segments.
+// The centroidKey segment in the cellKey already separates laterally-distinct
+// faces that share (cu, cv) purely because computeGridUVs gives each face its
+// own UV origin. The CELL_CENTROID_MAX_DIST check below is a belt-and-braces
+// safeguard against pathological cases where two entries with the same
+// centroidKey still turned out to be far apart at dedup time.
 
 const CELL_CENTROID_MAX_DIST = GRID_SIZE / 2; // 1 m — a full cell is 2 m, so
                                               // legit same-cell centroids fall
@@ -1136,6 +1148,15 @@ const CROSS_FACE_NARROW_MAX = 0.05;                         // sliver's short-di
 const GROUP_NDOT_MIN        = Math.cos(20 * Math.PI / 180); // ≈ 0.9397 — 20° cap
 const LONGEST_EDGE_TOL      = 0.9;                          // shared-edge tolerance
 
+// Scratch buffers for cellGeomStats. The worker thread is single-threaded and
+// buildCellGroups' cellInfo loop is synchronous, so module-scoped reuse is
+// safe and avoids allocating a fresh Map + arrays per cell — a measurable
+// win because cellGeomStats is called once per cell across thousands of cells.
+const _cgsEdgeMap = new Map();
+const _cgsVRX = [], _cgsVRY = [], _cgsVRZ = []; // interned rounded ints
+const _cgsVX  = [], _cgsVY  = [], _cgsVZ  = []; // first-seen raw coords
+const CGS_MAX_IDS = 65536; // per-cell vertex id ceiling for (lo,hi) pair packing
+
 // Recover a cell's union-polygon area + boundary edges from its fan-triangulated
 // `verts` buffer. A clipped polygon is fan-triangulated as (v0, v_k, v_{k+1}):
 // the interior diagonals (v0→v_k for k≥2) appear in exactly two fan triangles
@@ -1149,8 +1170,14 @@ function cellGeomStats(verts) {
 
   const ROUND = 100; // 1 cm, matches computeLineCoords
   let area = 0;
-  const edgeCount = new Map(); // rounded edge key → count
-  const edgeData  = new Map(); // rounded edge key → first-seen endpoint coords
+
+  // Per-cell vertex interning by rounded-int compare, with a single
+  // numeric-keyed edge Map. The previous version hashed 6 coord strings per
+  // triangle into two Maps per call — that string build dominated the worker's
+  // CPU (2.5s in profile). Linear-search intern wins because typical cells
+  // have ≤ ~20 unique vertices.
+  _cgsEdgeMap.clear();
+  let vCount = 0;
 
   for (let ti = 0; ti < triCount; ti++) {
     const i0 = ti * 9;
@@ -1165,30 +1192,54 @@ function cellGeomStats(verts) {
     const nz = e1x * e2y - e1y * e2x;
     area += 0.5 * Math.sqrt(nx * nx + ny * ny + nz * nz);
 
-    const segs = [
-      [ax, ay, az, bx, by, bz],
-      [bx, by, bz, cx, cy, cz],
-      [cx, cy, cz, ax, ay, az],
-    ];
-    for (const s of segs) {
-      const k1 = Math.round(s[0]*ROUND)+','+Math.round(s[1]*ROUND)+','+Math.round(s[2]*ROUND);
-      const k2 = Math.round(s[3]*ROUND)+','+Math.round(s[4]*ROUND)+','+Math.round(s[5]*ROUND);
-      if (k1 === k2) continue; // degenerate zero-length
-      const key = k1 < k2 ? k1+'|'+k2 : k2+'|'+k1;
-      edgeCount.set(key, (edgeCount.get(key) || 0) + 1);
-      if (!edgeData.has(key)) {
-        edgeData.set(key, [s[0], s[1], s[2], s[3], s[4], s[5]]);
-      }
+    const rAx = Math.round(ax * ROUND), rAy = Math.round(ay * ROUND), rAz = Math.round(az * ROUND);
+    const rBx = Math.round(bx * ROUND), rBy = Math.round(by * ROUND), rBz = Math.round(bz * ROUND);
+    const rCx = Math.round(cx * ROUND), rCy = Math.round(cy * ROUND), rCz = Math.round(cz * ROUND);
+
+    let ia = -1, ib = -1, ic = -1;
+    for (let i = 0; i < vCount; i++) {
+      const rx = _cgsVRX[i], ry = _cgsVRY[i], rz = _cgsVRZ[i];
+      if (ia < 0 && rx === rAx && ry === rAy && rz === rAz) ia = i;
+      if (ib < 0 && rx === rBx && ry === rBy && rz === rBz) ib = i;
+      if (ic < 0 && rx === rCx && ry === rCy && rz === rCz) ic = i;
+    }
+    if (ia < 0) { _cgsVRX[vCount] = rAx; _cgsVRY[vCount] = rAy; _cgsVRZ[vCount] = rAz;
+                  _cgsVX[vCount]  = ax;  _cgsVY[vCount]  = ay;  _cgsVZ[vCount]  = az; ia = vCount++; }
+    if (ib < 0) { _cgsVRX[vCount] = rBx; _cgsVRY[vCount] = rBy; _cgsVRZ[vCount] = rBz;
+                  _cgsVX[vCount]  = bx;  _cgsVY[vCount]  = by;  _cgsVZ[vCount]  = bz; ib = vCount++; }
+    if (ic < 0) { _cgsVRX[vCount] = rCx; _cgsVRY[vCount] = rCy; _cgsVRZ[vCount] = rCz;
+                  _cgsVX[vCount]  = cx;  _cgsVY[vCount]  = cy;  _cgsVZ[vCount]  = cz; ic = vCount++; }
+
+    if (ia !== ib) {
+      const k = ia < ib ? ia * CGS_MAX_IDS + ib : ib * CGS_MAX_IDS + ia;
+      _cgsEdgeMap.set(k, (_cgsEdgeMap.get(k) || 0) + 1);
+    }
+    if (ib !== ic) {
+      const k = ib < ic ? ib * CGS_MAX_IDS + ic : ic * CGS_MAX_IDS + ib;
+      _cgsEdgeMap.set(k, (_cgsEdgeMap.get(k) || 0) + 1);
+    }
+    if (ic !== ia) {
+      const k = ic < ia ? ic * CGS_MAX_IDS + ia : ia * CGS_MAX_IDS + ic;
+      _cgsEdgeMap.set(k, (_cgsEdgeMap.get(k) || 0) + 1);
     }
   }
 
+  // Build the cross-cell string key only for emitted boundary edges (count=1).
+  // buildCellGroups' edgeIndex needs it to match edges shared between cells,
+  // so the format has to stay "rx,ry,rz|rx,ry,rz" with lexicographic ordering.
   const edges = [];
-  for (const [key, count] of edgeCount) {
+  for (const [k, count] of _cgsEdgeMap) {
     if (count !== 1) continue; // internal (diagonal or shared seam)
-    const d = edgeData.get(key);
-    const dx = d[3] - d[0], dy = d[4] - d[1], dz = d[5] - d[2];
-    const len = Math.sqrt(dx*dx + dy*dy + dz*dz);
-    edges.push({ ax: d[0], ay: d[1], az: d[2], bx: d[3], by: d[4], bz: d[5], len, key });
+    const lo = Math.floor(k / CGS_MAX_IDS);
+    const hi = k - lo * CGS_MAX_IDS;
+    const ax = _cgsVX[lo], ay = _cgsVY[lo], az = _cgsVZ[lo];
+    const bx = _cgsVX[hi], by = _cgsVY[hi], bz = _cgsVZ[hi];
+    const k1 = _cgsVRX[lo] + ',' + _cgsVRY[lo] + ',' + _cgsVRZ[lo];
+    const k2 = _cgsVRX[hi] + ',' + _cgsVRY[hi] + ',' + _cgsVRZ[hi];
+    const key = k1 < k2 ? k1 + '|' + k2 : k2 + '|' + k1;
+    const dx = bx - ax, dy = by - ay, dz = bz - az;
+    const len = Math.sqrt(dx * dx + dy * dy + dz * dz);
+    edges.push({ ax, ay, az, bx, by, bz, len, key });
   }
   return { area, edges };
 }

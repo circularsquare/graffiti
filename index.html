@@ -27,6 +27,7 @@
     #overlay.hidden { display: none; }
     #overlay.loading { cursor: default; }
     #overlay.loading #overlay-prompt { opacity: 0.35; }
+    #overlay.startup { background: rgba(0,0,0,1); }
 
     #minimap-wrap {
       position: fixed;
@@ -40,6 +41,16 @@
     #minimap-wrap.big { pointer-events: auto; cursor: grab; }
     #minimap-wrap.big.dragging { cursor: grabbing; }
     #minimap-wrap canvas { display: block; }
+    #minimap-teleport-hint {
+      display: none;
+      position: fixed;
+      right: 16px; width: 234px;
+      text-align: center;
+      font-family: monospace; font-size: 11px;
+      color: rgba(255,255,255,0.55);
+      pointer-events: none;
+      z-index: 10;
+    }
     #minimap-attr {
       position: fixed;
       top: 16px; right: 16px;
@@ -103,39 +114,29 @@
     }
     #crosshair.visible { display: block; }
 
-    #hud {
-      position: fixed;
-      bottom: 16px;
-      left: 50%;
-      transform: translateX(-50%);
-      color: rgba(255,255,255,0.5);
-      font-family: monospace;
-      font-size: 12px;
-      pointer-events: none;
-    }
-
-    #loading-indicator {
+#loading-indicator {
       position: fixed;
       bottom: 16px;
       left: 16px;
-      color: rgba(255,255,255,0.85);
+      color: rgba(0,0,0,0.85);
       font-family: monospace;
-      font-size: 12px;
+      font-size: 15px;
       pointer-events: none;
       z-index: 10;
       display: flex;
       flex-direction: column;
-      gap: 3px;
-      text-shadow: 0 1px 2px rgba(0,0,0,0.9);
+      gap: 4px;
+      text-shadow: 0 1px 2px rgba(255,255,255,0.6);
     }
-    #loading-indicator > div { display: flex; align-items: center; gap: 6px; }
+    #loading-indicator > div { display: flex; align-items: center; gap: 8px; }
     #loading-indicator > div.hidden { display: none; }
     #loading-indicator > div::before {
       content: '';
-      width: 7px; height: 7px;
+      width: 9px; height: 9px;
       border-radius: 50%;
       background: #ffd24d;
-      box-shadow: 0 0 3px rgba(0,0,0,0.8);
+      box-shadow: 0 0 3px rgba(0,0,0,0.5);
+      flex-shrink: 0;
       animation: loading-pulse 1s ease-in-out infinite;
     }
     @keyframes loading-pulse {
@@ -178,26 +179,27 @@
   </style>
 </head>
 <body>
-  <div id="overlay" class="loading">
+  <div id="overlay" class="loading startup">
     <div>Graffiti NYC</div>
     <div id="overlay-prompt">Loading data...</div>
-    <small>WASD · mouse look · Shift to sprint · ESC to exit</small>
-    <small>Tab to cycle colors · C to pick color</small>
+    <small>WASD · mouse look · Q to sprint · M to open map · ESC to exit</small>
+    <small>Tab to cycle colors · C to pick color · I to eyedrop</small>
   </div>
   <div id="crosshair"></div>
   <div id="colorbar"></div>
-  <div id="hud">Graffiti NYC</div>
-  <div id="loading-indicator">
+<div id="loading-indicator">
     <div id="loading-buildings" class="hidden">Loading buildings...</div>
     <div id="loading-osm" class="hidden">Loading OSM...</div>
     <div id="loading-terrain" class="hidden">Loading terrain...</div>
+    <div id="loading-paint" class="hidden">Saving...</div>
   </div>
   <div id="minimap-wrap">
     <canvas id="minimap" width="234" height="234"></canvas>
   </div>
+  <div id="minimap-teleport-hint">click to teleport</div>
   <div id="minimap-attr">© OpenStreetMap contributors</div>
-  <button id="minimap-random" disabled>Random location</button>
-  <div id="render-distance">
+  <button id="minimap-random" disabled style="display:none">Random location</button>
+  <div id="render-distance" style="display:none">
     <div id="render-distance-label"><span>Render distance</span><span id="render-distance-val">1.00×</span></div>
     <input id="render-distance-slider" type="range" min="0.5" max="1.6" step="0.05" value="1">
   </div>

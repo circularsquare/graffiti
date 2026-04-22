@@ -17,7 +17,11 @@
       "WebSearch",
       "Bash(python -c ' *)",
       "Bash(python -c \"import ast; ast.parse\\(open\\('scripts/fetch_osm_features.py'\\).read\\(\\)\\); print\\('OK'\\)\")",
-      "Read(//c/Users/anita/projects/graffiti/**)"
+      "Read(//c/Users/anita/projects/graffiti/**)",
+      "WebFetch(domain:www.nature.com)",
+      "WebFetch(domain:figshare.com)",
+      "WebFetch(domain:api.figshare.com)",
+      "Read(//c/Users/anita/Downloads/**)"
     ],
     "additionalDirectories": [
       "C:\\Users\\anita\\.claude"

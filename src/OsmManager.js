@@ -17,7 +17,7 @@ import { injectGridOverlay, enableGridExtensions, GRID_SHADER_CACHE_KEY } from '
 //
 // Render-distance slider (setRadiusScale) still scales this, so users
 // on strong machines can raise it. Default keeps initial load safe.
-const LOAD_RADIUS       = 100;
+const LOAD_RADIUS       = 200;
 const OSM_UNLOAD_MARGIN = 60;
 
 // Spatial index grid — mirrors TileManager's scheme.
@@ -136,8 +136,8 @@ function _makeOsmMaterial(color, polygonOffsetUnits) {
 }
 
 const LAND_MAT         = _makeOsmMaterial(0xd1c8b7, -1);
-const WATER_MAT        = _makeOsmMaterial(0x9cc4e2, -2);
-const GREEN_MAT        = _makeOsmMaterial(0xb8de92, -4);
+const GREEN_MAT        = _makeOsmMaterial(0xb8de92, -2);
+const WATER_MAT        = _makeOsmMaterial(0x9cc4e2, -4);
 const STREET_MAT       = _makeOsmMaterial(0xf3ecd7, -6);
 
 // Skirt meshes are coplanar with the terrain cliff face (yOffset shift is parallel to the face), so they need real perpendicular separation — see SKIRT_OUT_* below. polygonOffset here is just a belt-and-braces backup; ordering matches tops (street > water > green > terrain).
@@ -328,6 +328,10 @@ export class OsmManager {
     // User-facing render-distance multiplier applied to LOAD_RADIUS in tick().
     this._radiusScale  = 1;
 
+    // Set to true once init() completes (success or 404). The startup/teleport
+    // gate checks this before querying allNearbySettled().
+    this._manifestSettled = false;
+
     // Raw streets cache for random-spawn sampling. Stores the in-flight Promise
     // so two concurrent callers share one fetch; resolved value replaces it.
     this._streetsCache = new Map();           // tileId → Array<street> | Promise
@@ -388,6 +392,7 @@ export class OsmManager {
       entries = await res.json();
     } catch (e) {
       console.warn(`OsmManager: manifest not found (${e.message}) — skipping OSM overlay`);
+      this._manifestSettled = true;
       return;
     }
 
@@ -396,7 +401,7 @@ export class OsmManager {
         id:          entry.id,
         // Manifest no longer stores `file` — it's deterministic from `id`.
         // Accept the old field for forward/backward compatibility.
-        file:        entry.file ?? `/osm/${entry.id}.bin.gz`,
+        file:        entry.file ?? `${import.meta.env.VITE_CDN_BASE ?? ''}/osm/${entry.id}.bin.gz`,
         bounds:      entry.bounds,
         streetCount: entry.streetCount ?? 0,
         status:      'unloaded',
@@ -406,6 +411,7 @@ export class OsmManager {
       this._indexTile(tile);
     }
 
+    this._manifestSettled = true;
     this.tick(0, 0);
   }
 
@@ -425,6 +431,82 @@ export class OsmManager {
       if (x >= b.minX && x < b.maxX && z >= b.minZ && z < b.maxZ) return tile;
     }
     return null;
+  }
+
+  // True when the nearest GATE_TILES OSM tiles within LOAD_RADIUS of (px, pz)
+  // have all settled (loaded or failed). Returns true immediately if the
+  // manifest hasn't loaded yet (would block forever) — callers check
+  // _manifestSettled separately for the startup gate.
+  allNearbySettled(px, pz) {
+    if (!this._manifestSettled) return false;
+    if (this._tiles.size === 0) return true;
+    const GATE_TILES = 2;
+    const maxR2 = (LOAD_RADIUS * this._radiusScale) ** 2;
+    const pgx = Math.floor(px / COARSE_GRID);
+    const pgz = Math.floor(pz / COARSE_GRID);
+    const nearest = [];
+    const seen = new Set();
+    for (let dx = -COARSE_REACH; dx <= COARSE_REACH; dx++) {
+      for (let dz = -COARSE_REACH; dz <= COARSE_REACH; dz++) {
+        const bucket = this._spatialIndex.get(`${pgx + dx},${pgz + dz}`);
+        if (!bucket) continue;
+        for (const tile of bucket) {
+          if (seen.has(tile)) continue;
+          seen.add(tile);
+          const d2 = _closestDist2(px, pz, tile.bounds);
+          if (d2 > maxR2) continue;
+          nearest.push({ tile, d2 });
+        }
+      }
+    }
+    if (nearest.length === 0) return true;
+    nearest.sort((a, b) => a.d2 - b.d2);
+    const count = Math.min(GATE_TILES, nearest.length);
+    for (let i = 0; i < count; i++) {
+      const s = nearest[i].tile.status;
+      if (s !== 'loaded' && s !== 'failed') return false;
+    }
+    return true;
+  }
+
+  /**
+   * Return all loaded water meshes (tops + skirts). Used by the paint raycast
+   * to reject aim points over water — since water is draped ~2.4 mm above
+   * terrain, a ray that hits water will always hit it before the terrain
+   * underneath, so a simple "first hit is water" check works per-cell.
+   */
+  waterMeshes() {
+    const out = [];
+    for (const tile of this._tiles.values()) {
+      if (tile.status !== 'loaded' || !tile.group) continue;
+      for (const child of tile.group.children) {
+        if (child.userData.isWater) out.push(child);
+      }
+    }
+    return out;
+  }
+
+  /**
+   * Return water meshes for the single OSM cell at (gx, gz), or null if that
+   * cell is in the manifest but not yet loaded+draped. An empty array means
+   * "cell is known to have no water" (or isn't in the manifest at all, i.e.
+   * off-coverage — nothing to wait for).
+   *
+   * Used by the terrain seeder to decide whether to skip water cells: if the
+   * return is null the seed pass bails without marking the tile complete so
+   * it retries on the next reload once OSM has caught up.
+   */
+  waterMeshesForCell(gx, gz) {
+    const tile = this._tiles.get(`cell_${gx}_${gz}`);
+    if (!tile) return [];
+    if (tile.status !== 'loaded' || !tile.drapeComplete) return null;
+    const out = [];
+    if (tile.group) {
+      for (const child of tile.group.children) {
+        if (child.userData.isWater) out.push(child);
+      }
+    }
+    return out;
   }
 
   /** Manifest tiles that report at least one street. Used by the random-spawn picker. */
@@ -498,6 +580,7 @@ export class OsmManager {
     const pgx = Math.floor(px / COARSE_GRID);
     const pgz = Math.floor(pz / COARSE_GRID);
     const seen = new Set();
+    const toEnqueue = [];
     for (let dx = -COARSE_REACH; dx <= COARSE_REACH; dx++) {
       for (let dz = -COARSE_REACH; dz <= COARSE_REACH; dz++) {
         const bucket = this._spatialIndex.get(`${pgx + dx},${pgz + dz}`);
@@ -506,11 +589,13 @@ export class OsmManager {
           if (seen.has(tile)) continue;
           seen.add(tile);
           const d2 = _closestDist2(px, pz, tile.bounds);
-          if (tile.status === 'unloaded' && d2 < loadR2) this._enqueueLoad(tile);
+          if (tile.status === 'unloaded' && d2 < loadR2) toEnqueue.push({ tile, d2 });
           else if (tile.status === 'loaded' && d2 > unloadR2) this._unload(tile);
         }
       }
     }
+    toEnqueue.sort((a, b) => a.d2 - b.d2);
+    for (const { tile } of toEnqueue) this._enqueueLoad(tile);
   }
 
   _enqueueLoad(tile) {
@@ -530,7 +615,18 @@ export class OsmManager {
       // recover missing cliff-face coverage. Tiny memory cost (~kB per
       // tile, ~4 tiles loaded).
       tile.sourceData = data;
-      await this._buildTileMeshes(tile);
+
+      // If terrain is present but hasn't settled for this tile's centre yet
+      // (still in-flight or never requested), skip the initial mesh build so
+      // we never flash flat y=0 geometry. redrapeOverBounds will call
+      // _rebuildTile once the covering terrain cell lands.
+      const cx = (tile.bounds.minX + tile.bounds.maxX) / 2;
+      const cz = (tile.bounds.minZ + tile.bounds.maxZ) / 2;
+      if (this._terrain && !this._terrain.isCellSettled(cx, cz)) {
+        tile.drapeComplete = false;
+      } else {
+        await this._buildTileMeshes(tile);
+      }
 
       // Tile could have been cancelled mid-build if we later add that path; for
       // now status stays 'loading' until here, but guard defensively.
@@ -539,7 +635,10 @@ export class OsmManager {
       if (this._onTileReady) this._onTileReady(tile);
     } catch (e) {
       console.error(`OsmManager: failed to load ${tile.id}:`, e);
-      tile.status = 'unloaded';
+      tile._failures = (tile._failures ?? 0) + 1;
+      // After 2 failures treat the tile as permanently absent so the
+      // startup/teleport gate can proceed rather than retrying forever.
+      tile.status = tile._failures >= 2 ? 'failed' : 'unloaded';
     } finally {
       this._drainQueue();
     }
@@ -569,7 +668,7 @@ export class OsmManager {
       // texture or terrain shader is needed.
       group.add(_buildLandMesh(tile.bounds));
       const water = _buildPolygonMesh(data.water  || [], Y_WATER,  WATER_MAT,  2);
-      if (water)   group.add(water);
+      if (water)   { water.userData.isWater = true; group.add(water); }
       const green = _buildPolygonMesh(data.green  || [], Y_GREEN,  GREEN_MAT,  1);
       if (green)   group.add(green);
       const streets = _buildStreetMesh(data.streets || [], Y_STREET, STREET_MAT, 3);
@@ -593,9 +692,9 @@ export class OsmManager {
       // from attaching meshes to a disposed group).
       if (tile.status === 'unloaded') return;
 
-      _applyDrapeLayer(result.water,   WATER_MAT,  WATER_SKIRT_MAT,  2, this._terrain, DRAPE_Y_WATER,  tile.drapables, group, SKIRT_OUT_WATER);
-      _applyDrapeLayer(result.green,   GREEN_MAT,  GREEN_SKIRT_MAT,  1, this._terrain, DRAPE_Y_GREEN,  tile.drapables, group, SKIRT_OUT_GREEN);
-      _applyDrapeLayer(result.streets, STREET_MAT, STREET_SKIRT_MAT, 3, this._terrain, DRAPE_Y_STREET, tile.drapables, group, SKIRT_OUT_STREET);
+      _applyDrapeLayer(result.water,   WATER_MAT,  WATER_SKIRT_MAT,  2, this._terrain, DRAPE_Y_WATER,  tile.drapables, group, SKIRT_OUT_WATER,  true);
+      _applyDrapeLayer(result.green,   GREEN_MAT,  GREEN_SKIRT_MAT,  1, this._terrain, DRAPE_Y_GREEN,  tile.drapables, group, SKIRT_OUT_GREEN,  false);
+      _applyDrapeLayer(result.streets, STREET_MAT, STREET_SKIRT_MAT, 3, this._terrain, DRAPE_Y_STREET, tile.drapables, group, SKIRT_OUT_STREET, false);
 
       // `stats.missingTerrain` used to live here but was never written; the
       // drape is considered complete after any build. If partial-terrain
@@ -930,7 +1029,7 @@ function _drapeIntoPositions(xzOwn, terrain, yOffset, positions) {
 // tops and skirts as THREE meshes, and adds them to `group`. Used for all
 // three layers (water/green/streets) — the caller routes materials +
 // skirtOut to pick the right stack ordering.
-function _applyDrapeLayer(layer, topMat, skirtMat, renderOrder, terrain, yOffset, drapables, group, skirtOut) {
+function _applyDrapeLayer(layer, topMat, skirtMat, renderOrder, terrain, yOffset, drapables, group, skirtOut, isWater) {
   const topXz = layer.topXz;
   const skirtXz = [];
   _emitBlockSkirts(layer.coveredBlocks, terrain, skirtXz, skirtOut);
@@ -940,8 +1039,8 @@ function _applyDrapeLayer(layer, topMat, skirtMat, renderOrder, terrain, yOffset
   const skirtMesh = skirtXz.length > 0
     ? _finalizeDrapedMesh(new Float32Array(skirtXz), skirtMat, renderOrder, terrain, yOffset, drapables)
     : null;
-  if (topMesh)   group.add(topMesh);
-  if (skirtMesh) group.add(skirtMesh);
+  if (topMesh)   { if (isWater) topMesh.userData.isWater   = true; group.add(topMesh); }
+  if (skirtMesh) { if (isWater) skirtMesh.userData.isWater = true; group.add(skirtMesh); }
 }
 
 // Re-sample terrain at every xz pair and rewrite the mesh's Y column in

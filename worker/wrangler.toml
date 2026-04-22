@@ -1,0 +1,11 @@
+name             = "graffiti-paint"
+main             = "index.js"
+compatibility_date = "2025-01-01"
+
+routes = [
+  { pattern = "api.anita.garden/*", zone_name = "anita.garden" }
+]
+
+[[r2_buckets]]
+binding     = "PAINT"
+bucket_name = "graffiti-paint"

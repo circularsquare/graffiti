@@ -171,14 +171,18 @@ export class TerrainManager {
     const minGz = Math.floor((pv - loadR) / CELL_SIZE);
     const maxGz = Math.floor((pv + loadR) / CELL_SIZE);
 
+    const toEnqueue = [];
     for (let gx = minGx; gx <= maxGx; gx++) {
       for (let gz = minGz; gz <= maxGz; gz++) {
-        if (_cellDist2(pu, pv, gx, gz) >= loadR2) continue;
+        const d2 = _cellDist2(pu, pv, gx, gz);
+        if (d2 >= loadR2) continue;
         const key = `${gx},${gz}`;
         if (this._cells.has(key)) continue;
-        this._enqueueLoad(gx, gz, key);
+        toEnqueue.push({ gx, gz, key, d2 });
       }
     }
+    toEnqueue.sort((a, b) => a.d2 - b.d2);
+    for (const { gx, gz, key } of toEnqueue) this._enqueueLoad(gx, gz, key);
 
     if (this._loadQueue.length > 0) {
       for (let i = this._loadQueue.length - 1; i >= 0; i--) {
@@ -225,8 +229,7 @@ export class TerrainManager {
       const meshSet = this._buildingPaintMeshByBuilding.get(bk);
       if (meshSet) {
         for (const paintMesh of meshSet) {
-          paintMesh.geometry.dispose();
-          paintMesh.material.dispose();
+          paintMesh.geometry.dispose(); // material is shared — never dispose
           this._paintGroup.remove(paintMesh);
           this._buildingPaintMeshes.delete(paintMesh.userData.paintMeshKey);
         }
@@ -316,7 +319,7 @@ export class TerrainManager {
   _fetchCellViaWorker(gx, gz, key) {
     return new Promise((resolve, reject) => {
       this._pendingLoads.set(key, { resolve, reject });
-      this._worker.postMessage({ type: 'load', gx, gz, key, file: `/terrain/cell_${gx}_${gz}.bin` });
+      this._worker.postMessage({ type: 'load', gx, gz, key, file: `${import.meta.env.VITE_CDN_BASE ?? ''}/terrain/cell_${gx}_${gz}.bin` });
     });
   }
 
@@ -379,6 +382,42 @@ export class TerrainManager {
     const state = this._cells.get(`${gx},${gz}`);
     if (!state || typeof state !== 'object') return null;
     return state;
+  }
+
+  // Returns true if the terrain cell covering world-space (x, z) has settled —
+  // either loaded with height data or confirmed absent (404). Returns false
+  // while the cell is still in-flight or has never been requested, which is
+  // the signal OsmManager uses to defer its initial mesh build so it never
+  // flashes flat y=0 geometry before terrain arrives.
+  isCellSettled(x, z) {
+    const [u, v] = worldToGrid(x, z);
+    const gx = Math.floor(u / CELL_SIZE);
+    const gz = Math.floor(v / CELL_SIZE);
+    const state = this._cells.get(`${gx},${gz}`);
+    return state !== undefined && state !== 'loading';
+  }
+
+  // True when the two terrain cells nearest the player (own cell plus the
+  // one across its closest edge) have settled (loaded or 404). Used by the
+  // startup/teleport gate.
+  allNearbySettled(px, pz) {
+    const [u, v] = worldToGrid(px, pz);
+    const gx = Math.floor(u / CELL_SIZE);
+    const gz = Math.floor(v / CELL_SIZE);
+    const localU = u - gx * CELL_SIZE;
+    const localV = v - gz * CELL_SIZE;
+    // Closest adjacent cell is across whichever of the 4 edges is nearest.
+    let adjGx = gx, adjGz = gz;
+    if (Math.min(localU, CELL_SIZE - localU) < Math.min(localV, CELL_SIZE - localV)) {
+      adjGx = localU < CELL_SIZE / 2 ? gx - 1 : gx + 1;
+    } else {
+      adjGz = localV < CELL_SIZE / 2 ? gz - 1 : gz + 1;
+    }
+    for (const [cgx, cgz] of [[gx, gz], [adjGx, adjGz]]) {
+      const state = this._cells.get(`${cgx},${cgz}`);
+      if (state === undefined || state === 'loading') return false;
+    }
+    return true;
   }
 
   /**

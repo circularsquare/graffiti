@@ -1,5 +1,5 @@
-const TILE_ENDPOINT    = '/api/paint';
-const SAVE_DEBOUNCE_MS  = 1500;
+const TILE_ENDPOINT    = import.meta.env.VITE_PAINT_ENDPOINT ?? '/api/paint';
+const SAVE_DEBOUNCE_MS  = 500;
 
 // Sentinel cellKey written to a tile's paint JSON once seedTileCells has
 // applied every mesh's seeds without being abandoned mid-way. Presence of
@@ -199,7 +199,16 @@ class PaintStore {
     this.cells.set(cellKey, cellData);
     this._indexAdd(cellKey);
     this._trackCellTile(cellKey);
-    this._scheduleSave();
+    // Intentionally no _scheduleSave() here — the tile is marked dirty by
+    // _trackCellTile so unloadTile will persist it. markTileSeedComplete
+    // fires _scheduleSave() after the full seed pass, ensuring the sentinel
+    // travels on the same write as the cells (avoids a premature save without
+    // the sentinel that could cause the tile to re-seed on the next visit if
+    // the player moves away before the second save fires).
+  }
+
+  get isDirty() {
+    return this._dirtyTiles.size > 0 || this._saveTimer !== null;
   }
 
   cellsForBuilding(buildingKey) {
@@ -214,10 +223,12 @@ class PaintStore {
   // ── Tile ↔ cell tracking ───────────────────────────────────────────────────
 
   _buildingKeyOf(cellKey) {
-    // "buildingId:meshType:cu:cv:pdKey" — strip last three segments to recover
-    // "buildingId:meshType". Robust against colons inside buildingId.
+    // Buildings: "buildingId:meshType:cu:cv:centroidKey:pdKey"  (strip 4)
+    // Terrain:   "terrain_gx_gz:meshType:ix:iz:iy"              (strip 3)
+    // Robust against colons inside buildingId.
     const parts = cellKey.split(':');
-    parts.pop(); parts.pop(); parts.pop();
+    const trailing = cellKey.startsWith('terrain_') ? 3 : 4;
+    for (let i = 0; i < trailing; i++) parts.pop();
     return parts.join(':');
   }
 
