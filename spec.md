@@ -22,6 +22,7 @@ graffiti/
 │   ├── osmWorker.js            # Off-thread OSM drape tessellation (2 m block-grid clip + fan-triangulate)
 │   ├── paintStore.js           # Cell paint state — per-tile server persistence, subscribe() for multiplayer
 │   ├── geo.js                  # lng/lat → local XZ meters (centered on FiDi reference point)
+│   ├── PigeonManager.js        # Tile-streamed pigeon flocks; instanced camera-facing sprites with procedural flipbook atlas
 │   └── loadCityGML.js          # Shared materials + wrapMeshData (MeshData → THREE.Mesh)
 │
 ├── scripts/
@@ -348,8 +349,11 @@ labels are dropped if the street segment is too short to fit them.
 | Input | Action |
 |---|---|
 | Click (unlocked) | Lock pointer / enter first-person mode |
-| Left-click (locked) | Paint the looked-at cell red (within 15 m reach) |
-| Right-click (locked) | Erase the looked-at cell |
+| Left-click (locked) | Paint the looked-at cell with the active color (within 15 m reach). Hold to paint every cell the crosshair sweeps across — the whole hold counts as one undo |
+| Right-click (locked) | Erase the looked-at cell. Hold to erase every cell the crosshair sweeps across |
+| Ctrl/Cmd + Z | Undo the last brush stroke (mousedown→mouseup). Up to 50 strokes of history |
+| Ctrl/Cmd + Shift + Z / Ctrl + Y | Redo — replay the most recently undone stroke. Any new stroke clears the redo stack |
+| Tab / Shift + Tab | Cycle the active paint color forward / backward |
 | WASD / Arrow keys | Move |
 | Mouse | Look |
 | Shift | Sprint |
@@ -386,6 +390,7 @@ labels are dropped if the street segment is too short to fit them.
 - **Lighting**: Directional sun (1.8) + ambient (0.35); `PCFSoftShadowMap`
 - **Atmosphere**: Sky-blue background + exponential distance fog
 - **FOV**: 100°
+- **Pigeons**: Grounded flocks stream in/out on a 150 m cell grid (`PigeonManager`, radius 200 m, unload margin 60 m) with a deterministic per-cell RNG so reloads don't reshuffle them. Each cell rolls 0–2 flock anchors (40 / 40 / 20 %); anchors that sit under a building (downward raycast against `buildingMeshes` shows a roof > 3 m above terrain) are rejected so flocks never spawn inside a wall. If buildings haven't loaded yet the tile defers to `_pendingTiles` and retries on the next tick. Each flock is 5–9 pigeons uniformly scattered in a 2.5 m disk around the anchor; each pigeon stands on its own per-point terrain sample with an independent peck-bob (`sin^8` of a 0.3–0.9 Hz phase — mostly 0 with brief spikes). All active pigeons share one `InstancedMesh` of 1 m quads; vertex shader does a Y-axis-locked camera-facing billboard so sprites stay upright when you look down at them from flight, samples a single-frame standing-pigeon sprite (procedurally drawn on a canvas, nearest-filter), and honours scene fog. The quad is anchor-at-feet (shader shifts `position.y` by +0.5) so writing `py = terrain.sample(...)` plants the pigeon on the ground. No collision, no shadows.
 
 ---
 
@@ -414,7 +419,7 @@ npm run build-osm
 
 ## Paint System
 
-Left-click while pointer-locked to paint the grid cell you're looking at (within 15 m). Right-click to erase.
+Left-click while pointer-locked to paint the grid cell you're looking at (within 15 m). Right-click to erase. **Holding** either button turns it into a brush — every new cell the crosshair sweeps across gets painted/erased — and the whole hold commits as a single undo entry. `Ctrl/Cmd + Z` reverts the most recent stroke (up to 50 strokes kept in memory); `Ctrl/Cmd + Shift + Z` or `Ctrl + Y` redoes. Any new stroke clears the redo stack.
 
 ### Cell identity
 
@@ -461,18 +466,22 @@ Per-building paint meshes (one mesh per colour) are tracked in `buildingPaintMes
 
 ### Persistence
 
-Paint is stored **per tile** on disk at `data/paint/{tileId}.json` via a Vite dev-server middleware (`scripts/tile-paint-plugin.js`). The client talks to it over two routes:
+Paint is stored **per tile**, either on disk at `data/paint/{tileId}.json` via the Vite dev-server middleware (`scripts/tile-paint-plugin.js`) or in Cloudflare R2 behind `worker/index.js` in prod. Both backends speak the same protocol:
 
-- `GET  /api/paint/:tileId` → `{ [cellKey]: cellData }` (empty object if the tile has never been painted)
-- `PUT  /api/paint/:tileId` → body is the full cell map; server overwrites the file
+- `GET   /paint/:tileId` → `{ [cellKey]: cellData }`. Returns an `ETag` header and honors `If-None-Match` (304 on hit — used by the pull loop).
+- `PATCH /paint/:tileId` → body is a **diff**: `{ __ts, __author, [cellKey]: cellData | null }`. `__ts` is the client's flush timestamp; `null` entries are erase tombstones (they use `__ts` as their effective `paintedAt`). `__author` is the client's per-device UUID (see *Identity & audit* below) — stripped before merge and never written into the paint JSON. The server reads the current blob, merges the diff with a `paintedAt` tiebreaker (newer wins), and writes back **under an R2 conditional** (`onlyIf: etagMatches`) — retrying up to 5× on CAS loss. Two clients painting different cells on the same tile both survive; same-cell races resolve deterministically to the later wall-clock paint.
 
-Stored cell data: `{ color, normal, planeD, paintedAt }`.
+Stored cell data: `{ color, normal, planeD, paintedAt, authorId }`.
 
-`paintStore.loadTile(tileId, buildingKeys)` is called by `TileManager._doLoad` as soon as meshes are wrapped. It synchronously registers a `buildingKey → tileId` mapping and then fetches the tile's cells in the background. `TileManager._applyCellDataToTile` awaits that promise before invoking the phase-2 `onTileCellData` callback, so `seedTileCells` runs with server-saved paint already populated and preserves pre-existing cells instead of overwriting them with freshly-rolled seeds.
+**Identity & audit.** `paintStore` generates a v4 UUID on first run, stores it in `localStorage['graffiti_author_id']`, and stamps it onto every cell it writes (field `authorId`) plus the PATCH envelope (`__author`). The worker strips `__author` out of the diff and — if the optional `AUDIT` KV binding is wired up — writes one row per `(authorId, ip)` pair with `expirationTtl = 14 days`, refreshed on every PATCH. That gives a 14-day rolling IP↔author map for moderation without mixing IPs into the public paint JSON. Cleared `localStorage` yields a fresh identity; stronger identity needs a real login, not in scope.
 
-`paintStore.unloadTile(tileId, buildingKeys)` is called by `TileManager._unload`; it flushes any pending save for the tile, then drops those cells from memory. Keeps the in-memory map bounded as the player wanders.
+`paintStore.loadTile(tileId, buildingKeys)` is called by `TileManager._doLoad` as soon as meshes are wrapped. It synchronously registers a `buildingKey → tileId` mapping, fetches the tile's cells in the background, stashes the returned ETag in `_tileETags[tileId]`, and kicks the pull loop (below). `TileManager._applyCellDataToTile` awaits the fetch before invoking the phase-2 `onTileCellData` callback, so `seedTileCells` runs with server-saved paint already populated.
 
-Writes are **debounced** (`SAVE_DEBOUNCE_MS = 1500`) per tile. `paint`/`erase`/`seed` mark the owning tile dirty and a single timer flushes every dirty tile on the next tick with a PUT each. On `visibilitychange` we flush with an async fetch; on `beforeunload` we reissue each pending PUT with `keepalive: true` so the write survives page teardown.
+`paintStore.unloadTile(tileId, buildingKeys)` is called by `TileManager._unload`; it flushes any pending save for the tile, then drops its cells, ETag, dirty map, and in-flight flag.
+
+**Writes** are debounced (`SAVE_DEBOUNCE_MS = 500`) per-tile but tracked at **cell granularity**. Every `paint`/`erase`/`seed`/`markTileSeedComplete` writes to local `cells` *and* to `_dirtyCells: Map<tileId, Map<cellKey, cellData|null>>`. The debounce flush snapshots-and-clears the dirty map, PATCHes the diff, and — on success — stashes the response ETag; on failure it merges the snapshot back into the current dirty map (newer writes already there win) and re-schedules. `visibilitychange=hidden` triggers an async PATCH; `beforeunload` re-fires each pending PATCH with `keepalive: true` so writes survive page teardown.
+
+**Periodic pull — two-tier cadence.** `main.js` recomputes the player's *active tile set* at 1 Hz (standing building tile + standing terrain tile + the tile owning the cell under the crosshair, when pointer-locked) and calls `paintStore.setActiveTiles(...)`. Active tiles poll every `PULL_ACTIVE_MS = 5 s`; every other loaded tile sweeps round-robin on an idle loop at `PULL_IDLE_MS = 20 s` (capped at `PULL_IDLE_MAX_TILES = 20` per tick as a safety rail). The effect: tiles the player is actually interacting with feel near-realtime; farther tiles converge within ~20 s without generating per-tile request traffic. Each pull skips tiles with dirty cells or in-flight saves (and re-checks both flags *after* the fetch awaits, so a paint that lands mid-pull still wins). On a 304 nothing changes; on a 200 `_applyServerState` applies non-dirty cells from the server body (using `paintedAt + color` equality to skip redundant rebuilds), deletes local cells the server no longer has (handles another client's erases), and fires one `subscribeBuildings` callback per touched building — which coalesces into at most one `rebuildBuildingPaint` per building per frame via `schedulePaintRebuild`. This is how one client sees another's paint without a full reload.
 
 Seeds are rolled per client at tile load and locked in once seeding finishes. The worker rolls 10% of cells; `seedTileCells` applies them, skipping cells already in `paintStore.cells` (preserves user paint + prior-session seeds). Completion is tracked via a per-tile sentinel (`__seed_complete__`) written to the paint JSON only when `seedTileCells` makes it through every mesh without abandonment — see the `abandoned` flag in [main.js#seedTileCells](src/main.js). Tiles with the sentinel skip all future seed rolls (`paintStore.isTileSeedComplete`); tiles without it (first visit, or a prior visit bailed when the player moved out of range mid-seed) get another roll on the next load. The yield between chunks is `requestAnimationFrame`, not `requestIdleCallback`, so seeding makes steady progress under continuous movement instead of starving on idle time. There is also an optional build-time bake (`scripts/bake_seeds.js`, `npm run bake-seeds`) that writes seeds directly to `data/paint/<tileId>.json`; it's not in the default flow because the full city takes ~2 hrs, but it remains the right tool if shared-across-clients starter graffiti is ever wanted.
 
@@ -528,7 +537,7 @@ random seed patches would visually dilute rather than densify the graffiti.
 
 ### Multiplayer path
 
-The Vite middleware is a dev-only stepping stone toward a hosted server. Swapping it for a real server is mostly a URL change: the client already fetches and saves per tile over HTTP. Real-time sync adds a WebSocket on top — `paintStore.subscribe(fn)` already fires `fn(cellKey, cellData)` on every paint and `fn(cellKey, null)` on every erase, so incoming server events can call the same `paint()`/`erase()` methods with no caller code changes.
+Prod runs `worker/index.js` on Cloudflare with an R2 bucket backing it (dev uses the Vite middleware for the same protocol). The cell-diff PATCH + pull loop gives **eventually-consistent multiplayer paint today** — within `PULL_INTERVAL_MS` of another client's save, every loaded client re-renders its buildings with the new cells. Push-based sync (WebSocket / Durable Object) would collapse that latency to ~0 and let clients react to individual cell events; `paintStore.subscribe(fn)` and `paintStore.subscribeBuildings(fn)` are already the hooks for it. Tabled until it's worth the paid-plan cost.
 
 ## Next Steps
 

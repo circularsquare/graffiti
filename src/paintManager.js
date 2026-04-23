@@ -5,7 +5,7 @@
 //   - The per-building merged paint meshes (buildingPaintMeshes etc.)
 //   - The cell-geometry cache populated off-thread by tileWorker
 //   - The cellGroups lookup (pre-baked paint-group membership)
-//   - The single-level undo snapshot
+//   - The stroke-based undo stack (mousedown→mouseup = one entry, up to 50)
 //   - hitCell / tryPaint / tryErase
 //   - Seeding (seedTileCells on building load, seedTerrainCells on terrain load)
 //
@@ -378,8 +378,9 @@ export function createPaintManager({
   }
   setActiveColor(activeColorIdx); // sync crosshair to initial color
 
-  function cycleActiveColor() {
-    setActiveColor((activeColorIdx + 1) % COLORS.length);
+  function cycleActiveColor(backward = false) {
+    const delta = backward ? -1 : 1;
+    setActiveColor((activeColorIdx + delta + COLORS.length) % COLORS.length);
   }
 
   function pickColorFromAim() {
@@ -402,8 +403,15 @@ export function createPaintManager({
 
   // ─── Undo ───────────────────────────────────────────────────────────────────
   //
-  // Single-level undo: snapshot of cellKey → previous cellData (null = was absent).
-  let lastAction = null;
+  // Stroke-based undo: one mousedown→mouseup = one undo entry, so a drag that
+  // paints 30 cells reverts in one Ctrl+Z. Each entry is a cellKey → prev-state
+  // map (null = cell was absent). beginStroke/endStroke wrap a stroke;
+  // recordPreState accumulates pre-state only the first time a key is touched,
+  // preserving the true pre-stroke state when a drag revisits cells.
+  const UNDO_LIMIT = 50;
+  const undoStack = [];
+  const redoStack = []; // cleared on any new stroke; populated by applyUndo
+  let currentStroke = null;
 
   function snapshotCells(primaryKey) {
     const snap = new Map();
@@ -414,13 +422,60 @@ export function createPaintManager({
     return snap;
   }
 
-  function applyUndo() {
-    if (!lastAction) return;
-    for (const [k, prev] of lastAction) {
-      if (prev === null) paintStore.erase(k);
-      else paintStore.paint(k, prev);
+  function beginStroke() {
+    if (!currentStroke) currentStroke = new Map();
+  }
+
+  function endStroke() {
+    if (currentStroke && currentStroke.size > 0) {
+      undoStack.push(currentStroke);
+      if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+      redoStack.length = 0; // new stroke invalidates any outstanding redo branch
     }
-    lastAction = null;
+    currentStroke = null;
+  }
+
+  function recordPreState(primaryKey) {
+    // If called outside a stroke (defensive), commit as a standalone 1-cell action.
+    const standalone = !currentStroke;
+    const target = currentStroke ?? new Map();
+    const snap = snapshotCells(primaryKey);
+    for (const [k, v] of snap) if (!target.has(k)) target.set(k, v);
+    if (standalone && target.size > 0) {
+      undoStack.push(target);
+      if (undoStack.length > UNDO_LIMIT) undoStack.shift();
+      redoStack.length = 0;
+    }
+  }
+
+  // Flip a snapshot: apply `snap` (k → newState), return a map of k → previous
+  // state so the inverse operation can restore it. Shared by undo + redo.
+  function flipSnapshot(snap) {
+    const inverse = new Map();
+    for (const [k, next] of snap) {
+      inverse.set(k, paintStore.cells.get(k) ?? null);
+      if (next === null) paintStore.erase(k);
+      else paintStore.paint(k, next);
+    }
+    return inverse;
+  }
+
+  function applyUndo() {
+    endStroke(); // commit any in-progress stroke first
+    const last = undoStack.pop();
+    if (!last) return;
+    const forward = flipSnapshot(last);
+    redoStack.push(forward);
+    if (redoStack.length > UNDO_LIMIT) redoStack.shift();
+  }
+
+  function applyRedo() {
+    endStroke();
+    const fwd = redoStack.pop();
+    if (!fwd) return;
+    const back = flipSnapshot(fwd);
+    undoStack.push(back);
+    if (undoStack.length > UNDO_LIMIT) undoStack.shift();
   }
 
   // ─── Rebuild scheduling ─────────────────────────────────────────────────────
@@ -461,10 +516,14 @@ export function createPaintManager({
     }
     buildingPaintMeshByBuilding.delete(buildingKey);
 
-    // Collect cell geometry and per-vertex colors into parallel arrays. Terrain
-    // cells bypass cellGeomCache (see comment on terrainCoords below).
-    const posArrays   = []; // Float32Array[] of XYZ triples
-    const colorArrays = []; // same-length parallel: R,G,B per vertex
+    // Collect cell geometry references + per-cell RGB in parallel arrays, summing
+    // the total float count as we go so the merged position/color buffers can
+    // be allocated once and filled directly. Avoids the old pattern of
+    // allocating a Float32Array per cell for color then copying it again into
+    // the merged buffer — hot path when a building has many painted cells.
+    const posArrays    = []; // Float32Array[] of XYZ triples (reused from cache)
+    const colorTriples = []; // flat [r, g, b, r, g, b, ...] — one triple per posArrays entry
+    let totalFloats = 0;
 
     // Terrain cells bypass cellGeomCache: their geometry is trivially derivable
     // from the terrain mesh's position buffer + a (meshType, ix, iz)-indexed
@@ -502,26 +561,28 @@ export function createPaintManager({
       if (!arr || !arr.length) continue;
 
       posArrays.push(arr);
-
       // setHex applies sRGB→linear conversion to match THREE.MeshBasicMaterial({ color }).
       _paintColor.setHex(v.color);
-      const r = _paintColor.r, g = _paintColor.g, b = _paintColor.b;
-      const vCnt = arr.length / 3; // vertices in this cell
-      const col  = new Float32Array(vCnt * 3);
-      for (let i = 0; i < vCnt; i++) { col[i*3]=r; col[i*3+1]=g; col[i*3+2]=b; }
-      colorArrays.push(col);
+      colorTriples.push(_paintColor.r, _paintColor.g, _paintColor.b);
+      totalFloats += arr.length;
     }
 
-    if (!posArrays.length) return;
+    if (!totalFloats) return;
 
-    const totalVerts = posArrays.reduce((s, a) => s + a.length, 0);
-    const allPos   = new Float32Array(totalVerts);
-    const allColor = new Float32Array(totalVerts); // same length (3 floats/vert)
+    const allPos   = new Float32Array(totalFloats);
+    const allColor = new Float32Array(totalFloats); // parallel — 3 floats/vert, matches allPos
     let off = 0;
     for (let i = 0; i < posArrays.length; i++) {
-      allPos.set(posArrays[i], off);
-      allColor.set(colorArrays[i], off);
-      off += posArrays[i].length;
+      const a = posArrays[i];
+      allPos.set(a, off);
+      const r = colorTriples[i * 3], g = colorTriples[i * 3 + 1], b = colorTriples[i * 3 + 2];
+      const vCnt = a.length / 3;
+      for (let j = 0; j < vCnt; j++) {
+        allColor[off + j * 3    ] = r;
+        allColor[off + j * 3 + 1] = g;
+        allColor[off + j * 3 + 2] = b;
+      }
+      off += a.length;
     }
 
     const geo = new THREE.BufferGeometry();
@@ -546,6 +607,12 @@ export function createPaintManager({
     schedulePaintRebuild(parts.join(':'));
   });
 
+  // The pull loop fires this instead once per building touched, so a reconcile
+  // that changes 200 cells still triggers one rebuild per building per frame.
+  paintStore.subscribeBuildings((buildingKey) => {
+    schedulePaintRebuild(buildingKey);
+  });
+
   // ─── Seeding ────────────────────────────────────────────────────────────────
   //
   // Apply the worker's pre-computed cell data to paint caches. The triangle scan
@@ -554,26 +621,27 @@ export function createPaintManager({
   // aren't already user-painted. Still chunked so a giant tile doesn't push
   // rebuildBuildingPaint calls into one frame.
   async function seedTileCells(meshes) {
-    const SEED_CHUNK = 50;
-    const now        = Date.now();
-    const tSeed      = performance.now();
+    // Yield when accumulated work crosses the frame budget rather than at a
+    // fixed mesh count. A dense tile with a few chunky buildings was spiking
+    // past budget inside one chunk; a sparse tile wasted frames yielding
+    // every 50 meshes. Time-based yielding handles both.
+    const BUDGET_MS = 8;
+    const now       = Date.now();
+    const tSeed     = performance.now();
 
     // Tile is "seed-locked" only after every mesh has been processed without
     // being abandoned mid-way (see abandoned flag below). Resolved lazily from
     // the first mesh we touch since seedTileCells takes meshes, not a tileId.
-    let tileId    = null;
-    let abandoned = false;
+    let tileId      = null;
+    let abandoned   = false;
+    let tChunkStart = performance.now();
 
-    for (let start = 0; start < meshes.length; start += SEED_CHUNK) {
-      const end = Math.min(start + SEED_CHUNK, meshes.length);
+    for (let mi = 0; mi < meshes.length; mi++) {
+      const srcMesh = meshes[mi];
+      if (!srcMesh.parent) { abandoned = true; continue; } // tile unloaded before we got here
 
-      for (let mi = start; mi < end; mi++) {
-        const srcMesh = meshes[mi];
-        if (!srcMesh.parent) { abandoned = true; continue; } // tile unloaded before we got here
-
-        const perType = srcMesh.userData.cellDataByType;
-        if (!perType) continue; // already applied, or wrapped without worker data
-
+      const perType = srcMesh.userData.cellDataByType;
+      if (perType) {
         const { buildingId } = srcMesh.userData;
 
         // Iterate each meshType's CellBundle independently — cellKeys, seeds,
@@ -634,7 +702,10 @@ export function createPaintManager({
       // rAF instead of requestIdleCallback: idle time can starve to zero under
       // continuous movement, which was the original "bottom third seeded, rest
       // empty" symptom. rAF fires every frame so seeding makes steady progress.
-      if (end < meshes.length) await new Promise(r => requestAnimationFrame(r));
+      if (mi + 1 < meshes.length && performance.now() - tChunkStart > BUDGET_MS) {
+        await new Promise(r => requestAnimationFrame(r));
+        tChunkStart = performance.now();
+      }
     }
 
     // Only mark the tile seed-complete if we made it through every mesh without
@@ -861,7 +932,12 @@ export function createPaintManager({
     const h = hitCell();
     if (!h) return;
 
-    lastAction = snapshotCells(h.cellKey);
+    // Dedupe: skip if the target cell is already this color. Keeps hold-to-paint
+    // drags from re-snapshotting + re-painting the same cell every frame.
+    const existing = paintStore.cells.get(h.cellKey);
+    if (existing && existing.color === activeColor.hex) return;
+
+    recordPreState(h.cellKey);
 
     const cellData = { color: activeColor.hex, normal: h.normal.toArray(), planeD: h.planeD, paintedAt: Date.now() };
 
@@ -886,7 +962,10 @@ export function createPaintManager({
     const h = hitCell();
     if (!h) return;
 
-    lastAction = snapshotCells(h.cellKey);
+    // Dedupe: skip if there's nothing painted at this cell.
+    if (!paintStore.cells.has(h.cellKey)) return;
+
+    recordPreState(h.cellKey);
 
     paintStore.erase(h.cellKey);
 
@@ -930,7 +1009,10 @@ export function createPaintManager({
     // User-input actions.
     tryPaint,
     tryErase,
+    beginStroke,
+    endStroke,
     applyUndo,
+    applyRedo,
     cycleActiveColor,
     pickColorFromAim,
     openColorPicker,

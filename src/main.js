@@ -4,8 +4,9 @@ import { TileManager } from './TileManager.js';
 import { OsmManager } from './OsmManager.js';
 import { TerrainManager } from './TerrainManager.js';
 import { TreeManager } from './TreeManager.js';
+import { PigeonManager } from './PigeonManager.js';
 import { paintStore } from './paintStore.js';
-import { gridToWorld } from './geo.js';
+import { gridToWorld, worldToGrid } from './geo.js';
 import { createPhysics, WALK_HEIGHT } from './physics.js';
 import { createPaintManager } from './paintManager.js';
 import {
@@ -553,10 +554,26 @@ minimapWrap.addEventListener('wheel', (e) => {
   adjustMinimapZoom(-e.deltaY * 0.005);
 }, { passive: false });
 
+// -1 = idle; 0 = left held (paint); 2 = right held (erase). Checked each frame
+// in animate() so holding the mouse paints every new cell under the crosshair.
+let paintHeldButton = -1;
+
+function endPaintStroke() {
+  if (paintHeldButton === -1) return;
+  paint.endStroke();
+  paintHeldButton = -1;
+}
+
 renderer.domElement.addEventListener('mousedown', e => {
   if (!controls.isLocked) { if (e.button === 0 && firstTileLoaded) { paint.closeColorPicker(); controls.lock(); } return; }
-  if (e.button === 0) paint.tryPaint();
-  if (e.button === 2) paint.tryErase();
+  if (e.button === 0) { paintHeldButton = 0; paint.beginStroke(); paint.tryPaint(); }
+  else if (e.button === 2) { paintHeldButton = 2; paint.beginStroke(); paint.tryErase(); }
+});
+// Listen on window so a mouseup outside the canvas (e.g. over the HUD) still ends the stroke.
+window.addEventListener('mouseup', e => {
+  if ((e.button === 0 && paintHeldButton === 0) || (e.button === 2 && paintHeldButton === 2)) {
+    endPaintStroke();
+  }
 });
 renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
 overlay.addEventListener('click', () => { if (firstTileLoaded && !teleporting) controls.lock(); });
@@ -578,6 +595,8 @@ controls.addEventListener('lock', () => {
   overlayPrompt.style.visibility = '';
 });
 controls.addEventListener('unlock', () => {
+  // Close any in-progress brush stroke so undo captures exactly what's committed.
+  endPaintStroke();
   crosshair.classList.remove('visible');
   // Press-C flow hides the overlay so only the colorbar is visible. ESC leaves
   // colorPickMode false and shows the full overlay, but the colorbar + minimap
@@ -609,7 +628,12 @@ document.addEventListener('keydown', e => {
     }
     if (e.code === 'KeyZ' && controls.isLocked && !e.repeat) {
       e.preventDefault();
-      paint.applyUndo();
+      if (e.shiftKey) paint.applyRedo(); // Ctrl+Shift+Z
+      else paint.applyUndo();
+    }
+    if (e.code === 'KeyY' && controls.isLocked && !e.repeat) {
+      e.preventDefault();
+      paint.applyRedo();
     }
     return;
   }
@@ -643,7 +667,7 @@ document.addEventListener('keydown', e => {
 
   if (e.code === 'Tab' && !e.repeat) {
     e.preventDefault();
-    paint.cycleActiveColor();
+    paint.cycleActiveColor(e.shiftKey);
   }
 
   if (e.code === 'KeyC' && controls.isLocked && !e.repeat) {
@@ -742,15 +766,15 @@ function updateDebugHud() {
   // fetches. The source with the largest q+f gets a `<-` marker so it's
   // obvious which pipeline is currently furthest behind without having to
   // open DevTools → Performance. Paint is reactive (no fetch queue), so we
-  // show `_dirtyTiles` — tiles with unsaved edits waiting on the debounced
-  // server flush — as its backlog proxy.
+  // show `pendingTileCount` — tiles with unsaved edits waiting on the
+  // debounced server flush — as its backlog proxy.
   const _streamSources = [
     { name: 'bldg',    q: tileManager._loadQueue.length,    f: tileManager._activeLoads    },
     { name: 'osm',     q: osmManager._loadQueue.length,     f: osmManager._activeLoads     },
     { name: 'terrain', q: terrainManager._loadQueue.length, f: terrainManager._activeLoads },
     { name: 'trees',   q: treeManager ? treeManager._loadQueue.length : 0,
                        f: treeManager ? treeManager._activeLoads      : 0 },
-    { name: 'paint',   q: paintStore._dirtyTiles.size, f: 0, kind: 'dirty' },
+    { name: 'paint',   q: paintStore.pendingTileCount, f: 0, kind: 'dirty' },
   ];
   let _streamMax = 0, _streamBehind = -1;
   for (let i = 0; i < _streamSources.length; i++) {
@@ -907,17 +931,24 @@ async function _doStartupTerrainFirst() {
   _startupTerrainDone = true;
 }
 
+// True once building tiles, terrain (if enabled), and OSM around (x, z) have
+// all settled (loaded or 404). Shared by the startup gate and the teleport
+// gate — the two conditions were identical modulo the position argument.
+function allManagersSettledAt(x, z) {
+  if (!tileManager.allNearbyTilesLoaded(x, z)) return false;
+  if (TERRAIN_ENABLED && !terrainManager.allNearbySettled(x, z)) return false;
+  if (!osmManager.allNearbySettled(x, z)) return false;
+  return true;
+}
+
 // Phase 2 of startup: gate until terrain, OSM, and building tiles around the
-// spawn position have all settled (loaded or 404). Called every frame so it
-// fires as soon as all conditions are met without needing explicit callbacks.
+// spawn position have all settled. Called every frame so it fires as soon as
+// all conditions are met without needing explicit callbacks.
 function tryFinishInitialLoad() {
   if (firstTileLoaded) return;
   if (!_startupTerrainDone) return;
   if (!tileManager._manifestLoaded) return;
-  const x = camera.position.x, z = camera.position.z;
-  if (!tileManager.allNearbyTilesLoaded(x, z)) return;
-  if (TERRAIN_ENABLED && !terrainManager.allNearbySettled(x, z)) return;
-  if (!osmManager.allNearbySettled(x, z)) return;
+  if (!allManagersSettledAt(camera.position.x, camera.position.z)) return;
 
   firstTileLoaded = true;
   overlay.classList.remove('loading'); // 'startup' already removed by _doStartupTerrainFirst
@@ -927,17 +958,12 @@ function tryFinishInitialLoad() {
   physics.snapToSafeStart();
 }
 
-// Gate check for teleport: all three managers must be settled before
-// finishTeleportLoad() unlocks. Checked immediately after each trigger
-// (building tile load, terrain load) and every frame to catch OSM settling.
+// Gate check for teleport. Uses the stored destination, not camera.position —
+// the camera is still at the old location during the sampleAsync terrain
+// fetch, and we must not pass the gate against the already-loaded old tiles.
 function tryFinishTeleportLoad() {
   if (!teleporting) return;
-  // Use the stored destination, not camera.position — the camera is still at
-  // the old location during the sampleAsync terrain fetch, and we must not
-  // pass the gate against the already-loaded old tiles.
-  if (!tileManager.allNearbyTilesLoaded(_teleportDestX, _teleportDestZ)) return;
-  if (TERRAIN_ENABLED && !terrainManager.allNearbySettled(_teleportDestX, _teleportDestZ)) return;
-  if (!osmManager.allNearbySettled(_teleportDestX, _teleportDestZ)) return;
+  if (!allManagersSettledAt(_teleportDestX, _teleportDestZ)) return;
   finishTeleportLoad();
 }
 
@@ -988,6 +1014,7 @@ tileManager.init(`${import.meta.env.VITE_CDN_BASE ?? ''}/tiles/manifest.json`);
 // so the rest of main.js (spawn, collision, rescue) keeps calling it
 // unconditionally.
 let treeManager = null;
+let pigeonManager = null;
 
 const terrainManager = TERRAIN_ENABLED
   ? new TerrainManager({
@@ -1021,7 +1048,7 @@ const terrainManager = TERRAIN_ENABLED
         // (buried in terrain, invisible). Bug was latent when drape
         // geometry extended far past tile bounds; post-bake-clip the
         // drape is tight to the tile and the misses become visible holes.
-        osmManager.redrapeOverBounds(_gridBoundsToWorldAABB(state.bounds));
+        osmManager.redrapeOverBounds(_gridBoundsToWorldAABB(state.bounds), state.bounds);
         if (treeManager) treeManager.onTerrainCellLoaded();
       },
       onTerrainUnloaded() {
@@ -1054,6 +1081,12 @@ osmManager.init(`${import.meta.env.VITE_CDN_BASE ?? ''}/osm/manifest.json`);
 
 if (TERRAIN_ENABLED) {
   treeManager = new TreeManager({ scene, terrain: terrainManager });
+  pigeonManager = new PigeonManager({
+    scene,
+    terrain: terrainManager,
+    getBuildings: () => buildingMeshes,
+  });
+  window.pigeonManager = pigeonManager; // dev-only: lets DevTools poke the flock state
 }
 
 // Render-distance slider — scales building/OSM/terrain load radii together.
@@ -1133,21 +1166,60 @@ function updateLoadingIndicator(now) {
   else if (!paintShow && !paintHidden) _paintSaveEl.classList.add('hidden');
 }
 
+// Tiles the player is currently "near" poll on paintStore's fast loop (6 s);
+// everything else sweeps at 30 s. Recomputed at 1 Hz while pointer-locked:
+// standing building tile + standing terrain tile + the tile owning the cell
+// under the crosshair. While unlocked (menu / afk), pulls pause entirely so
+// idle tabs don't burn server requests indefinitely. hitCell raycasts, so
+// the 1 Hz cadence keeps per-frame cost negligible.
+let _lastActiveTilesUpdate = 0;
+
+function updateActiveTiles() {
+  const active = new Set();
+  const px = camera.position.x, pz = camera.position.z;
+  active.add(`cell_${Math.floor(px / 100)}_${Math.floor(pz / 100)}`);
+  const [u, v] = worldToGrid(px, pz);
+  active.add(`terrain_${Math.floor(u / 125)}_${Math.floor(v / 125)}`);
+
+  const h = paint.hitCell();
+  if (h?.cellKey) {
+    const tid = paintStore.tileIdOfCell(h.cellKey);
+    if (tid) active.add(tid);
+  }
+  paintStore.setActiveTiles(active);
+}
+
 function animate(now) {
   requestAnimationFrame(animate);
   if (now - _lastFrameTime < FRAME_INTERVAL) return;
   _lastFrameTime = now;
   tickFps(now);
 
+  if (now - _lastActiveTilesUpdate > 1000) {
+    _lastActiveTilesUpdate = now;
+    if (controls.isLocked) {
+      paintStore.setPaused(false);
+      updateActiveTiles();
+    } else {
+      paintStore.setPaused(true);
+    }
+  }
+
   tileManager.tick(camera.position.x, camera.position.z);
   osmManager.tick(camera.position.x, camera.position.z);
   terrainManager.tick(camera.position.x, camera.position.z);
   if (treeManager) treeManager.tick(camera.position.x, camera.position.z);
+  if (pigeonManager) {
+    pigeonManager.tick(camera.position.x, camera.position.z);
+    pigeonManager.update(now / 1000);
+  }
   if (!firstTileLoaded) tryFinishInitialLoad();
   if (teleporting) tryFinishTeleportLoad();
   updateViewFalloff(cullRadius());
   maybeCull();
   physics.updateMovement();
+  if (paintHeldButton === 0) paint.tryPaint();
+  else if (paintHeldButton === 2) paint.tryErase();
   ground.position.x = camera.position.x;
   ground.position.z = camera.position.z;
   camera.getWorldDirection(_minimapDir);

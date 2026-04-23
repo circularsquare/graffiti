@@ -9,3 +9,9 @@ routes = [
 [[r2_buckets]]
 binding     = "PAINT"
 bucket_name = "graffiti-paint"
+
+# Audit log for IP ↔ authorId, 14-day rolling TTL. The worker no-ops without
+# this binding, so it's safe to leave commented until the namespace exists.
+[[kv_namespaces]]
+binding = "AUDIT"
+id = "932e14929b144206bb33897473f1628a"

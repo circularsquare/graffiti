@@ -3,6 +3,7 @@ import { Font } from 'three/addons/loaders/FontLoader.js';
 import fontData from 'three/examples/fonts/helvetiker_bold.typeface.json';
 import { gridToWorld } from './geo.js';
 import { injectGridOverlay, enableGridExtensions, GRID_SHADER_CACHE_KEY } from './gridShader.js';
+import { emitStreetTrisXZ } from './streetGeometry.js';
 
 // OSM-specific load radius. Tight (100 m) because draped OSM geometry is
 // by far the heaviest per-tile payload in the client — ~3–20 MB of
@@ -26,26 +27,8 @@ const COARSE_REACH = 2;
 
 const MAX_CONCURRENT_LOADS = 3;
 
-// Approximate road width (metres) per OSM `highway` value. Defaults for
-// anything unlisted is DEFAULT_WIDTH.
-const TYPE_WIDTH = {
-  motorway: 11, motorway_link: 8,
-  trunk: 10,    trunk_link: 7,
-  primary: 9,   primary_link: 6,
-  secondary: 8, secondary_link: 5,
-  tertiary: 7,  tertiary_link: 5,
-  unclassified: 6,
-  residential: 6,
-  living_street: 5,
-  service: 4,
-  pedestrian: 4,
-  footway: 2.5,
-  cycleway: 2.5,
-  path: 2,
-  steps: 2,
-  track: 3,
-};
-const DEFAULT_WIDTH = 5;
+// Street width table + ribbon tessellation live in ./streetGeometry.js so the
+// flat-mode builder here and the draped builder in osmWorker.js can't drift.
 
 // Y stagger for the flat-mode mesh stack — unused in terrain mode (the
 // canvas texture composites into the terrain shader instead).
@@ -787,8 +770,21 @@ export class OsmManager {
    * `bounds` is expected in WORLD space. Callers (main.js::onTerrainLoaded)
    * convert from terrain's grid-space bounds via gridToWorld corners first.
    */
-  redrapeOverBounds(bounds) {
+  redrapeOverBounds(bounds, gridBounds) {
     if (!this._terrain) return;
+    // Grid-space block range of the terrain tile that just landed — used by
+    // `_drapeIntoPositions` to skip verts owned by neighbouring tiles. Falls
+    // back to a null range (process everything) if the caller didn't supply
+    // gridBounds, preserving the pre-D behaviour for older callers.
+    let blockRange = null;
+    if (gridBounds) {
+      blockRange = {
+        gxMin: Math.round(gridBounds.minX / BLOCK_STEP),
+        gxMax: Math.round(gridBounds.maxX / BLOCK_STEP),
+        gzMin: Math.round(gridBounds.minZ / BLOCK_STEP),
+        gzMax: Math.round(gridBounds.maxZ / BLOCK_STEP),
+      };
+    }
     for (const tile of this._tiles.values()) {
       if (tile.status !== 'loaded') continue;
       const b = tile.bounds;
@@ -797,7 +793,7 @@ export class OsmManager {
 
       if (tile.drapeComplete) {
         if (tile.drapables) {
-          for (const drap of tile.drapables) _redrapeMesh(drap, this._terrain);
+          for (const drap of tile.drapables) _redrapeMesh(drap, this._terrain, blockRange);
         }
       } else {
         // Full rebuild — drape was incomplete at last build. _buildTileMeshes
@@ -981,8 +977,18 @@ function _finalizeDrapedMesh(xzOwn, material, renderOrder, terrain, yOffset, dra
 //         0.0 = SW half (tx ≤ tz), 1.0 = NE half (tx > tz).
 //   ≥ 2 → skirt vertex: look up one corner directly.
 //         2=NW, 3=NE, 4=SE, 5=SW of the block stored in slots [4..5].
-function _drapeIntoPositions(xzOwn, terrain, yOffset, positions) {
+//
+// `blockRange` (optional) narrows work to verts whose home block falls inside
+// [gxMin, gxMax) × [gzMin, gzMax). Used by redrape to skip verts whose Y
+// can't have changed because a different terrain tile owns their block. Omit
+// (or pass null) to process every vert — initial build uses the null path so
+// it populates the whole buffer.
+function _drapeIntoPositions(xzOwn, terrain, yOffset, positions, blockRange) {
   const vertCount = xzOwn.length / 7;
+  const gxMin = blockRange ? blockRange.gxMin : 0;
+  const gxMax = blockRange ? blockRange.gxMax : 0;
+  const gzMin = blockRange ? blockRange.gzMin : 0;
+  const gzMax = blockRange ? blockRange.gzMax : 0;
   for (let i = 0; i < vertCount; i++) {
     const b = i * 7;
     const posX     = xzOwn[b    ];
@@ -992,6 +998,15 @@ function _drapeIntoPositions(xzOwn, terrain, yOffset, positions) {
     const blockGx  = xzOwn[b + 4];
     const blockGz  = xzOwn[b + 5];
     const typeFlag = xzOwn[b + 6];
+
+    // Skip verts outside the terrain tile that just landed — their Y is owned
+    // by a different terrain tile and didn't change. Leaves the existing
+    // `positions` entry as-is, which is correct because redrape calls hit an
+    // already-populated buffer.
+    if (blockRange &&
+        (blockGx < gxMin || blockGx >= gxMax || blockGz < gzMin || blockGz >= gzMax)) {
+      continue;
+    }
 
     let y = yOffset;
     if (terrain) {
@@ -1052,9 +1067,9 @@ function _applyDrapeLayer(layer, topMat, skirtMat, renderOrder, terrain, yOffset
 // radius of streaming terrain fires it hundreds of times at hundreds of
 // KB each. The initial normals (computed at mesh build) stay close
 // enough as Y values shift by a few cm from the initial guess.
-function _redrapeMesh({ mesh, xz, yOffset }, terrain) {
+function _redrapeMesh({ mesh, xz, yOffset }, terrain, blockRange) {
   const pos = mesh.geometry.attributes.position;
-  _drapeIntoPositions(xz, terrain, yOffset, pos.array);
+  _drapeIntoPositions(xz, terrain, yOffset, pos.array, blockRange);
   pos.needsUpdate = true;
 }
 
@@ -1100,106 +1115,13 @@ function _buildPolygonMesh(polygons, y, material, renderOrder) {
   return mesh;
 }
 
-// Street polylines → extruded ribbon with miter joins at each interior
-// vertex. Without joins, adjacent rectangles leave V-shaped gaps on the
-// outside of a turn — very visible on curved roads approximated by short
-// straight segments. Writes 2 triangles × 3 verts × 2 floats = 12 floats
-// per segment into `outXZ` (pairs of x,z in triangle order). Used by the
-// flat-mode geometry builder (`_buildStreetMesh`). The terrain-mode drape
-// path duplicates this function inside osmWorker.js so main doesn't have
-// to tessellate.
-function _emitStreetTrisXZ(streets, outXZ) {
-  const offX = [];
-  const offZ = [];
-  for (const s of streets) {
-    const width = TYPE_WIDTH[s.type] ?? DEFAULT_WIDTH;
-    const half  = width * 0.5;
-    const endExtend = width * 0.1;
-    const pts  = s.points;
-    if (!pts || pts.length < 2) continue;
-    const N = pts.length;
-    offX.length = N;
-    offZ.length = N;
-
-    for (let i = 0; i < N; i++) {
-      let inX = 0,  inZ = 0;
-      let outX = 0, outZ = 0;
-      let hasIn = false, hasOut = false;
-      if (i > 0) {
-        const dx = pts[i][0] - pts[i - 1][0];
-        const dz = pts[i][1] - pts[i - 1][1];
-        const len = Math.hypot(dx, dz);
-        if (len > 1e-6) { inX = dx / len; inZ = dz / len; hasIn = true; }
-      }
-      if (i < N - 1) {
-        const dx = pts[i + 1][0] - pts[i][0];
-        const dz = pts[i + 1][1] - pts[i][1];
-        const len = Math.hypot(dx, dz);
-        if (len > 1e-6) { outX = dx / len; outZ = dz / len; hasOut = true; }
-      }
-
-      let tx, tz;
-      if (hasIn && hasOut) { tx = inX + outX; tz = inZ + outZ; }
-      else if (hasIn)      { tx = inX;        tz = inZ; }
-      else                 { tx = outX;       tz = outZ; }
-      const tlen = Math.hypot(tx, tz);
-      if (tlen < 1e-6) {
-        tx = hasOut ? outX : inX;
-        tz = hasOut ? outZ : inZ;
-      } else {
-        tx /= tlen; tz /= tlen;
-      }
-      const px = -tz, pz = tx;
-
-      let miter = half;
-      if (hasIn && hasOut) {
-        const inPx = -inZ, inPz = inX;
-        const c = px * inPx + pz * inPz;
-        if (Math.abs(c) > 0.2) miter = half / c;
-        else                   miter = (c >= 0 ? 4 : -4) * half;
-      }
-      const maxMiter = 4 * half;
-      if (miter >  maxMiter) miter =  maxMiter;
-      if (miter < -maxMiter) miter = -maxMiter;
-
-      offX[i] = px * miter;
-      offZ[i] = pz * miter;
-    }
-
-    for (let i = 0; i < N - 1; i++) {
-      let x0 = pts[i][0],     z0 = pts[i][1];
-      let x1 = pts[i + 1][0], z1 = pts[i + 1][1];
-      if (i === 0) {
-        const dx = pts[1][0] - pts[0][0], dz = pts[1][1] - pts[0][1];
-        const len = Math.hypot(dx, dz);
-        if (len > 1e-6) { x0 -= (dx / len) * endExtend; z0 -= (dz / len) * endExtend; }
-      }
-      if (i + 1 === N - 1) {
-        const dx = pts[N - 1][0] - pts[N - 2][0], dz = pts[N - 1][1] - pts[N - 2][1];
-        const len = Math.hypot(dx, dz);
-        if (len > 1e-6) { x1 += (dx / len) * endExtend; z1 += (dz / len) * endExtend; }
-      }
-      const o0x = offX[i],     o0z = offZ[i];
-      const o1x = offX[i + 1], o1z = offZ[i + 1];
-
-      outXZ.push(
-        x0 + o0x, z0 + o0z,
-        x0 - o0x, z0 - o0z,
-        x1 - o1x, z1 - o1z,
-        x0 + o0x, z0 + o0z,
-        x1 - o1x, z1 - o1z,
-        x1 + o1x, z1 + o1z,
-      );
-    }
-  }
-}
-
-// Flat-mode wrapper around `_emitStreetTrisXZ`: plants every vertex at the
-// given Y plane. Terrain mode uses `_buildDrapedStreetMesh` instead.
+// Flat-mode wrapper around emitStreetTrisXZ (see ./streetGeometry.js): plants
+// every vertex at the given Y plane. Terrain mode uses `_buildDrapedStreetMesh`
+// instead, which runs the same tessellation inside osmWorker.js.
 function _buildStreetMesh(streets, y, material, renderOrder) {
   if (!streets.length) return null;
   const xz = [];
-  _emitStreetTrisXZ(streets, xz);
+  emitStreetTrisXZ(streets, xz);
   if (xz.length === 0) return null;
   const vertCount = xz.length / 2;
   const positions = new Float32Array(vertCount * 3);

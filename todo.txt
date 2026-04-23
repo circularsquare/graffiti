@@ -5,6 +5,8 @@ deploy (anita.garden):
   - new/updated tiles (public/): rclone copy public/ r2:graffiti-static --progress --transfers 16 --checkers 32
   - worker change (worker/):     cd worker && npx wrangler deploy
 
+
+
 - add bridges...
   - statue of liberty
   - trains??
@@ -14,19 +16,19 @@ deploy (anita.garden):
 - topography
   - terrain 1m?
 
-- just have all tiles render on both sides?  or side facing player?
-- undo button
-- make undo undo more
-
 - accounts / id tracking 
 - mobile controls 
 - favicon, link pictures, title
 - have controls always visible 
-- online count 
-- periodic refresh to load other peoples updates?
+- online count
+- periodic refresh to load other peoples updates?  [done 2026-04-22 — server-side cell-diff PATCH + 5s active / 20s idle pull]
 - colors different on apple?
 
 - glitch through walls if flying fast
+shift tab 
+
+dont drape far stuff
+
 
 
 

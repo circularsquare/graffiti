@@ -46,6 +46,12 @@ MIN_HEIGHT_DM =  40   # drop sub-4 m detections (shrubs / small ornamentals / Li
 THIN_FRACTION = 0.5   # keep this fraction of survivors (cheap density control)
 THIN_SEED     = 42    # deterministic — same build always picks the same subset
 
+# Must match TreeManager.js — used to compute the rendered canopy radius for
+# the ground-tree wall-clip filter below.
+SIZE_SCALE   = 0.8
+MAX_CANOPY_R = 5
+WALL_BUFFER  = 0.23   # extra clearance beyond rendered canopy so trees don't kiss walls
+
 FIDI_BBOX = dict(south=40.695, north=40.730, west=-74.025, east=-73.985)
 
 BOROUGHS = ['BronxP', 'BrooklynP', 'ManhP', 'QueensP', 'StateIP']
@@ -170,6 +176,51 @@ def roof_y_at(x, z, triangles, index):
     return float(ys.max())
 
 
+def tree_clips_building(x, z, r, triangles, index):
+    """Return True if the circle at (x,z) with radius r intersects any building
+    footprint (roof triangle in XZ). Used to drop ground trees whose canopy
+    would poke through a wall — their centre is either inside a footprint,
+    or close enough to an edge that the sphere overlaps the cliff face."""
+    # Canopy radii are ≤ MAX_CANOPY_R (5 m), INDEX_CELL_SIZE is 50 m, so the
+    # query spans at most a 2×2 cell block. Expand on both axes to cover the
+    # case where the tree sits near a cell boundary.
+    gx_min = int(math.floor((x - r) / INDEX_CELL_SIZE))
+    gx_max = int(math.floor((x + r) / INDEX_CELL_SIZE))
+    gz_min = int(math.floor((z - r) / INDEX_CELL_SIZE))
+    gz_max = int(math.floor((z + r) / INDEX_CELL_SIZE))
+    cells = []
+    for gx in range(gx_min, gx_max + 1):
+        for gz in range(gz_min, gz_max + 1):
+            c = index.get((gx, gz))
+            if c is not None:
+                cells.append(c)
+    if not cells:
+        return False
+    # Triangles whose bbox spans multiple cells appear in each — dedup so the
+    # vectorised checks don't do duplicate work.
+    cand = np.unique(np.concatenate(cells))
+    t = triangles[cand]
+    x0 = t[:, 0]; z0 = t[:, 2]
+    x1 = t[:, 3]; z1 = t[:, 5]
+    x2 = t[:, 6]; z2 = t[:, 8]
+
+    # Centre inside footprint → clip (distance would be 0).
+    d = (z1 - z2) * (x0 - x2) + (x2 - x1) * (z0 - z2)
+    safe = d != 0
+    d_safe = np.where(safe, d, 1.0)
+    a = ((z1 - z2) * (x - x2) + (x2 - x1) * (z - z2)) / d_safe
+    b = ((z2 - z0) * (x - x2) + (x0 - x2) * (z - z2)) / d_safe
+    c = 1.0 - a - b
+    if np.any(safe & (a >= 0) & (b >= 0) & (c >= 0)):
+        return True
+
+    # Outside any triangle but close to an edge → still clipping the wall.
+    d01 = _seg_dist_xz(x, z, x0, z0, x1, z1)
+    d12 = _seg_dist_xz(x, z, x1, z1, x2, z2)
+    d20 = _seg_dist_xz(x, z, x2, z2, x0, z0)
+    return bool(np.any(np.minimum(np.minimum(d01, d12), d20) < r))
+
+
 def main():
     parser = argparse.ArgumentParser()
     parser.add_argument('--bbox', choices=['fidi'], default=None,
@@ -200,6 +251,7 @@ def main():
     n_total  = 0
     n_keep   = 0
     n_roof   = 0
+    n_clip   = 0
 
     for boro in BOROUGHS:
         input_path = os.path.join(shp_dir, boro)
@@ -237,6 +289,7 @@ def main():
         print(f'  {nk:,} after filter + thin; placing …')
 
         boro_roof = 0
+        boro_clip = 0
         for i in np.where(keep)[0]:
             x    = float(world_x[i])
             z    = float(world_z[i])
@@ -246,13 +299,20 @@ def main():
             y_abs = roof_y_at(x, z, roof_tris, roof_index)
             if y_abs > 0:
                 boro_roof += 1
+            else:
+                # Ground tree: drop if its rendered canopy would overlap a wall.
+                canopy_r = min(rr, MAX_CANOPY_R) * SIZE_SCALE + WALL_BUFFER
+                if tree_clips_building(x, z, canopy_r, roof_tris, roof_index):
+                    boro_clip += 1
+                    continue
             gx = int(math.floor(x / CELL_SIZE))
             gz = int(math.floor(z / CELL_SIZE))
             cells[(gx, gz)].extend([
                 round(x, 1), round(z, 1), round(h, 1), round(rr, 1), round(y_abs, 1),
             ])
         n_roof += boro_roof
-        print(f'  {boro_roof:,} of those landed on a rooftop')
+        n_clip += boro_clip
+        print(f'  {boro_roof:,} of those landed on a rooftop; {boro_clip:,} dropped for wall clearance')
 
     total_bytes = 0
     for (gx, gz), flat in cells.items():
@@ -261,8 +321,8 @@ def main():
             json.dump(flat, f, separators=(',', ':'))
         total_bytes += os.path.getsize(path)
 
-    print(f'Wrote {n_keep:,} trees ({n_roof:,} rooftop) across {len(cells):,} tiles → '
-          f'{output_dir}/ ({total_bytes / 1_000_000:.1f} MB raw)')
+    print(f'Wrote {n_keep - n_clip:,} trees ({n_roof:,} rooftop, {n_clip:,} dropped for wall clearance) '
+          f'across {len(cells):,} tiles → {output_dir}/ ({total_bytes / 1_000_000:.1f} MB raw)')
 
 
 if __name__ == '__main__':
