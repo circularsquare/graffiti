@@ -24,6 +24,23 @@ const SEED_COMPLETE_KEY = '__seed_complete__';
 // yields a fresh identity — that's intended; anything stronger needs a login.
 const AUTHOR_ID_KEY = 'graffiti_author_id';
 
+/** Retry a fetch on connection-level failures (DNS, TCP, TLS — surface as
+ *  TypeError from fetch()). Non-ok responses pass through unchanged on the
+ *  first try. Used for the startup paint + bucket GETs so a brief wifi blip
+ *  doesn't lose paint data for 30s until the pull loop picks it up. */
+async function fetchWithRetry(url, init) {
+  const delays = [500, 2000];
+  let lastErr;
+  for (let i = 0; i <= delays.length; i++) {
+    try { return await fetch(url, init); }
+    catch (e) {
+      lastErr = e;
+      if (i < delays.length) await new Promise(r => setTimeout(r, delays[i]));
+    }
+  }
+  throw lastErr;
+}
+
 function loadOrCreateAuthorId() {
   try {
     const existing = localStorage.getItem(AUTHOR_ID_KEY);
@@ -152,7 +169,7 @@ class PaintStore {
 
     let payload, etag;
     try {
-      const res = await fetch(`${TILE_ENDPOINT}/${encodeURIComponent(tileId)}`);
+      const res = await fetchWithRetry(`${TILE_ENDPOINT}/${encodeURIComponent(tileId)}`);
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       etag    = res.headers.get('etag');
       payload = await res.json();
@@ -434,7 +451,7 @@ class PaintStore {
    */
   async _syncBucketOnInit() {
     try {
-      const res = await fetch(`${BUCKET_ENDPOINT}?author=${encodeURIComponent(this._authorId)}`);
+      const res = await fetchWithRetry(`${BUCKET_ENDPOINT}?author=${encodeURIComponent(this._authorId)}`);
       if (res.ok) this._syncBucketFromResponse(res);
     } catch (e) {
       console.warn('paintStore: bucket sync failed:', e);

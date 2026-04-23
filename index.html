@@ -17,7 +17,7 @@
   <link rel="icon" type="image/png" href="/favicon.png">
   <link rel="preconnect" href="https://fonts.googleapis.com">
   <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
-  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;700&family=Silkscreen&display=swap">
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;700&display=swap">
   <title>graffiti nyc</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
@@ -52,20 +52,24 @@
       gap: 12px;
     }
     .overlay-title {
-      font-family: 'Silkscreen', monospace;
-      font-size: 36px;
-      font-weight: 400;
-      letter-spacing: 0;
+      width: min(242px, 80vw);
+      aspect-ratio: 484 / 82;
+      display: block;
+      background-color: var(--title-color, #edefe2);
+      -webkit-mask: url('/title.png') center / contain no-repeat;
+              mask: url('/title.png') center / contain no-repeat;
+      image-rendering: pixelated;
+      image-rendering: crisp-edges;
     }
     #overlay-prompt { font-size: 16px; opacity: 0.85; }
 
     #overlay-controls {
       position: fixed;
       bottom: 80px;
-      right: 24px;
+      right: 16px;
       display: flex;
       gap: 22px;
-      padding: 12px 16px;
+      padding: 16px 16px;
       font-family: 'Nunito', system-ui, sans-serif;
       font-size: 12px;
       color: #fff;
@@ -159,9 +163,13 @@
     }
     #render-distance {
       position: fixed;
-      bottom: 16px; right: 168px;
+      bottom: 16px;
+      /* Sits immediately left of #paint-bank with an 8px gap: 16px viewport
+         gutter + 108px paint-bank width + 8px gap = 132px. */
+      right: 140px;
       width: 234px;
-      padding: 6px 8px;
+      height: 50px;
+      padding: 4px 8px;
       font-family: 'Nunito', system-ui, sans-serif;
       font-size: 11px;
       color: rgba(255,255,255,0.9);
@@ -172,7 +180,8 @@
       z-index: 10;
       display: none;  /* hidden during locked gameplay — you can't drag it anyway */
       flex-direction: column;
-      gap: 4px;
+      justify-content: center;
+      gap: 2px;
     }
     /* Reveal only when the overlay is up and not mid-load (pause menu / map mode). */
     #overlay:not(.hidden):not(.loading) ~ #render-distance { display: flex; }
@@ -195,9 +204,11 @@
       position: fixed;
       bottom: 16px;
       right: 16px;
-      padding: 6px 10px;
+      width: 112px;
+      height: 50px;
+      padding: 4px 8px;
       font-family: 'Nunito', system-ui, sans-serif;
-      font-size: 13px;
+      font-size: 12px;
       color: rgba(255,255,255,0.95);
       background: rgba(0,0,0,0.55);
       border: 2px solid rgba(255,255,255,0.25);
@@ -206,13 +217,13 @@
       z-index: 10;
       display: flex;
       flex-direction: column;
-      gap: 2px;
+      justify-content: center;
+      gap: 1px;
       align-items: flex-end;
-      min-width: 140px;
     }
-    #paint-bank .bank-count { font-size: 14px; letter-spacing: 0.02em; }
+    #paint-bank .bank-count { font-size: 13px; letter-spacing: 0.02em; }
     #paint-bank .bank-refill {
-      font-size: 11px;
+      font-size: 10px;
       color: rgba(255,255,255,0.6);
     }
     #paint-bank.empty { border-color: rgba(255,120,100,0.8); }
@@ -414,7 +425,7 @@
   <div id="mobile-warning">note: this website is not usable on mobile</div>
   <div id="overlay" class="loading startup">
     <div id="overlay-main">
-      <div class="overlay-title">graffiti nyc</div>
+      <div class="overlay-title" role="img" aria-label="graffiti nyc"></div>
       <div id="overlay-prompt">loading data...</div>
     </div>
   </div>
@@ -438,7 +449,7 @@
       <div class="ctrl-row"><span class="ctrl-key">click</span><span>paint</span></div>
       <div class="ctrl-row"><span class="ctrl-key">r click</span><span>erase</span></div>
       <div class="ctrl-row"><span class="ctrl-key">tab</span><span>cycle color</span></div>
-      <div class="ctrl-row"><span class="ctrl-key">C</span><span>color picker</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">C</span><span>pick color</span></div>
       <div class="ctrl-row"><span class="ctrl-key">I</span><span>eyedrop</span></div>
       <div class="ctrl-row"><span class="ctrl-key">ctrl+Z</span><span>undo</span></div>
     </div>
@@ -475,8 +486,9 @@
   <div id="info-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="info-title">
     <div class="info-content">
       <button class="info-close" aria-label="Close">&times;</button>
-      <h2 id="info-title">Graffiti NYC</h2>
-      <p>Paint every surface in the city!</p>
+      <h2 id="info-title">graffiti nyc</h2>
+      <p>Paint every surface in New York City!</p>
+      <p>Your paint will be visible forever. Unless someone paints over it. Please don't paint anything inappropriate or i will ban you!! &gt;_&lt; </p>
 
       <p>Data sources:</p>
       <ul>
@@ -485,9 +497,10 @@
         <li>Street map: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> via Overpass</li>
       </ul>
 
-      <p>Rendered in-browser with Three.js / WebGL. Each building face is split into 1m paintable cells. Other painters' strokes usually show up within a few seconds.</p>
+      <p>Rendered with Three.js and WebGL. Each building face is split into 1m paintable cells. The terrain is 2m cells. Other people's paints will not show live, but will generally update within ~10 seconds. I apologize if the site runs slowly, a fast internet connection and some gpu are necessary. </p>
 
-      <p>more projects: <a href="https://anita.garden/projects" target="_blank" rel="noopener">anita.garden/projects</a></p>
+
+      <p>made by <a href="https://anita.garden/projects" target="_blank" rel="noopener">anita</a>!</p>
     </div>
   </div>
   <div id="render-distance">

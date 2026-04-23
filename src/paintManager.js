@@ -115,22 +115,15 @@ function clipHalfPlane(poly, axisIdx, value, sign) {
  *   1. Normal direction — dot product with cellNormal must be > 0.7 (rejects perpendicular/opposite walls)
  *   2. Depth — triangle centroid must be within COPLANAR_TOL of the hit plane dot(p, n) = planeD
  *      (rejects parallel faces that are set back, e.g. ledges/steps behind the clicked surface)
- * Returns flat vertex array (x,y,z triples), offset 5 cm along cellNormal.
+ * Returns flat vertex array (x,y,z triples), coplanar with the face — the paint
+ * material's polygonOffset handles z-fighting.
  */
-function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD, meshType, cameraPos) {
+function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD, meshType) {
   const pos = srcMesh.geometry.attributes.position.array;
   const uv  = srcMesh.geometry.attributes.uv.array;
   const verts = [];
-  const OFFSET        = 0.012;
   const COPLANAR_TOL  = 0.15; // 15 cm — rejects steps/ledges, accepts tessellation seams
   const cn = [cellNormal.x, cellNormal.y, cellNormal.z];
-
-  // Always offset toward the player regardless of face winding. Convert camera
-  // to mesh local space (tiles are translation-only, so this is just a shift),
-  // then check which side of the face plane it's on.
-  const camLocal = cameraPos.clone();
-  srcMesh.worldToLocal(camLocal);
-  const offsetSign = (dot3([camLocal.x, camLocal.y, camLocal.z], cn) - planeD) >= 0 ? 1 : -1;
 
   // When meshType is known, iterate only that half of the merged mesh (roof
   // tris vs wall tris live in contiguous ranges — see tileWorker
@@ -174,14 +167,9 @@ function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD, meshType, 
     poly = clipHalfPlane(poly, 1, cellV + 1, -1);
     if (poly.length < 3) continue;
 
-    // Fan-triangulate and offset toward the player (offsetSign accounts for winding)
     for (let k = 1; k < poly.length - 1; k++) {
       for (const v of [poly[0], poly[k], poly[k+1]]) {
-        verts.push(
-          v.pos[0] + cn[0]*OFFSET*offsetSign,
-          v.pos[1] + cn[1]*OFFSET*offsetSign,
-          v.pos[2] + cn[2]*OFFSET*offsetSign,
-        );
+        verts.push(v.pos[0], v.pos[1], v.pos[2]);
       }
     }
   }
@@ -192,7 +180,7 @@ function buildCellGeometry(srcMesh, cellU, cellV, cellNormal, planeD, meshType, 
 // Each face's 6 vertices (2 tris) already exist in the terrain mesh's
 // position buffer; the worker emits quads in a known order and TerrainManager
 // precomputes a (meshType, ix, iz) → first-vertex-index lookup at tile load.
-// We just copy the 18 floats out and offset by the face normal × OFFSET.
+// Paint is coplanar with the terrain face — polygonOffset handles z-fighting.
 // Empty Float32Array if the face isn't emitted on this block (e.g. a cliff
 // side pointing at a taller neighbour), which lets the rebuild loop skip it.
 function buildTerrainCellGeometry(state, meshType, ix, iz, iy) {
@@ -202,21 +190,13 @@ function buildTerrainCellGeometry(state, meshType, ix, iz, iy) {
   const vi = faceIdx[iz * state.res + ix];
   if (vi < 0) return new Float32Array(0);
 
-  const OFFSET = 0.012;
   const pos = state.mesh.geometry.attributes.position.array;
-  const nrm = state.mesh.geometry.attributes.normal.array;
-  const nx = nrm[vi * 3], ny = nrm[vi * 3 + 1], nz = nrm[vi * 3 + 2];
-  const ox = nx * OFFSET, oy = ny * OFFSET, oz = nz * OFFSET;
   const base = vi * 3;
 
   // Top face: single cell per (ix, iz), copy the 2-tri quad as-is.
   if (meshType === 'top') {
     const out = new Float32Array(18);
-    for (let k = 0; k < 6; k++) {
-      out[k * 3    ] = pos[base + k * 3    ] + ox;
-      out[k * 3 + 1] = pos[base + k * 3 + 1] + oy;
-      out[k * 3 + 2] = pos[base + k * 3 + 2] + oz;
-    }
+    for (let k = 0; k < 18; k++) out[k] = pos[base + k];
     return out;
   }
 
@@ -268,9 +248,9 @@ function buildTerrainCellGeometry(state, meshType, ix, iz, iy) {
   const out = new Float32Array(triCount * 9);
   let o = 0;
   const writeVert = (p) => {
-    out[o++] = p[0] + ox;
-    out[o++] = p[1] + oy;
-    out[o++] = p[2] + oz;
+    out[o++] = p[0];
+    out[o++] = p[1];
+    out[o++] = p[2];
   };
   for (let i = 1; i <= triCount; i++) {
     writeVert(clipped[0]);
@@ -375,6 +355,7 @@ export function createPaintManager({
     activeColorIdx = i;
     swatchEls[activeColorIdx].classList.add('active');
     crosshairEl.style.background = COLORS[i].css;
+    document.documentElement.style.setProperty('--title-color', COLORS[i].css);
   }
   setActiveColor(activeColorIdx); // sync crosshair to initial color
 
@@ -553,7 +534,7 @@ export function createPaintManager({
         if (!cellGeomCache.has(k)) {
           const parts = k.slice(prefix.length).split(':');
           const cu = parseInt(parts[0]), cv = parseInt(parts[1]);
-          const verts = buildCellGeometry(srcMesh, cu, cv, new THREE.Vector3(...v.normal), v.planeD, meshType, camera.position);
+          const verts = buildCellGeometry(srcMesh, cu, cv, new THREE.Vector3(...v.normal), v.planeD, meshType);
           cellGeomCache.set(k, new Float32Array(verts));
           let geomSet = cellGeomByBuilding.get(buildingKey);
           if (!geomSet) { geomSet = new Set(); cellGeomByBuilding.set(buildingKey, geomSet); }

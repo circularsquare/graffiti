@@ -52,7 +52,6 @@
 //     cellGroups: Array<Array<cellKey>>  // paint-groups of size >= 2; singletons implicit }
 
 const GRID_SIZE    = 1.0;
-const OFFSET       = 0.025; // 2.5 cm outward offset along face normal (keep in sync with main.js)
 const COPLANAR_TOL = 0.15;  // 15 cm — rejects stepped/ledged faces from matching a cell
 // Face-equivalence thresholds. Two values per axis (normal + distance), used
 // in three combinations across three passes:
@@ -487,29 +486,6 @@ function makeMeshData(flatVerts, id, floorY, horizU, meshType, shiftY) {
   verts = dedupTriangles(verts, id, meshType);
 
   const faceInfo = extractFaces(verts);
-
-  // Flag faces whose outside-direction we can't trust. Two cues:
-  //   (1) face's horizontal normal component points toward the mesh bbox
-  //       center — a correctly-wound wall's outside points away from center.
-  //   (2) face tilts more than ~10° below horizontal (ny < -sin 10°) — real
-  //       exterior surfaces don't face downward at any meaningful angle.
-  // Cell geometry (worker scanCells + main.js buildCellGeometry) emits the
-  // paint polygon on both sides of the face plane when this is set, so the
-  // overlay is visible regardless of winding.
-  const bboxCx = (minX + maxX) / 2;
-  const bboxCz = (minZ + maxZ) / 2;
-  for (let fi = 0; fi < faceInfo.faces.length; fi++) {
-    const f = faceInfo.faces[fi];
-    if (!f) continue;
-    const n = f.normal;
-    let sus = n[1] < -0.174; // sin(10°)
-    if (!sus && (n[0] * n[0] + n[2] * n[2]) > 1e-6) {
-      const dx = bboxCx - f.centroid[0];
-      const dz = bboxCz - f.centroid[2];
-      if (n[0] * dx + n[2] * dz > 0) sus = true;
-    }
-    f.suspicious = sus ? 1 : 0;
-  }
 
   // ── DIAGNOSTIC — strip once we know ─────────────────────────────────────
   // For each face, compute the spread of per-triangle planeD values
@@ -986,23 +962,9 @@ function scanCells(pos, uv, buildingId, meshType, seedConfig, faces, triFace, ho
         poly      = clipHalfPlane(poly, 1, cv + 1, -1);
         if (poly.length < 3) continue;
 
-        // Offset along the face's normal (not the triangle's) so adjacent
-        // clipped polygons within the same face share edges cleanly. If the
-        // face was flagged suspicious in makeMeshData, also emit a mirror
-        // copy offset the other way — the data's outside direction can't be
-        // trusted there, so we cover both possibilities.
-        const ox = faceNormal[0] * OFFSET;
-        const oy = faceNormal[1] * OFFSET;
-        const oz = faceNormal[2] * OFFSET;
-        const doubleSide = face.suspicious === 1;
         for (let k = 1; k < poly.length - 1; k++) {
           for (const v of [poly[0], poly[k], poly[k + 1]]) {
-            entry.verts.push(v.pos[0] + ox, v.pos[1] + oy, v.pos[2] + oz);
-          }
-          if (doubleSide) {
-            for (const v of [poly[0], poly[k], poly[k + 1]]) {
-              entry.verts.push(v.pos[0] - ox, v.pos[1] - oy, v.pos[2] - oz);
-            }
+            entry.verts.push(v.pos[0], v.pos[1], v.pos[2]);
           }
         }
       }
@@ -1459,31 +1421,6 @@ function buildCellGroups(discovered, horizU) {
       break;
     }
     // If not joined, sliver stays ungrouped (acts as singleton at runtime).
-  }
-
-  // Unified-normal offset within each group. Cell polygons left scanCells
-  // already shifted 2.5 cm along their own face normal; for cells whose
-  // adjacent group-mate lives on a different face (e.g. cylinder facets),
-  // that per-face offset opens a ~6 mm V-gap at the shared edge where the
-  // building's face-border shader peeks through. Re-offset every grouped
-  // cell onto the group anchor's normal so adjacent members' offset edges
-  // coincide exactly. Singletons are untouched.
-  for (const g of groups) {
-    if (g.members.size < 2) continue;
-    const ax = g.anchorNormal[0], ay = g.anchorNormal[1], az = g.anchorNormal[2];
-    for (const memberKey of g.members) {
-      const mn = cellInfo.get(memberKey).normal;
-      const dx = (ax - mn[0]) * OFFSET;
-      const dy = (ay - mn[1]) * OFFSET;
-      const dz = (az - mn[2]) * OFFSET;
-      if (dx === 0 && dy === 0 && dz === 0) continue; // anchor itself
-      const verts = discovered.get(memberKey).verts;
-      for (let i = 0; i < verts.length; i += 3) {
-        verts[i]     += dx;
-        verts[i + 1] += dy;
-        verts[i + 2] += dz;
-      }
-    }
   }
 
   const out = [];
