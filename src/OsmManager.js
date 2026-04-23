@@ -36,7 +36,10 @@ const Y_LAND         = 0.02;
 const Y_WATER        = 0.10;
 const Y_GREEN        = 0.05;
 const Y_STREET       = 0.15;
-const Y_STREET_LABEL = 0.50;
+// Label vertices are individually draped to the terrain surface, so this is
+// a small clearance above the street layer (DRAPE_Y_STREET ≈ 3 mm) and well
+// below paint (+25 mm) so graffiti still renders on top of street names.
+const Y_STREET_LABEL = 0.010;
 
 // Overlay colours used by both the flat-mode mesh materials below and the
 // terrain-mode draped meshes. Exported so TerrainManager can use LAND_COLOR
@@ -136,12 +139,32 @@ const SKIRT_OUT_STREET = 0.006;
 // Street-label tuning. Labels are built from real font glyph outlines via
 // ShapeGeometry so they stay crisp at any viewing distance — no texture,
 // no resolution ceiling.
-const LABEL_HEIGHT_M        = 2.5;
+const LABEL_HEIGHT_M        = 1.5;
 const MIN_LABELED_STREET_M  = 40;   // don't bother labelling tiny service stubs
 const MIN_LABEL_SCALE       = 0.45; // drop labels that would shrink below this to fit
+// Target spacing between labels along a single street's polyline. Used as the
+// stride for periodic placement; actual spacing is normalized so the first
+// and last labels sit `margin` from each end.
+const LABEL_REPEAT_M        = 150;
+// Proximity dedupe radii (centre-to-centre). OSM splits a single named road
+// into many short ways at every intersection, so the per-polyline stride
+// alone over-counts; LABEL_DEDUPE_SAME_NAME_M kills repeats of the same name
+// that pile up. LABEL_DEDUPE_ANY_M is the smaller fallback to avoid different
+// labels visually overlapping at intersections.
+const LABEL_DEDUPE_SAME_NAME_M = 100;
+const LABEL_DEDUPE_ANY_M       = 30;
 // Labels only render when the player is within this many metres of them —
 // at a distance they compress to unreadable scribble and waste fill rate.
-const LABEL_VISIBILITY_RANGE_M = 300;
+const LABEL_VISIBILITY_RANGE_M = 180;
+
+// Cliff-rejection: walk the label's footprint at LABEL_CLIFF_STEP_M intervals
+// and skip the label entirely if any adjacent pair of samples disagrees by
+// more than LABEL_CLIFF_DROP_M. A 0.20 m drop over a 0.10 m step is a 63°
+// apparent slope — implausible as a continuous street grade, so this reliably
+// fires on bake-induced block-edge cliffs without false-positives on real
+// hills.
+const LABEL_CLIFF_STEP_M = 0.10;
+const LABEL_CLIFF_DROP_M = 0.20;
 
 const _font = new Font(fontData);
 
@@ -642,8 +665,20 @@ export class OsmManager {
 
     const group = new THREE.Group();
     const labels = [];
-    if (this._showLabels) _buildStreetLabels(data.streets || [], group, this._terrain, labels);
+    const labelAnchors = [];
+    if (this._showLabels) {
+      // Collect already-accepted label anchors from every other loaded tile so
+      // proximity dedupe applies across tile seams. Without this, two same-name
+      // labels straddling a seam each pass independently.
+      const existingAnchors = [];
+      for (const other of this._tiles.values()) {
+        if (other === tile || !other.labelAnchors) continue;
+        for (const a of other.labelAnchors) existingAnchors.push(a);
+      }
+      _buildStreetLabels(data.streets || [], group, this._terrain, labels, existingAnchors, labelAnchors);
+    }
     tile.labels = labels;
+    tile.labelAnchors = labelAnchors;
 
     if (this._flatMode) {
       // Pre-terrain rendering path: flat stacked meshes at Y_LAND..Y_STREET.
@@ -707,6 +742,7 @@ export class OsmManager {
     }
     tile.drapables = null;
     tile.labels = null;
+    tile.labelAnchors = null;
   }
 
   _drainQueue() {
@@ -1149,7 +1185,10 @@ function _getLabelAsset(name) {
   if (entry) return entry;
 
   const shapes = _font.generateShapes(name, 1.0);
-  const geometry = new THREE.ShapeGeometry(shapes);
+  // curveSegments=3 (default 12) — labels draw at street-level scale where
+  // glyph curves never read smoother than ~3 segments anyway, and dropping
+  // it cuts triangle count by roughly 4×.
+  const geometry = new THREE.ShapeGeometry(shapes, 3);
   geometry.computeBoundingBox();
   const bb = geometry.boundingBox;
   // Capture extents in the glyph-native XY plane *before* transforming —
@@ -1169,58 +1208,174 @@ function _getLabelAsset(name) {
   return entry;
 }
 
-// For each named street, pick its longest segment and lay a flat label plane
-// along it. One mesh per street — the material/texture come from the shared
-// _labelCache, so repeat names across tiles add only geometry cost. Pushes
-// each created mesh into `outLabels` (with its anchor XZ stamped on userData)
-// so OsmManager.updateLabelVisibility can toggle them by player distance.
-function _buildStreetLabels(streets, parentGroup, terrain, outLabels) {
+// Walk the polyline and return (point, unit tangent) at arclength `s`.
+// Clamps to the endpoints so out-of-range queries from the cliff scan or
+// edge-of-label vertices don't NaN out — they just sit at the nearest end.
+function _pointAtArclen(pts, cum, s) {
+  if (s <= 0) {
+    const dxx = pts[1][0] - pts[0][0];
+    const dzz = pts[1][1] - pts[0][1];
+    const L = Math.hypot(dxx, dzz) || 1;
+    return { x: pts[0][0], z: pts[0][1], tx: dxx / L, tz: dzz / L };
+  }
+  const total = cum[cum.length - 1];
+  if (s >= total) {
+    const i = pts.length - 2;
+    const dxx = pts[i + 1][0] - pts[i][0];
+    const dzz = pts[i + 1][1] - pts[i][1];
+    const L = Math.hypot(dxx, dzz) || 1;
+    return { x: pts[i + 1][0], z: pts[i + 1][1], tx: dxx / L, tz: dzz / L };
+  }
+  // Linear scan — street polylines are short (typically <20 verts).
+  let i = 0;
+  while (i < cum.length - 2 && cum[i + 1] <= s) i++;
+  const segLen = cum[i + 1] - cum[i] || 1;
+  const t = (s - cum[i]) / segLen;
+  const dxx = pts[i + 1][0] - pts[i][0];
+  const dzz = pts[i + 1][1] - pts[i][1];
+  return {
+    x:  pts[i][0] + dxx * t,
+    z:  pts[i][1] + dzz * t,
+    tx: dxx / segLen,
+    tz: dzz / segLen,
+  };
+}
+
+// Place periodic labels along each named street's polyline. Done in three
+// passes:
+//   1. Generate cheap candidates per polyline at LABEL_REPEAT_M stride. Each
+//      candidate is just metadata + an on-curve anchor XZ.
+//   2. Sort candidates by polyline length (descending) so the most prominent
+//      stretch always wins, then proximity-dedupe: kill anything within
+//      LABEL_DEDUPE_SAME_NAME_M of an already-accepted same-name label, or
+//      within LABEL_DEDUPE_ANY_M of any accepted label. OSM splits long
+//      avenues into a way per intersection; the same-name radius collapses
+//      that pile-up. The any-name radius prevents different labels from
+//      visually colliding at intersections.
+//   3. For survivors, run the cliff scan and bend each glyph vertex onto its
+//      polyline (local-X → arclength offset, local-Z → perpendicular offset
+//      along the local tangent's normal N=(-Tz,Tx)), with per-vertex Y drape.
+function _buildStreetLabels(streets, parentGroup, terrain, outLabels, existingAnchors, outAnchors) {
+  // Pass 1: candidates.
+  const candidates = [];
   for (const s of streets) {
     if (!s.name) continue;
     const pts = s.points;
     if (!pts || pts.length < 2) continue;
 
-    // Longest segment — we anchor the label on the straightest-looking piece
-    // so the baseline lines up with the street rather than cutting a corner.
-    let bestLen2 = 0;
-    let bestIdx  = -1;
-    for (let i = 0; i < pts.length - 1; i++) {
-      const dx = pts[i + 1][0] - pts[i][0];
-      const dz = pts[i + 1][1] - pts[i][1];
-      const len2 = dx * dx + dz * dz;
-      if (len2 > bestLen2) { bestLen2 = len2; bestIdx = i; }
+    const cum = new Float64Array(pts.length);
+    for (let i = 1; i < pts.length; i++) {
+      const dxx = pts[i][0] - pts[i - 1][0];
+      const dzz = pts[i][1] - pts[i - 1][1];
+      cum[i] = cum[i - 1] + Math.hypot(dxx, dzz);
     }
-    if (bestIdx < 0 || bestLen2 < MIN_LABELED_STREET_M * MIN_LABELED_STREET_M) continue;
+    const totalLen = cum[cum.length - 1];
+    if (totalLen < MIN_LABELED_STREET_M) continue;
 
-    const p0  = pts[bestIdx];
-    const p1  = pts[bestIdx + 1];
-    const len = Math.sqrt(bestLen2);
-    let dx = (p1[0] - p0[0]) / len;
-    let dz = (p1[1] - p0[1]) / len;
-    // Flip direction so text reads right (+X side). Without this, half the
-    // labels in every tile would render upside-down when viewed north-up.
-    if (dx < 0 || (dx === 0 && dz < 0)) { dx = -dx; dz = -dz; }
-
-    const { geometry, width, height } = _getLabelAsset(s.name);
-    // Target "LABEL_HEIGHT_M tall" as a base scale; shrink further if the
-    // resulting run would overflow the segment.
+    const { width, height } = _getLabelAsset(s.name);
     const baseScale = LABEL_HEIGHT_M / height;
     let scale = baseScale;
-    const worldW = width * scale;
-    if (worldW > len * 0.85) scale *= (len * 0.85) / worldW;
+    const fullW = width * scale;
+    if (fullW > totalLen * 0.85) scale *= (totalLen * 0.85) / fullW;
     if (scale / baseScale < MIN_LABEL_SCALE) continue;
+    const worldW = width * scale;
+    const margin = worldW * 0.5;
+    const usableSpan = totalLen - 2 * margin;
+    if (usableSpan < 0) continue;
 
-    const mesh = new THREE.Mesh(geometry, LABEL_MAT);
-    const cx = (p0[0] + p1[0]) * 0.5;
-    const cz = (p0[1] + p1[1]) * 0.5;
-    mesh.position.set(cx, drapeY(terrain, cx, cz, Y_STREET_LABEL), cz);
-    mesh.rotation.y  = Math.atan2(-dz, dx);
-    mesh.scale.set(scale, scale, scale);
+    const n = Math.max(1, 1 + Math.round(usableSpan / LABEL_REPEAT_M));
+    const stride = n > 1 ? usableSpan / (n - 1) : 0;
+    for (let k = 0; k < n; k++) {
+      const centerS = margin + k * stride;
+      const ptMid = _pointAtArclen(pts, cum, centerS);
+      candidates.push({
+        name: s.name,
+        points: pts, cum, scale, margin, centerS,
+        anchorX: ptMid.x, anchorZ: ptMid.z,
+        priority: totalLen,
+      });
+    }
+  }
+
+  // Pass 2: priority sort + proximity dedupe. Existing anchors come from
+  // already-loaded tiles so seam-straddling duplicates get caught. Linear
+  // scan is fine — total accepted across the viewport is in the hundreds.
+  candidates.sort((a, b) => b.priority - a.priority);
+  const accepted = [];
+  const sameNameSq = LABEL_DEDUPE_SAME_NAME_M * LABEL_DEDUPE_SAME_NAME_M;
+  const anyNameSq  = LABEL_DEDUPE_ANY_M * LABEL_DEDUPE_ANY_M;
+  for (const c of candidates) {
+    let kill = false;
+    if (existingAnchors) {
+      for (const a of existingAnchors) {
+        const dx = c.anchorX - a.x;
+        const dz = c.anchorZ - a.z;
+        const d2 = dx * dx + dz * dz;
+        if (d2 < anyNameSq) { kill = true; break; }
+        if (a.name === c.name && d2 < sameNameSq) { kill = true; break; }
+      }
+    }
+    if (kill) continue;
+    for (const a of accepted) {
+      const dx = c.anchorX - a.anchorX;
+      const dz = c.anchorZ - a.anchorZ;
+      const d2 = dx * dx + dz * dz;
+      if (d2 < anyNameSq) { kill = true; break; }
+      if (a.name === c.name && d2 < sameNameSq) { kill = true; break; }
+    }
+    if (!kill) accepted.push(c);
+  }
+
+  // Pass 3: cliff scan, bend, drape, build mesh.
+  for (const c of accepted) {
+    const { name, points: pts, cum, scale, margin, centerS } = c;
+
+    let cliff = false;
+    const cliffSteps = Math.max(2, Math.ceil((margin * 2) / LABEL_CLIFF_STEP_M));
+    let prevY = 0;
+    for (let cs = 0; cs <= cliffSteps; cs++) {
+      const sp = (centerS - margin) + (margin * 2) * (cs / cliffSteps);
+      const pt = _pointAtArclen(pts, cum, sp);
+      const sy = drapeY(terrain, pt.x, pt.z, 0);
+      if (cs > 0 && Math.abs(sy - prevY) > LABEL_CLIFF_DROP_M) { cliff = true; break; }
+      prevY = sy;
+    }
+    if (cliff) continue;
+
+    // Reading direction: average tangent over the label's footprint. If the
+    // dominant tangent points in -X (or pure -Z), reverse the local coords
+    // so text reads upright from a +Y / north-up viewpoint.
+    const tA = _pointAtArclen(pts, cum, centerS - margin);
+    const tB = _pointAtArclen(pts, cum, centerS + margin);
+    const avgTx = (tA.tx + tB.tx) * 0.5;
+    const avgTz = (tA.tz + tB.tz) * 0.5;
+    const reverse = avgTx < 0 || (avgTx === 0 && avgTz < 0);
+
+    const { geometry } = _getLabelAsset(name);
+    const drapedGeo = geometry.clone();
+    const arr = drapedGeo.attributes.position.array;
+    for (let i = 0; i < arr.length; i += 3) {
+      let lx = arr[i]     * scale;
+      let lz = arr[i + 2] * scale;
+      if (reverse) { lx = -lx; lz = -lz; }
+      const pt = _pointAtArclen(pts, cum, centerS + lx);
+      const nx = -pt.tz, nz = pt.tx;
+      const wx = pt.x + lz * nx;
+      const wz = pt.z + lz * nz;
+      arr[i]     = wx;
+      arr[i + 1] = drapeY(terrain, wx, wz, Y_STREET_LABEL);
+      arr[i + 2] = wz;
+    }
+    drapedGeo.attributes.position.needsUpdate = true;
+    drapedGeo.computeBoundingSphere();
+
+    const mesh = new THREE.Mesh(drapedGeo, LABEL_MAT);
     mesh.renderOrder = 4;
-    mesh.userData.sharedGeometry = true;
-    mesh.userData.anchorX = cx;
-    mesh.userData.anchorZ = cz;
+    mesh.userData.sharedGeometry = false;
+    mesh.userData.anchorX = c.anchorX;
+    mesh.userData.anchorZ = c.anchorZ;
     parentGroup.add(mesh);
     outLabels.push(mesh);
+    if (outAnchors) outAnchors.push({ name: c.name, x: c.anchorX, z: c.anchorZ });
   }
 }

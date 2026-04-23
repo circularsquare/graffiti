@@ -6,7 +6,7 @@ import { TerrainManager } from './TerrainManager.js';
 import { TreeManager } from './TreeManager.js';
 import { PigeonManager } from './PigeonManager.js';
 import { paintStore } from './paintStore.js';
-import { gridToWorld, worldToGrid } from './geo.js';
+import { gridToWorld, worldToGrid, MANHATTAN_GRID_DEG } from './geo.js';
 import { createPhysics, WALK_HEIGHT } from './physics.js';
 import { createPaintManager } from './paintManager.js';
 import { tilesWithLandmarks, prepareLandmarks, landmarksReady, tileInjection } from './landmarks.js';
@@ -32,7 +32,23 @@ scene.background = new THREE.Color(0x9ab8d4);
 scene.fog = new THREE.FogExp2(0x9ab8d4, 0.003);
 
 const camera = new THREE.PerspectiveCamera(100, window.innerWidth / window.innerHeight, 0.25, 2000);
-camera.position.set(2215, 1.7, -5928); // Times Square (42nd St & 7th Ave) — default spawn
+
+// Fresh-spawn pool. `yawDeg` is a compass heading in degrees (CW from true
+// north); applied as a negative Y-Euler because negative Y rotation turns
+// the camera CW viewed from above. Add new locations freely — the random
+// pick below handles the rest. Tune if the view doesn't frame the subject.
+const SPAWN_LOCATIONS = [
+  // Times Square (42nd St & 7th Ave) — facing uptown along 7th Ave.
+  { name: 'Times Square',       x: 2215, y:  1.70, z: -5928, yawDeg: MANHATTAN_GRID_DEG },
+  // Flatiron — north of the building looking back south at the prow.
+  { name: 'Flatiron',           x: 1903, y: 14.33, z: -4116, yawDeg: -174 },
+  // Washington Sq Park — south of the fountain, facing the arch.
+  { name: 'Washington Sq Park', x: 1196, y: 10.90, z: -2883, yawDeg:   29 },
+  // Bowling Green — southern tip of Broadway, looking uptown.
+  { name: 'Bowling Green',      x: -166, y:  7.34, z:   -14, yawDeg:   16 },
+];
+const _spawn = SPAWN_LOCATIONS[Math.floor(Math.random() * SPAWN_LOCATIONS.length)];
+camera.position.set(_spawn.x, _spawn.y, _spawn.z);
 
 // ─── Player state persistence ─────────────────────────────────────────────────
 //
@@ -61,9 +77,8 @@ if (_savedPlayer) {
   camera.position.set(_savedPlayer.px, _savedPlayer.py, _savedPlayer.pz);
   camera.quaternion.set(_savedPlayer.qx, _savedPlayer.qy, _savedPlayer.qz, _savedPlayer.qw);
 } else {
-  // Default spawn orientation: 23° clockwise (viewed from above) so the camera
-  // looks along the Manhattan avenue grid rather than true north.
-  camera.quaternion.setFromEuler(new THREE.Euler(0, -23 * Math.PI / 180, 0, 'YXZ'));
+  // Apply the randomly-picked spawn's heading (CW-from-north → negative Y-Euler).
+  camera.quaternion.setFromEuler(new THREE.Euler(0, -_spawn.yawDeg * Math.PI / 180, 0, 'YXZ'));
 }
 
 function savePlayerState() {
@@ -802,6 +817,15 @@ function updateDebugHud() {
   const streamLine = `stream   ${_streamRows[0]}\n` +
     _streamRows.slice(1).map(r => `         ${r}`).join('\n');
 
+  // Current position + heading in SPAWN_LOCATIONS format. Stand where you
+  // want a new spawn, open the HUD, and paste the line into the array.
+  // _lastMinimapYaw is the same yaw the minimap uses (CW from true north).
+  const spawnLine =
+    `spawn    { x: ${Math.round(camera.position.x)}, ` +
+    `y: ${camera.position.y.toFixed(2)}, ` +
+    `z: ${Math.round(camera.position.z)}, ` +
+    `yawDeg: ${Math.round(_lastMinimapYaw * 180 / Math.PI)} }`;
+
   debugRay.setFromCamera(new THREE.Vector2(0, 0), camera);
 
   // Separate terrain line so we can show the floor height under the crosshair
@@ -825,8 +849,8 @@ function updateDebugHud() {
   const hits = debugRay.intersectObjects(nearBuildingMeshes, false);
   if (!hits.length) {
     debugHud.textContent = terrainLines.length
-      ? [fpsLine, renderLine, streamLine, ...terrainLines].join('\n')
-      : [fpsLine, renderLine, streamLine, '(no hit)'].join('\n');
+      ? [fpsLine, renderLine, streamLine, spawnLine, ...terrainLines].join('\n')
+      : [fpsLine, renderLine, streamLine, spawnLine, '(no hit)'].join('\n');
     return;
   }
   const hit     = hits[0];
@@ -874,6 +898,7 @@ function updateDebugHud() {
     fpsLine,
     renderLine,
     streamLine,
+    spawnLine,
     `bldg     ${ud.buildingId}`,
     `hit      (${hit.point.x.toFixed(1)}, ${hit.point.y.toFixed(1)}, ${hit.point.z.toFixed(1)})`,
     `mesh     ${meshType}   tri ${faceIdx}   face ${fi}`,
@@ -1010,6 +1035,12 @@ const tileManager = new TileManager({
     // Phase 1 — buildings are visible now. The spawn gate opens here so the
     // player can start interacting before the seed scan (phase 2) finishes.
     updateCulling();
+    // If this tile's buildings just engulfed the player, eject them
+    // horizontally. Only runs post-spawn; initial placement handles itself via
+    // snapToSafeStart / snapOutOfBuildingFootprint in tryFinishInitialLoad.
+    if (physics && firstTileLoaded && !teleporting) {
+      physics.popOutOfBuildingCeiling(meshes);
+    }
     tryFinishInitialLoad();
     if (teleporting) tryFinishTeleportLoad();
   },

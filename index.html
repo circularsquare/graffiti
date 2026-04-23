@@ -55,7 +55,10 @@
       width: min(242px, 80vw);
       aspect-ratio: 484 / 82;
       display: block;
-      background-color: var(--title-color, #edefe2);
+      /* No fallback — before paintManager boots and sets --title-color, this
+         resolves to invalid and background-color stays transparent, so the
+         title stays hidden rather than flashing white. */
+      background-color: var(--title-color);
       -webkit-mask: url('/title.png') center / contain no-repeat;
               mask: url('/title.png') center / contain no-repeat;
       image-rendering: pixelated;
@@ -126,7 +129,7 @@
       pointer-events: none;
       z-index: 10;
     }
-    #minimap-wrap.big { pointer-events: auto; cursor: grab; }
+    #minimap-wrap.big { pointer-events: auto; cursor: pointer; }
     #minimap-wrap.big.dragging { cursor: grabbing; }
     #minimap-wrap.escaped:not(.big) { pointer-events: auto; cursor: pointer; }
     #minimap-wrap canvas { display: block; }
@@ -303,13 +306,13 @@
 
     #info-btn {
       position: fixed;
-      top: 28px;
+      top: 26px;
       /* Tracks the minimap's left edge: 16px gutter + minimap width + 10px gap.
          --minimap-size is set by minimap.js#setMinimapSize on every resize,
          so the button follows the map as it expands in map mode. */
       right: calc(16px + var(--minimap-size, 234px) + 10px);
-      width: 28px;
-      height: 28px;
+      width: 30px;
+      height: 30px;
       display: flex;
       align-items: center;
       justify-content: center;
@@ -322,7 +325,14 @@
       z-index: 10;
       padding: 0;
     }
-    #info-btn svg { display: block; }
+    #info-btn .info-i {
+      font-family: 'Times New Roman', Times, serif;
+      font-style: italic;
+      font-weight: bold;
+      font-size: 21px;
+      line-height: 1;
+      margin-left: -1px;  /* optical centring — italic slants right, so nudge left */
+    }
     #info-btn:hover { border-color: rgba(255,255,255,0.55); }
 
     #info-modal {
@@ -478,17 +488,14 @@
   </div>
   <div id="minimap-attr">© OpenStreetMap contributors</div>
   <button id="info-btn" aria-label="About this project" title="About">
-    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
-      <circle cx="8" cy="3.5" r="1.4" fill="currentColor"/>
-      <rect x="6.6" y="6.4" width="2.8" height="7" rx="0.4" fill="currentColor"/>
-    </svg>
+    <span class="info-i">i</span>
   </button>
   <div id="info-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="info-title">
     <div class="info-content">
       <button class="info-close" aria-label="Close">&times;</button>
       <h2 id="info-title">graffiti nyc</h2>
       <p>Paint every surface in New York City!</p>
-      <p>Your paint will be visible forever. Unless someone paints over it. Please don't paint anything inappropriate or i will ban you!! &gt;_&lt; </p>
+      <p>Your paint will be visible for all to see. Unless someone paints over it. Please don't paint anything inappropriate or i will ban you!! &gt;_&lt; </p>
 
       <p>Data sources:</p>
       <ul>
@@ -497,8 +504,11 @@
         <li>Street map: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> via Overpass</li>
       </ul>
 
-      <p>Rendered with Three.js and WebGL. Each building face is split into 1m paintable cells. The terrain is 2m cells. Other people's paints will not show live, but will generally update within ~10 seconds. I apologize if the site runs slowly, a fast internet connection and some gpu are necessary. </p>
+      <p>Rendered with Three.js and WebGL. Each building face is split into 1m paintable cells. The terrain is 2m cells. </p>
+        
+      <p>The building data is from 2014, so buildings younger than that are not present. Also I apologize if the site runs slowly, a fast internet connection and some gpu are necessary. </p>
 
+      <p>inspired by <a href="https://wplace.live/" target="_blank" rel="noopener">wplace</a>. </p>
 
       <p>made by <a href="https://anita.garden/projects" target="_blank" rel="noopener">anita</a>!</p>
     </div>

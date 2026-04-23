@@ -59,6 +59,7 @@ const CAPSULE_SAMPLE_OFFSETS = [0, -0.3 * WALK_HEIGHT, -0.6 * WALK_HEIGHT, -(WAL
 const MAX_CAPSULE_ITERS = 4;
 
 const DOWN = new THREE.Vector3(0, -1, 0);
+const UP   = new THREE.Vector3(0,  1, 0);
 
 // ─── closestPointOnTriangle ───────────────────────────────────────────────────
 //
@@ -581,6 +582,58 @@ export function createPhysics({
     }
   }
 
+  // Called when a tile's building meshes finish loading. If the newly-loaded
+  // geometry includes a roof directly above the player (i.e. a tile streamed
+  // in and engulfed them), shift them horizontally to the nearest XZ that
+  // isn't under any building roof *and* has wall clearance — so we never pop
+  // them out of one building into another. Y is preserved; walk-mode rescue
+  // + gravity correct for terrain step-up/down the same frame.
+  //
+  // The trigger ray only considers the just-loaded meshes. That way flying
+  // inside an already-loaded building while a *neighbouring* tile admits
+  // doesn't yank the player out mid-sightseeing.
+  function popOutOfBuildingCeiling(justLoadedMeshes) {
+    if (!justLoadedMeshes || justLoadedMeshes.length === 0) return;
+    const cx = camera.position.x, cz = camera.position.z, cy = camera.position.y;
+    if (!_hasCeilingAbove(cx, cy, cz, justLoadedMeshes)) return;
+
+    const allBuildings = getNearBuildings();
+    // 1 m radial steps out to ~60 m covers all but the largest atria; per-ring
+    // angular spacing is ~1 m along the circumference (capped at 64 samples
+    // per ring to cap worst-case raycasts on a huge building).
+    for (let r = 1; r <= 60; r += 1) {
+      const steps = Math.min(64, Math.max(8, Math.round(r * 6.28)));
+      for (let i = 0; i < steps; i++) {
+        const angle = (i / steps) * Math.PI * 2;
+        const x = cx + Math.cos(angle) * r;
+        const z = cz + Math.sin(angle) * r;
+        if (_hasCeilingAbove(x, cy, z, allBuildings)) continue;
+        if (!_positionHasWallClearance(x, cy, z, allBuildings)) continue;
+        camera.position.x = x;
+        camera.position.z = z;
+        return;
+      }
+    }
+  }
+
+  function _hasCeilingAbove(x, y, z, meshes) {
+    _skyOrigin.set(x, y, z);
+    snapRay.set(_skyOrigin, UP);
+    snapRay.far = 2000;
+    return snapRay.intersectObjects(meshes, false).length > 0;
+  }
+
+  function _positionHasWallClearance(x, y, z, buildings) {
+    _skyOrigin.set(x, y, z);
+    for (let i = 0; i < 8; i++) {
+      const angle = (i / 8) * Math.PI * 2;
+      snapRay.set(_skyOrigin, new THREE.Vector3(Math.cos(angle), 0, Math.sin(angle)));
+      snapRay.far = PLAYER_RADIUS + 0.1;
+      if (snapRay.intersectObjects(buildings, false).length > 0) return false;
+    }
+    return true;
+  }
+
   // ─── Input edge-triggers ────────────────────────────────────────────────────
   //
   // Called from the Space keydown handler (after preventDefault + the
@@ -610,6 +663,7 @@ export function createPhysics({
     updateMovement,
     snapToSafeStart,
     snapOutOfBuildingFootprint,
+    popOutOfBuildingCeiling,
     resetFallVelocity() { velY = 0; },
     handleSpaceTap,
   };

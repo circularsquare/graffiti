@@ -31,7 +31,7 @@ const COLOR_CDF = (() => {
   return out;
 })();
 
-const NOISE_SCALE  = 1 / 70; // world m per noise-grid cell → regional clusters ~70 m across
+const NOISE_SCALE  = 1 / 60; // world m per noise-grid cell → regional clusters ~70 m across
 const TONE_JITTER  = 0.6;     // per-tree offset span (±TONE_JITTER/2) around the regional tone, in CDF units
 
 function hash01(ix, iz) {

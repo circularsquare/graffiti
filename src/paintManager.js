@@ -329,7 +329,14 @@ export function createPaintManager({
   _seedWaterRay.ray.direction.set(0, -1, 0);
 
   // ─── Color state ────────────────────────────────────────────────────────────
-  let activeColorIdx = 5; // start on white
+  // Persisted across refresh. If the saved index is missing or out-of-range
+  // (e.g. after a COLORS edit), fall back to 5 (white).
+  const ACTIVE_COLOR_KEY = 'graffiti_active_color_idx';
+  let activeColorIdx;
+  {
+    const saved = parseInt(localStorage.getItem(ACTIVE_COLOR_KEY), 10);
+    activeColorIdx = Number.isInteger(saved) && saved >= 0 && saved < COLORS.length ? saved : 5;
+  }
   let colorPickMode  = false;
 
   const swatchEls = COLORS.map((c, i) => {
@@ -356,6 +363,7 @@ export function createPaintManager({
     swatchEls[activeColorIdx].classList.add('active');
     crosshairEl.style.background = COLORS[i].css;
     document.documentElement.style.setProperty('--title-color', COLORS[i].css);
+    localStorage.setItem(ACTIVE_COLOR_KEY, String(i));
   }
   setActiveColor(activeColorIdx); // sync crosshair to initial color
 
