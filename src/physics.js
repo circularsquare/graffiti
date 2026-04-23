@@ -18,6 +18,14 @@ import * as THREE from 'three';
 export const WALK_HEIGHT = 1.8;        // eye height above surface
 export const PLAYER_RADIUS = 0.9;      // body collision radius; also spawn clearance
 
+// Swept-collision sub-step size. Horizontal motion is split into chunks no
+// larger than this so a single fast frame can't skip entirely past a thin
+// wall before resolveCapsule runs. Needs to be < 2 × PLAYER_RADIUS so the
+// capsule always overlaps a zero-thickness wall at some sub-step; half
+// PLAYER_RADIUS leaves comfortable margin. At fly-boost (~40 m/s) with a
+// 50 ms frame this yields ~5 sub-steps — still cheap per frame.
+const MAX_COLLISION_STEP = PLAYER_RADIUS * 0.5;
+
 // Player scale — all lengths/speeds below sit ×0.6 against a prior ~3 m-tall
 // "giant" pass so proportions vs. city geometry feel natural (human ≈ 1.8 m
 // tall, walks ~5 m/s sprinting).
@@ -383,15 +391,24 @@ export function createPhysics({
       dy = 0; // gravity handled below
     }
 
-    // Capsule collision: apply full horizontal delta, then let resolveCapsule
-    // push us out of any overlapping triangles. Corners eject along the
-    // contact normal so narrow gaps push the player sideways at the entrance
-    // instead of letting them wedge in.
+    // Swept collision: split the horizontal delta into sub-steps no larger
+    // than MAX_COLLISION_STEP and run resolveCapsule after each. Applying the
+    // full delta in one go let fast fly-boost frames skip entirely past a
+    // thin wall (player ends up inside the building); sub-stepping guarantees
+    // the capsule overlaps the wall at some step and gets pushed back out.
+    // Narrow-gap corner ejection still works — resolveCapsule pushes along
+    // the contact normal whether it runs once or many times.
     const prevX = camera.position.x;
     const prevZ = camera.position.z;
-    camera.position.x += dx;
-    camera.position.z += dz;
-    resolveCapsule(camera.position);
+    const hDist = Math.hypot(dx, dz);
+    const nSteps = Math.max(1, Math.ceil(hDist / MAX_COLLISION_STEP));
+    const stepX = dx / nSteps;
+    const stepZ = dz / nSteps;
+    for (let s = 0; s < nSteps; s++) {
+      camera.position.x += stepX;
+      camera.position.z += stepZ;
+      resolveCapsule(camera.position);
+    }
     // If the resolver reversed our intended motion on an axis, zero the
     // smoothed fly velocity so it doesn't keep accumulating against the wall.
     const actualDx = camera.position.x - prevX;

@@ -9,10 +9,12 @@ import { paintStore } from './paintStore.js';
 import { gridToWorld, worldToGrid } from './geo.js';
 import { createPhysics, WALK_HEIGHT } from './physics.js';
 import { createPaintManager } from './paintManager.js';
+import { tilesWithLandmarks, prepareLandmarks, landmarksReady, tileInjection } from './landmarks.js';
 import {
   initMinimap, updateMinimap, setMinimapSize,
   adjustMinimapZoom, adjustMinimapPan, resetMinimapPan,
   minimapMetersPerPixel, minimapPixelToWorld,
+  toggleMinimapHeadingUp, getMinimapHeadingUp,
 } from './minimap.js';
 
 // ─── Scene ───────────────────────────────────────────────────────────────────
@@ -79,11 +81,16 @@ document.addEventListener('visibilitychange', () => {
   if (document.visibilityState === 'hidden') savePlayerState();
 });
 
-window.addEventListener('resize', () => {
+function syncRendererToViewport() {
   camera.aspect = window.innerWidth / window.innerHeight;
   camera.updateProjectionMatrix();
   renderer.setSize(window.innerWidth, window.innerHeight);
-});
+}
+window.addEventListener('resize', syncRendererToViewport);
+// Some mobile browsers (and Chrome's device emulator) settle the viewport
+// meta after the script's initial run, leaving the canvas stuck at the pre-
+// viewport size. Re-sync on `load` once layout is definitely final.
+window.addEventListener('load', syncRendererToViewport);
 
 // ─── Lights ───────────────────────────────────────────────────────────────────
 
@@ -299,9 +306,19 @@ document.removeEventListener('pointerlockerror', controls._onPointerlockError);
 const overlay       = document.getElementById('overlay');
 const overlayPrompt = document.getElementById('overlay-prompt');
 const crosshair     = document.getElementById('crosshair');
-const randomBtn   = document.getElementById('minimap-random');
 const minimapWrap = document.getElementById('minimap-wrap');
 initMinimap();
+
+// Compass rose: click to toggle between north-up and heading-up minimap modes.
+// Rotated each frame below so the red arrow always points to true north on
+// screen — acts as a constant visual ground-truth regardless of mode.
+const compassEl = document.getElementById('compass');
+compassEl.addEventListener('click', (e) => {
+  e.stopPropagation();  // don't let the click fall through to minimap-click teleport in big mode
+  toggleMinimapHeadingUp();
+});
+// Prevent mousedown from starting a pan drag when the compass is hit in big mode.
+compassEl.addEventListener('mousedown', (e) => { e.stopPropagation(); });
 
 // Small vs. big minimap. 234 px mirrors the initial HTML canvas size; big mode
 // fills half the shorter viewport axis (so it's ~a quarter of the screen's
@@ -311,35 +328,8 @@ function minimapBigSize() {
   return Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.5);
 }
 let minimapBig = false;
-function syncMapControls(locked = controls.isLocked) {
-  const show   = minimapBig || !locked;
-  const btn    = document.getElementById('minimap-random');
-  const slider = document.getElementById('render-distance');
-  const hint   = document.getElementById('minimap-teleport-hint');
-  const escHint = document.getElementById('esc-hint');
-  if (btn)    btn.style.display    = show ? '' : 'none';
-  if (slider) slider.style.display = show ? '' : 'none';
-  if (hint)   hint.style.display   = minimapBig ? 'block' : 'none';
-  // Only surface "ESC to escape" when the user is actually captured in
-  // first-person; it's noise while already unlocked or viewing the big map.
-  if (escHint) escHint.style.display = (locked && !minimapBig) ? '' : 'none';
-}
-syncMapControls(); // set initial visibility (unlocked by default = show)
 function applyMinimapLayout() {
-  const px = minimapBig ? minimapBigSize() : MINIMAP_SIZE_SMALL;
-  setMinimapSize(px);
-  // Keep the random-location button and render-distance slider anchored just
-  // below the map so the big map doesn't visually swallow them. Map sits at
-  // top: 28px; hint follows at (28 + size + 4)px; button follows the hint.
-  const btn    = document.getElementById('minimap-random');
-  const slider = document.getElementById('render-distance');
-  const hint   = document.getElementById('minimap-teleport-hint');
-  const hintTop = 28 + px + 12;
-  const btnTop  = hintTop + 22;
-  if (hint)   hint.style.top   = hintTop + 'px';
-  if (btn)    btn.style.top    = btnTop + 'px';
-  if (slider) slider.style.top = (btnTop + 34) + 'px';
-  syncMapControls();
+  setMinimapSize(minimapBig ? minimapBigSize() : MINIMAP_SIZE_SMALL);
 }
 function toggleMinimapBig() {
   minimapBig = !minimapBig;
@@ -363,47 +353,6 @@ window.addEventListener('resize', () => {
   if (minimapBig) applyMinimapLayout();
 });
 
-// Max distance from a spawn point to the nearest building tile AABB. Keeps
-// the random-teleport button from dropping the player in open water / parks /
-// the middle of the FDR where there's nothing to paint.
-const STREET_SPAWN_MAX_BUILDING_DIST = 50; // metres
-
-/**
- * Try to pick a spawn on an actual OSM street that's within
- * STREET_SPAWN_MAX_BUILDING_DIST of a building. Returns null if no street
- * data is available (OSM manifest missing) or every tried point was far from
- * buildings — the caller should fall back to the plain random picker.
- *
- * Why sample OSM tiles rather than the loaded street meshes: the street
- * meshes only cover the ~300 m around the player; we want teleport targets
- * anywhere on the map. So we hit the manifest and fetch street polylines on
- * demand, cached in OsmManager for repeat clicks.
- */
-async function pickStreetSpawn(maxTileTries = 20, pointsPerTile = 4) {
-  const candidates = osmManager.tilesWithStreets();
-  if (candidates.length === 0) return null;
-  for (let i = 0; i < maxTileTries; i++) {
-    const tile = candidates[Math.floor(Math.random() * candidates.length)];
-    let streets;
-    try { streets = await osmManager.fetchStreets(tile.id); }
-    catch { continue; }
-    if (!streets || streets.length === 0) continue;
-    for (let j = 0; j < pointsPerTile; j++) {
-      const s = streets[Math.floor(Math.random() * streets.length)];
-      if (!s.points || s.points.length < 2) continue;
-      const segIdx = Math.floor(Math.random() * (s.points.length - 1));
-      const p0 = s.points[segIdx], p1 = s.points[segIdx + 1];
-      const t = Math.random();
-      const x = p0[0] + (p1[0] - p0[0]) * t;
-      const z = p0[1] + (p1[1] - p0[1]) * t;
-      if (tileManager.distanceToNearestBuildingTile(x, z) <= STREET_SPAWN_MAX_BUILDING_DIST) {
-        return { x, z };
-      }
-    }
-  }
-  return null;
-}
-
 const _teleportEuler = new THREE.Euler(0, 0, 0, 'YXZ');
 
 // Rising counter so a second fastTravelTo() started before the first's
@@ -416,10 +365,10 @@ let _teleportId = 0;
 // position (which is still at the old location during the terrain fetch).
 let _teleportDestX = 0, _teleportDestZ = 0;
 
-// Mirror the first-page-load experience: unlock pointer, show the dimmed
-// "loading" overlay, fetch the destination's terrain height, then place the
-// player and wait for nearby tiles to finish loading before letting the user
-// click in. Shared by the random-location button and map-click teleport.
+// Unlock pointer, show the dimmed "loading" overlay, fetch the destination's
+// terrain height, then place the player and wait for nearby tiles to finish
+// loading before letting the user click back in. Used by the map-click
+// teleport.
 //
 // Order matters: the overlay is only 40% opaque, so if we moved the camera
 // before the terrain cell finished loading, the player would briefly see
@@ -437,11 +386,10 @@ async function fastTravelTo(x, z) {
 
   teleporting = true;
   overlay.classList.add('loading');
-  overlayPrompt.textContent = 'Loading data...';
+  overlayPrompt.textContent = 'loading data...';
   paint.closeColorPicker();
   if (controls.isLocked) controls.unlock();
   else overlay.classList.remove('hidden');
-  randomBtn.disabled = true;
 
   // Close the big map if it was open so the loading overlay is actually
   // visible; resetMinimapPan() runs via toggleMinimapBig.
@@ -477,13 +425,6 @@ async function fastTravelTo(x, z) {
   tileManager.tick(x, z);
   tryFinishTeleportLoad();
 }
-
-randomBtn.addEventListener('click', async () => {
-  if (!firstTileLoaded) return;
-  const loc = (await pickStreetSpawn()) ?? tileManager.randomLocation();
-  if (!loc) return;
-  fastTravelTo(loc.x, loc.z);
-});
 
 // ─── Map-mode mouse interaction ───────────────────────────────────────────────
 // Active only while the minimap is in "big" mode (.big class). Drag to pan,
@@ -531,8 +472,17 @@ document.addEventListener('mousemove', (e) => {
   // Panning only applies to the big map; the small map just tracks a click.
   if (minimapBig) {
     // Dragging right moves content right → view centre shifts left (west).
+    // In heading-up mode the canvas is rotated by −yaw, so the screen-space
+    // drag delta must be rotated back into world XZ by +yaw before applying.
     const m = minimapMetersPerPixel();
-    adjustMinimapPan(-dxPx * m, -dyPx * m);
+    if (getMinimapHeadingUp()) {
+      const c = Math.cos(_lastMinimapYaw), s = Math.sin(_lastMinimapYaw);
+      const wdx = dxPx * c - dyPx * s;
+      const wdy = dxPx * s + dyPx * c;
+      adjustMinimapPan(-wdx * m, -wdy * m);
+    } else {
+      adjustMinimapPan(-dxPx * m, -dyPx * m);
+    }
   }
 });
 
@@ -555,8 +505,11 @@ minimapWrap.addEventListener('wheel', (e) => {
 }, { passive: false });
 
 // -1 = idle; 0 = left held (paint); 2 = right held (erase). Checked each frame
-// in animate() so holding the mouse paints every new cell under the crosshair.
+// in animate() so holding the mouse paints every new cell under the crosshair —
+// but only after HOLD_DRAG_MS, so a quick click paints exactly one cell.
 let paintHeldButton = -1;
+let paintHeldAt     = 0;
+const HOLD_DRAG_MS  = 300;
 
 function endPaintStroke() {
   if (paintHeldButton === -1) return;
@@ -566,8 +519,8 @@ function endPaintStroke() {
 
 renderer.domElement.addEventListener('mousedown', e => {
   if (!controls.isLocked) { if (e.button === 0 && firstTileLoaded) { paint.closeColorPicker(); controls.lock(); } return; }
-  if (e.button === 0) { paintHeldButton = 0; paint.beginStroke(); paint.tryPaint(); }
-  else if (e.button === 2) { paintHeldButton = 2; paint.beginStroke(); paint.tryErase(); }
+  if (e.button === 0)      { paintHeldButton = 0; paintHeldAt = performance.now(); paint.beginStroke(); paint.tryPaint(); }
+  else if (e.button === 2) { paintHeldButton = 2; paintHeldAt = performance.now(); paint.beginStroke(); paint.tryErase(); }
 });
 // Listen on window so a mouseup outside the canvas (e.g. over the HUD) still ends the stroke.
 window.addEventListener('mouseup', e => {
@@ -590,7 +543,6 @@ controls.addEventListener('lock', () => {
   // map (and reset its pan) so it doesn't stay spread across the game view.
   if (minimapBig) toggleMinimapBig();
   minimapWrap.classList.remove('escaped');
-  syncMapControls(true);
   if (promptRestoreTimer) { clearTimeout(promptRestoreTimer); promptRestoreTimer = null; }
   overlayPrompt.style.visibility = '';
 });
@@ -603,7 +555,6 @@ controls.addEventListener('unlock', () => {
   // button remain clickable above it either way.
   if (!paint.isColorPicking) overlay.classList.remove('hidden');
   minimapWrap.classList.add('escaped');
-  syncMapControls(false);
   overlayPrompt.style.visibility = 'hidden';
   if (promptRestoreTimer) clearTimeout(promptRestoreTimer);
   promptRestoreTimer = setTimeout(() => {
@@ -649,8 +600,7 @@ document.addEventListener('keydown', e => {
       firstTileLoaded = true;
       teleporting = false;
       overlay.classList.remove('loading', 'startup');
-      overlayPrompt.textContent = 'Click to explore';
-      randomBtn.disabled = false;
+      overlayPrompt.textContent = 'click to explore';
       physics.snapToSafeStart();
     }
     return;
@@ -681,7 +631,58 @@ document.addEventListener('keydown', e => {
   if (e.code === 'KeyM' && !e.repeat) {
     toggleMinimapBig();
   }
+
+  if (e.code === 'KeyX' && !e.repeat) {
+    // Toggle the in-game controls hud. Pause-menu CSS forces it visible
+    // regardless, so the toggle only takes effect once gameplay resumes.
+    document.getElementById('overlay-controls').classList.toggle('hidden');
+  }
+
+  // Cheat code: typing "refill" anywhere fires a paint-bank refill request.
+  // Server gates on REFILL_SECRET; first use per session prompts for the
+  // secret and caches it in sessionStorage. Wrong secret → cached value is
+  // cleared so the next attempt re-prompts.
+  if (e.key && e.key.length === 1 && !e.ctrlKey && !e.metaKey && !e.altKey) {
+    _cheatBuffer = (_cheatBuffer + e.key.toLowerCase()).slice(-CHEAT_CODE.length);
+    if (_cheatBuffer === CHEAT_CODE) {
+      _cheatBuffer = '';
+      tryCheatRefill();
+    }
+  }
 });
+
+const CHEAT_CODE = 'refill';
+const CHEAT_SECRET_KEY = 'graffiti_refill_secret';
+let _cheatBuffer = '';
+let _cheatInFlight = false;
+
+async function tryCheatRefill() {
+  if (_cheatInFlight) return;
+  let secret = sessionStorage.getItem(CHEAT_SECRET_KEY);
+  if (!secret) {
+    secret = window.prompt('refill secret?');
+    if (!secret) return;
+    sessionStorage.setItem(CHEAT_SECRET_KEY, secret);
+  }
+  _cheatInFlight = true;
+  try {
+    const result = await paintStore.tryRefill(secret);
+    if (result === 'forbidden') {
+      sessionStorage.removeItem(CHEAT_SECRET_KEY);
+      console.warn('refill: wrong secret, cached value cleared');
+    } else if (result === 'error') {
+      console.warn('refill: request failed');
+    } else {
+      // Brief green flash on the paint-bank readout so the cheat has visible
+      // feedback even when the bucket was already at capacity.
+      _paintBankEl.classList.remove('flash');
+      void _paintBankEl.offsetWidth; // force reflow so the class re-apply restarts the animation
+      _paintBankEl.classList.add('flash');
+    }
+  } finally {
+    _cheatInFlight = false;
+  }
+}
 
 document.addEventListener('keyup', e => { keys[e.code] = false; });
 
@@ -737,13 +738,23 @@ debugHud.style.cssText = `
   font-size: 12px; line-height: 1.4;
   color: #fff; background: rgba(0, 0, 0, 0.6);
   padding: 8px 10px; border-radius: 4px;
-  white-space: pre; pointer-events: none; z-index: 9999;
+  white-space: pre; z-index: 9999;
+  user-select: text; -webkit-user-select: text; cursor: text;
   display: none;
 `;
 document.body.appendChild(debugHud);
 
+// Freeze HUD updates while the cursor is over it — textContent is rewritten
+// every frame, which blows away any active text selection the user is trying
+// to copy. Hover-pause lets them read/copy the snapshot from the moment they
+// moved onto the HUD. Values resume updating once the cursor leaves.
+let _debugHudHovered = false;
+debugHud.addEventListener('mouseenter', () => { _debugHudHovered = true; });
+debugHud.addEventListener('mouseleave', () => { _debugHudHovered = false; });
+
 function updateDebugHud() {
   if (!debugHudOn) return;
+  if (_debugHudHovered) return;
   const fpsLine = `fps      ${_fpsValue.toFixed(1)}`;
   // renderer.info is updated each render(); values here reflect the *previous*
   // frame's draw. Useful for spotting draw-call growth as paint/buildings
@@ -864,6 +875,7 @@ function updateDebugHud() {
     renderLine,
     streamLine,
     `bldg     ${ud.buildingId}`,
+    `hit      (${hit.point.x.toFixed(1)}, ${hit.point.y.toFixed(1)}, ${hit.point.z.toFixed(1)})`,
     `mesh     ${meshType}   tri ${faceIdx}   face ${fi}`,
     `cell     (${cu}, ${cv})   pdKey ${pdKey}`,
     `cellKey  ${cellKey}`,
@@ -952,8 +964,7 @@ function tryFinishInitialLoad() {
 
   firstTileLoaded = true;
   overlay.classList.remove('loading'); // 'startup' already removed by _doStartupTerrainFirst
-  overlayPrompt.textContent = 'Click to explore';
-  randomBtn.disabled = false;
+  overlayPrompt.textContent = 'click to explore';
   if (!_savedPlayer) physics.snapOutOfBuildingFootprint();
   physics.snapToSafeStart();
 }
@@ -971,17 +982,29 @@ function finishTeleportLoad() {
   if (!teleporting) return;
   teleporting = false;
   overlay.classList.remove('loading');
-  overlayPrompt.textContent = 'Click to explore';
-  randomBtn.disabled = false;
+  overlayPrompt.textContent = 'click to explore';
   physics.snapOutOfBuildingFootprint();
   physics.snapToSafeStart();
 }
+
+// Landmark overrides (see src/landmarks.js). Tile IDs containing landmarks
+// are computed up front so resolveTileInjection knows which tiles to gate
+// on landmark prep — most tiles return null (no injection) immediately.
+// prepareLandmarks runs once terrainManager exists (further down) and
+// flips landmarksReady() to true; until then, landmark tiles return
+// 'pending' and TileManager defers loading them.
+const _landmarkTiles = tilesWithLandmarks();
 
 const tileManager = new TileManager({
   scene,
   buildingMeshes,
   collidables,
   buildingMeshMap,
+  resolveTileInjection: (tileId) => {
+    if (!_landmarkTiles.has(tileId)) return null;
+    if (!landmarksReady()) return 'pending';
+    return tileInjection(tileId);
+  },
   ...paint.tileManagerBindings,
   onTileLoaded(meshes) {
     // Phase 1 — buildings are visible now. The spawn gate opens here so the
@@ -1079,15 +1102,29 @@ const osmManager = new OsmManager({
 });
 osmManager.init(`${import.meta.env.VITE_CDN_BASE ?? ''}/osm/manifest.json`);
 
+// Landmark prep — resolves terrain Y for each landmark via sampleAsync, then
+// transforms the local-space triangles into world space and builds the
+// per-tile injection lookup. resolveTileInjection (set up where TileManager
+// is constructed) returns 'pending' for landmark tiles until this resolves.
+prepareLandmarks({ terrain: terrainManager }).catch(err => {
+  console.error('prepareLandmarks failed:', err);
+});
+
 if (TERRAIN_ENABLED) {
   treeManager = new TreeManager({ scene, terrain: terrainManager });
-  pigeonManager = new PigeonManager({
-    scene,
-    terrain: terrainManager,
-    getBuildings: () => buildingMeshes,
-  });
-  window.pigeonManager = pigeonManager; // dev-only: lets DevTools poke the flock state
+  // Pigeons temporarily disabled — the 3D-mesh rewrite still needs visual polish
+  // before going to prod. Re-enable by uncommenting.
+  // pigeonManager = new PigeonManager({
+  //   scene,
+  //   terrain: terrainManager,
+  //   getBuildings: () => buildingMeshes,
+  // });
+  // window.pigeonManager = pigeonManager;
 }
+
+// Dev-only: lets DevTools issue one-off paint wipes (e.g. after a landmark
+// topology change orphans cells under stale cellKeys).
+window.paintStore = paintStore;
 
 // Render-distance slider — scales building/OSM/terrain load radii together.
 // Building radius is adaptive (budget-driven) so the scale is applied to both
@@ -1125,6 +1162,7 @@ physics = createPhysics({
 // ─── Render loop ──────────────────────────────────────────────────────────────
 
 const _minimapDir = new THREE.Vector3();
+let _lastMinimapYaw = 0;
 
 // Cap the render loop to 60 Hz even on high-refresh monitors. Browsers' RAF
 // fires at the monitor's refresh rate (often 120/144/165 Hz), doing work we
@@ -1147,6 +1185,34 @@ const _loadingRows = [
 const _paintSaveEl    = document.getElementById('loading-paint');
 let   _paintShowUntil = 0;
 const LOADING_MIN_VISIBLE_MS = 250;
+
+// Paint-bank HUD: bottom-right token readout. `paintStore.tickBucket()` fires
+// our subscribeBucket listener each animation tick (~1 Hz via the
+// _lastPaintBankTick gate below) so the "+1 in Ys" countdown advances without
+// a separate timer.
+const _paintBankEl        = document.getElementById('paint-bank');
+const _paintBankCountEl   = document.getElementById('paint-bank-count');
+const _paintBankRefillEl  = document.getElementById('paint-bank-refill');
+let   _lastPaintBankTick  = 0;
+
+function renderPaintBank(state) {
+  if (!state.ready) {
+    _paintBankCountEl.textContent  = 'paint: loading…';
+    _paintBankRefillEl.textContent = '';
+    _paintBankEl.classList.remove('empty');
+    return;
+  }
+  _paintBankCountEl.textContent = `paint: ${state.tokens}/${state.capacity}`;
+  if (state.tokens >= state.capacity) {
+    _paintBankRefillEl.textContent = 'full';
+  } else {
+    const secs = Math.max(1, Math.ceil(state.msUntilNext / 1000));
+    _paintBankRefillEl.textContent = `+1 in ${secs}s`;
+  }
+  _paintBankEl.classList.toggle('empty', state.tokens === 0);
+}
+paintStore.subscribeBucket(renderPaintBank);
+renderPaintBank(paintStore.getBucketState());
 function updateLoadingIndicator(now) {
   // Startup overlay already says "Loading data..." — suppress the bottom-left
   // rows until the overlay is dismissed so we don't say the same thing twice.
@@ -1211,21 +1277,34 @@ function animate(now) {
   if (treeManager) treeManager.tick(camera.position.x, camera.position.z);
   if (pigeonManager) {
     pigeonManager.tick(camera.position.x, camera.position.z);
-    pigeonManager.update(now / 1000);
+    pigeonManager.update(now / 1000, camera.position.x, camera.position.z);
   }
   if (!firstTileLoaded) tryFinishInitialLoad();
   if (teleporting) tryFinishTeleportLoad();
   updateViewFalloff(cullRadius());
   maybeCull();
   physics.updateMovement();
-  if (paintHeldButton === 0) paint.tryPaint();
-  else if (paintHeldButton === 2) paint.tryErase();
+  if (paintHeldButton !== -1 && now - paintHeldAt > HOLD_DRAG_MS) {
+    if (paintHeldButton === 0) paint.tryPaint();
+    else                       paint.tryErase();
+  }
   ground.position.x = camera.position.x;
   ground.position.z = camera.position.z;
   camera.getWorldDirection(_minimapDir);
-  updateMinimap(camera.position.x, camera.position.z, Math.atan2(_minimapDir.x, -_minimapDir.z));
+  _lastMinimapYaw = Math.atan2(_minimapDir.x, -_minimapDir.z);
+  updateMinimap(camera.position.x, camera.position.z, _lastMinimapYaw);
+  // North-up: compass arrow always points up. Heading-up: map was rotated
+  // by −yaw, so screen-space north is at +yaw off vertical — rotate the
+  // compass by −yaw to track it.
+  compassEl.style.transform = getMinimapHeadingUp()
+    ? `rotate(${-_lastMinimapYaw}rad)`
+    : 'rotate(0deg)';
   updateDebugHud();
   updateLoadingIndicator(now);
+  if (now - _lastPaintBankTick >= 1000) {
+    _lastPaintBankTick = now;
+    paintStore.tickBucket();
+  }
   const eyeOffset = physics.eyeVisualOffset;
   camera.position.y += eyeOffset;
   renderer.render(scene, camera);

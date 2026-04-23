@@ -5,12 +5,12 @@ import { gridToWorld } from './geo.js';
 import { injectGridOverlay, enableGridExtensions, GRID_SHADER_CACHE_KEY } from './gridShader.js';
 import { emitStreetTrisXZ } from './streetGeometry.js';
 
-// OSM-specific load radius. Tight (100 m) because draped OSM geometry is
+// OSM-specific load radius. Tight (150 m) because draped OSM geometry is
 // by far the heaviest per-tile payload in the client — ~3–20 MB of
 // positions + normals + skirts per tile — and at the old 350 m radius
 // that's 25 tiles × double-digit megabytes loading in the first second
 // after spawn, which crashes the tab on memory-constrained machines.
-// At 100 m only the player's own tile plus partial neighbours stay
+// At 150 m only the player's own tile plus partial neighbours stay
 // resident (~1–4 tiles), and distant ground just reads as bare LAND-tan
 // terrain — an acceptable LOD cut since fine polygon detail isn't
 // readable beyond this distance anyway. UNLOAD_MARGIN keeps tiles
@@ -18,7 +18,7 @@ import { emitStreetTrisXZ } from './streetGeometry.js';
 //
 // Render-distance slider (setRadiusScale) still scales this, so users
 // on strong machines can raise it. Default keeps initial load safe.
-const LOAD_RADIUS       = 200;
+const LOAD_RADIUS       = 150;
 const OSM_UNLOAD_MARGIN = 60;
 
 // Spatial index grid — mirrors TileManager's scheme.

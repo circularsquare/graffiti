@@ -18,16 +18,8 @@ deploy (anita.garden):
 
 - accounts / id tracking 
 - mobile controls 
-- favicon, link pictures, title
-- have controls always visible 
+- link pictures, title
 - online count
-- periodic refresh to load other peoples updates?  [done 2026-04-22 — server-side cell-diff PATCH + 5s active / 20s idle pull]
-- colors different on apple?
-
-- glitch through walls if flying fast
-shift tab 
-
-dont drape far stuff
 
 
 

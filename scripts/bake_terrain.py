@@ -165,12 +165,28 @@ def target_cells(manifest, pad=PAD_CELLS):
 
 # ── DEM index ────────────────────────────────────────────────────────────────
 
+def _dem_priority(path):
+    # Lower = queried first in sample_cell. NY DEMs must outrank NJ so the real
+    # NY LiDAR (e.g. the Cloisters bluff in x58y453_NY_CMPG_2013) isn't
+    # clobbered by the 100 m fillnodata tail from x58y453_NJ_SdL5_2014 that
+    # bleeds 25 m "shelf" values eastward across the Hudson — that tail used to
+    # land right under the Cloisters and produce a sheer stepped cliff at the
+    # fill-range boundary.
+    name = os.path.basename(path)
+    if '_NY_' in name: return 0
+    if '_NJ_' in name: return 1
+    return 2
+
+
 def open_dems():
     # We require the pre-filled variants. Raw *.tif have NODATA pixels, and
     # filling them locally per-tile at runtime caused seam-border holes:
     # adjacent tiles converged on different values for the same shared sample.
     # See scripts/fill_dem_nodata.py for the preprocessing step.
-    paths = sorted(glob.glob(os.path.join(DEM_DIR, '*_filled.tif')))
+    paths = sorted(
+        glob.glob(os.path.join(DEM_DIR, '*_filled.tif')),
+        key=lambda p: (_dem_priority(p), os.path.basename(p)),
+    )
     if not paths:
         sys.exit(f'No *_filled.tif in {DEM_DIR}. '
                  f'Run `python scripts/fill_dem_nodata.py` first.')

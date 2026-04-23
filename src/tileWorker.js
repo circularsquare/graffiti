@@ -24,10 +24,18 @@
 // to a face get zeroed out so only real face boundaries draw a border.
 //
 // Protocol:
-//   main → worker: { type:'load', tileId, file, seedConfig: { fraction, colors } }
+//   main → worker: { type:'load', tileId, file, seedConfig: { fraction, colors },
+//                    hideBuildingIds?: string[],
+//                    injectedBuildings?: [{ buildingId, roof: Float32Array,
+//                                           walls: Float32Array }, ...] }
 //   worker → main: { type:'loaded',   tileId, meshes:   [MeshData,   ...] }
 //                  { type:'cellData', tileId, cellData: [CellBundle, ...] }
 //                  { type:'error',    tileId, error }
+//
+// hideBuildingIds drops citywide-dataset buildings before face extraction
+// touches them; injectedBuildings appends hand-authored landmarks (see
+// src/landmarks.js) into the same pipeline so they get face borders, grid
+// UVs, paint cells, etc. without any duplicated downstream code.
 //
 // MeshData:
 //   { buildingId, meshType,
@@ -131,7 +139,7 @@ async function onLoadMessage(e) {
   const msg = e.data;
   if (!msg || msg.type !== 'load') return;
 
-  const { tileId, file, seedConfig } = msg;
+  const { tileId, file, seedConfig, hideBuildingIds, injectedBuildings } = msg;
   try {
     const t0 = performance.now();
     const res = await fetch(file);
@@ -142,7 +150,21 @@ async function onLoadMessage(e) {
     // it and throws NOT_READY on mismatch (covers HTML fallback responses).
     const t1 = performance.now();
     const buf = await res.arrayBuffer();
-    const buildings = decodeTile(buf);
+    let buildings = decodeTile(buf);
+
+    // Landmark override: drop the bad meshes before face extraction sees
+    // them, then append the hand-authored replacement triangles. From here
+    // on the pipeline doesn't distinguish — landmarks get face merging,
+    // UVs, lineCoord, cell scan, and seeding the same as any building.
+    if (hideBuildingIds && hideBuildingIds.length) {
+      const hide = new Set(hideBuildingIds);
+      buildings = buildings.filter(b => !hide.has(b.id));
+    }
+    if (injectedBuildings && injectedBuildings.length) {
+      for (const inj of injectedBuildings) {
+        buildings.push({ id: inj.buildingId, roof: inj.roof, walls: inj.walls });
+      }
+    }
     const t2 = performance.now();
 
     // Phase 1 — mesh build. Roof + wall get merged into ONE meshData per

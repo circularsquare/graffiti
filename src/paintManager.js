@@ -450,12 +450,15 @@ export function createPaintManager({
 
   // Flip a snapshot: apply `snap` (k → newState), return a map of k → previous
   // state so the inverse operation can restore it. Shared by undo + redo.
+  // Uses the unmetered writes so ctrl+Z / ctrl+Y never drain the token bucket
+  // (and also work when the bucket is empty, which is the whole point of
+  // undo — recovering from a regretted spend).
   function flipSnapshot(snap) {
     const inverse = new Map();
     for (const [k, next] of snap) {
       inverse.set(k, paintStore.cells.get(k) ?? null);
-      if (next === null) paintStore.erase(k);
-      else paintStore.paint(k, next);
+      if (next === null) paintStore.eraseUnmetered(k);
+      else paintStore.paintUnmetered(k, next);
     }
     return inverse;
   }

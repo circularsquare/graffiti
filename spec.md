@@ -22,7 +22,8 @@ graffiti/
 │   ├── osmWorker.js            # Off-thread OSM drape tessellation (2 m block-grid clip + fan-triangulate)
 │   ├── paintStore.js           # Cell paint state — per-tile server persistence, subscribe() for multiplayer
 │   ├── geo.js                  # lng/lat → local XZ meters (centered on FiDi reference point)
-│   ├── PigeonManager.js        # Tile-streamed pigeon flocks; instanced camera-facing sprites with procedural flipbook atlas
+│   ├── PigeonManager.js        # Tile-streamed pigeon flocks; instanced low-poly 3D mesh (~32 tris) with vertex-shader peck + wing-flap animation; flee the camera as a flock
+│   ├── landmarks.js            # Hand-authored replacements for visibly-wrong citywide-dataset buildings (e.g. Washington Square Arch)
 │   └── loadCityGML.js          # Shared materials + wrapMeshData (MeshData → THREE.Mesh)
 │
 ├── scripts/
@@ -176,6 +177,44 @@ pip install -r scripts/requirements.txt
 npm run build-tiles                 # all 5 boroughs
 npm run build-tiles -- --manhattan  # Manhattan-only subset (faster iteration)
 ```
+
+### Landmark overrides
+
+The citywide CityGML dataset has a handful of known-bad simplifications —
+e.g. Washington Square Arch ships as a solid block. `src/landmarks.js`
+keeps a short config array of overrides, each of which lists
+`hideBuildingIds` (the bad meshes to suppress) and a `buildTriangles()`
+function returning local-space `{ roof: Float32Array, walls: Float32Array }`
+for the replacement.
+
+The replacement runs through the **same tileWorker pipeline as a regular
+building** — landmarks aren't a separate scene layer. At startup,
+`prepareLandmarks({ terrain })` resolves each landmark's terrain Y via
+`sampleAsync`, applies its `rotationY` + `position` + `terrainY` transform
+to produce world-space triangles, and indexes the result by tile ID
+(asserting each landmark fits in one 100 m cell — bridges spanning many
+cells aren't supported yet). When `TileManager` admits a tile, it calls
+`resolveTileInjection(tileId)` to fetch any landmark payload and forwards
+it in the worker's `load` message. Inside `tileWorker.js`, the `decodeTile`
+result is filtered by `hideBuildingIds`, then `injectedBuildings` are
+appended to the building list before face extraction begins. From there
+landmarks get face merging, face-tangent UVs, `lineCoord`, the cell scan,
+overlap dedupe, paint groups, and seeding identically to GML buildings.
+Synthetic `buildingId = 'landmark_<name>'` keeps paint persistence stable
+across sessions.
+
+A `tilesWithLandmarks()` set lets `TileManager` defer admission of any
+landmark-bearing tile until `prepareLandmarks` resolves (otherwise the
+tile would render the bad mesh briefly before reload). Non-landmark tiles
+load freely throughout.
+
+To add a new override:
+1. Aim the F3 crosshair at the bad building in-game.
+2. Copy `bldg ...` and `hit (x, y, z)` from the debug HUD.
+3. Add an entry to `LANDMARKS` in `src/landmarks.js`. Authoring shapes:
+   procedural triangle emitters (see `buildWashingtonSquareArchTriangles`
+   for a box-based example) work for simple geometry; richer shapes want
+   Blender → glTF → triangle extraction (not wired yet).
 
 ### OSM overlay pipeline (streets, water, green)
 
@@ -363,7 +402,7 @@ labels are dropped if the street segment is too short to fit them.
 | Q (while flying) | 3× speed boost (horizontal + vertical) |
 | Click "Random location" (unlocked) | Teleport to a random point on an OSM street, constrained to within 50 m of a building tile AABB so the player never lands inside a building interior, in open water, or out on the FDR. Falls back to a random tile XZ if the OSM manifest is unavailable. Before moving the camera, a priority `TerrainManager.sampleAsync` fetch resolves the destination cell's DEM height so the player doesn't briefly see themselves underground through the 40%-opaque loading overlay. Re-enters the initial "Loading tiles…" overlay until every tile in load range of the new position is loaded, then user clicks to enter |
 | M | Toggle **map mode** — expands the top-right minimap to a square half the shorter viewport axis (≈ a quarter of the screen) and releases the pointer. In map mode the map is interactive: **drag** to pan, **scroll** to zoom, **click** to fast-travel to that location (same flow as the Random location button). Zoom persists when leaving map mode; pan snaps back to player-centred. Map is north-up; player arrow rotates with heading |
-| F3 | Toggle the debug HUD — top-left overlay showing what the crosshair is hitting: building id, mesh, triangle index, face id, cell coords, canonical cellKey, cache hit/miss + area, paint state, planeD (with tri-vs-face mismatch warning), normal, distance |
+| F3 | Toggle the debug HUD — top-left overlay showing what the crosshair is hitting: building id, hit world XYZ (useful for sourcing landmark positions), mesh, triangle index, face id, cell coords, canonical cellKey, cache hit/miss + area, paint state, planeD (with tri-vs-face mismatch warning), normal, distance |
 | Ctrl+R / F5 | Soft reload preserves player position, rotation, and fly state via `localStorage` (`graffiti_player_state_v1`) |
 | Ctrl+Shift+R | Hard reload — keydown handler flips a `sessionStorage` flag before the browser reloads; on next load that flag clears the saved state so the player respawns at the default (Times Square) |
 | Esc | Release pointer |
@@ -469,11 +508,13 @@ Per-building paint meshes (one mesh per colour) are tracked in `buildingPaintMes
 Paint is stored **per tile**, either on disk at `data/paint/{tileId}.json` via the Vite dev-server middleware (`scripts/tile-paint-plugin.js`) or in Cloudflare R2 behind `worker/index.js` in prod. Both backends speak the same protocol:
 
 - `GET   /paint/:tileId` → `{ [cellKey]: cellData }`. Returns an `ETag` header and honors `If-None-Match` (304 on hit — used by the pull loop).
-- `PATCH /paint/:tileId` → body is a **diff**: `{ __ts, __author, [cellKey]: cellData | null }`. `__ts` is the client's flush timestamp; `null` entries are erase tombstones (they use `__ts` as their effective `paintedAt`). `__author` is the client's per-device UUID (see *Identity & audit* below) — stripped before merge and never written into the paint JSON. The server reads the current blob, merges the diff with a `paintedAt` tiebreaker (newer wins), and writes back **under an R2 conditional** (`onlyIf: etagMatches`) — retrying up to 5× on CAS loss. Two clients painting different cells on the same tile both survive; same-cell races resolve deterministically to the later wall-clock paint.
+- `PATCH /paint/:tileId` → body is a **diff**: `{ __ts, __author, [__seed], [cellKey]: cellData | null }`. `__ts` is the client's flush timestamp; `null` entries are erase tombstones (they use `__ts` as their effective `paintedAt`). `__author` is the client's per-device UUID (see *Identity & audit* below). `__seed: true` marks a flush whose dirty cells all originated from procedural seeding — exempt from the token bucket. All three envelope fields are stripped before merge and never written into the paint JSON. The server reads the current blob, merges the diff with a `paintedAt` tiebreaker (newer wins), and writes back **under an R2 conditional** (`onlyIf: etagMatches`) — retrying up to 5× on CAS loss. Two clients painting different cells on the same tile both survive; same-cell races resolve deterministically to the later wall-clock paint.
 
 Stored cell data: `{ color, normal, planeD, paintedAt, authorId }`.
 
 **Identity & audit.** `paintStore` generates a v4 UUID on first run, stores it in `localStorage['graffiti_author_id']`, and stamps it onto every cell it writes (field `authorId`) plus the PATCH envelope (`__author`). The worker strips `__author` out of the diff and — if the optional `AUDIT` KV binding is wired up — writes one row per `(authorId, ip)` pair with `expirationTtl = 14 days`, refreshed on every PATCH. That gives a 14-day rolling IP↔author map for moderation without mixing IPs into the public paint JSON. Cleared `localStorage` yields a fresh identity; stronger identity needs a real login, not in scope.
+
+**Rate limit (token bucket).** Per-authorId bucket backed by the same `AUDIT` KV under `bucket:<authorId>`. Default capacity 100, refill 1 token per 30 s (`BUCKET_CAPACITY` / `BUCKET_REFILL_MS` — client mirrors these values until the first header sync, server is authoritative). Each cell write (paint **or** erase) costs 1 token; the seed-complete sentinel and any `__seed: true` batch are free. When a PATCH arrives with cost > available tokens, the worker returns **429** with JSON `{ error:'rate_limited', tokens, refillAt, capacity, refillMs, needed }` and the same state on headers `X-Paint-Tokens` / `X-Paint-Refill-At` / `X-Paint-Capacity` / `X-Paint-Refill-Ms`. Every successful PATCH also echoes those headers so the client stays synced. The client gates paint/erase calls against its local bucket extrapolation, so 429s only happen on multi-tab drift (both tabs optimistically spend their shared budget); when one does fire, the rejected writes become phantom locally until the pull loop reconciles them. The `paint-bank` HUD bottom-right (`index.html#paint-bank`) shows `paint: xx/cap` plus a `+1 in Ys` countdown driven by `paintStore.tickBucket()` at 1 Hz from the render loop. Bucket state inherits a 7-day TTL: inactive users return to a full bucket.
 
 `paintStore.loadTile(tileId, buildingKeys)` is called by `TileManager._doLoad` as soon as meshes are wrapped. It synchronously registers a `buildingKey → tileId` mapping, fetches the tile's cells in the background, stashes the returned ETag in `_tileETags[tileId]`, and kicks the pull loop (below). `TileManager._applyCellDataToTile` awaits the fetch before invoking the phase-2 `onTileCellData` callback, so `seedTileCells` runs with server-saved paint already populated.
 

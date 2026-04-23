@@ -23,6 +23,8 @@ import crypto from 'node:crypto';
 const DATA_DIR    = 'data/paint';
 const TILE_ID_RE  = /^[A-Za-z0-9_-]+$/;
 const ROUTE       = '/api/paint/';
+const BUCKET_ROUTE = '/api/bucket';
+const REFILL_ROUTE = '/api/refill';
 const MAX_BODY    = 50 * 1024 * 1024;
 
 // tileId → Promise — tail of this tile's serialized operations.
@@ -34,6 +36,30 @@ export function tilePaintPlugin() {
     configureServer(server) {
       server.middlewares.use(async (req, res, next) => {
         const url = req.url || '';
+
+        // Dev has no rate limit; the bucket endpoint exists only so the
+        // client init sync gets a 204 instead of 404. Emitting no X-Paint-*
+        // headers leaves the client's default bucket intact (effectively
+        // unlimited locally). Clients still flip _bucketReady → true.
+        if (url.startsWith(BUCKET_ROUTE) && req.method === 'GET') {
+          res.statusCode = 204;
+          res.end();
+          return;
+        }
+
+        // Dev stub for the cheat-code refill. No secret gating — locally
+        // there's no rate limit to bypass. Echoes a synthetic full-bucket
+        // so the client's tryRefill() returns 'ok' and the HUD flashes.
+        if (url.startsWith(REFILL_ROUTE) && req.method === 'POST') {
+          res.statusCode = 204;
+          res.setHeader('x-paint-tokens',    '200');
+          res.setHeader('x-paint-refill-at', String(Date.now()));
+          res.setHeader('x-paint-capacity',  '200');
+          res.setHeader('x-paint-refill-ms', '20000');
+          res.end();
+          return;
+        }
+
         if (!url.startsWith(ROUTE)) return next();
 
         const tileId = url.slice(ROUTE.length).split('?')[0];
@@ -102,9 +128,12 @@ async function handlePatch(file, req, res) {
 
   const eraseTs = typeof diff.__ts === 'number' ? diff.__ts : Date.now();
   delete diff.__ts;
-  // __author is a prod-only audit hook (see worker/index.js). Strip it so
-  // the client↔server envelope matches between dev and prod.
+  // __author / __seed / __undo are prod-only worker hooks (audit + rate-
+  // limit exemptions). Strip so the client↔server envelope matches between
+  // dev and prod. Dev has no rate limit — every write lands unchecked.
   delete diff.__author;
+  delete diff.__seed;
+  delete diff.__undo;
 
   let existing = {};
   try {

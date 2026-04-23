@@ -1,7 +1,7 @@
 import { localToLngLat } from './geo.js';
 
 const TILE_SIZE    = 256;  // OSM tile pixel size
-const ZOOM_MIN     = 13;
+const ZOOM_MIN     = 12;
 const ZOOM_MAX     = 19;
 const ZOOM_DEFAULT = 16;   // ~325m visible across 180px canvas at latitude 40.7°
 // Redraw every animation frame. drawImage on cached tile textures is a few
@@ -13,13 +13,15 @@ const EARTH_CIRCUM_M = 40075016.686;
 // Tile image cache: "z/tx/ty" → HTMLImageElement
 const _cache = new Map();
 
-let _ctx      = null;
-let _lastTime = -Infinity;
-let _size     = 180;   // current canvas side in px — mutable via setMinimapSize
-let _zoom     = ZOOM_DEFAULT;  // fractional; floor is the OSM tile z, remainder scales drawImage
-let _panX     = 0;     // metres — world X offset of view centre from player
-let _panZ     = 0;     // metres — world Z offset of view centre from player
-let _viewLat  = 40.70475;  // last drawn view-centre latitude, cached for metresPerPixel()
+let _ctx        = null;
+let _lastTime   = -Infinity;
+let _size       = 180;   // current canvas side in px — mutable via setMinimapSize
+let _zoom       = ZOOM_DEFAULT;  // fractional; floor is the OSM tile z, remainder scales drawImage
+let _panX       = 0;     // metres — world X offset of view centre from player
+let _panZ       = 0;     // metres — world Z offset of view centre from player
+let _viewLat    = 40.70475;  // last drawn view-centre latitude, cached for metresPerPixel()
+let _headingUp  = false;  // false = north-up (map fixed, arrow rotates); true = heading-up (map rotates, arrow fixed)
+let _lastYaw    = 0;      // cached last-drawn yaw — read by main.js to rotate the compass rose in lockstep
 
 export function initMinimap() {
   const canvas = document.getElementById('minimap');
@@ -42,6 +44,7 @@ export function setMinimapSize(px) {
     wrap.style.width  = px + 'px';
     wrap.style.height = px + 'px';
   }
+  document.documentElement.style.setProperty('--minimap-size', px + 'px');
   _lastTime = -Infinity;
 }
 
@@ -56,6 +59,14 @@ export function adjustMinimapPan(dxMetres, dzMetres) {
   _panX += dxMetres;
   _panZ += dzMetres;
 }
+
+export function getMinimapHeadingUp() { return _headingUp; }
+export function toggleMinimapHeadingUp() {
+  _headingUp = !_headingUp;
+  _lastTime = -Infinity;  // force immediate redraw
+  return _headingUp;
+}
+export function getMinimapYaw() { return _lastYaw; }
 
 /**
  * World metres per canvas pixel at the current zoom and view latitude.
@@ -73,8 +84,18 @@ export function minimapMetersPerPixel() {
  */
 export function minimapPixelToWorld(px, py, playerX, playerZ) {
   const m = minimapMetersPerPixel();
-  const dxPx = px - _size / 2;
-  const dyPx = py - _size / 2;
+  let dxPx = px - _size / 2;
+  let dyPx = py - _size / 2;
+  // Heading-up mode rotates the map by −yaw for display. A screen-space
+  // delta from centre is already in the rotated frame, so rotate it back
+  // by +yaw before converting to world XZ.
+  if (_headingUp) {
+    const c = Math.cos(_lastYaw), s = Math.sin(_lastYaw);
+    const rx = dxPx * c - dyPx * s;
+    const ry = dxPx * s + dyPx * c;
+    dxPx = rx;
+    dyPx = ry;
+  }
   return {
     x: playerX + _panX + dxPx * m,
     z: playerZ + _panZ + dyPx * m,
@@ -116,6 +137,7 @@ function getTile(z, tx, ty) {
 }
 
 function _draw(playerX, playerZ, yaw) {
+  _lastYaw = yaw;
   const viewX = playerX + _panX;
   const viewZ = playerZ + _panZ;
   const [vlng, vlat] = localToLngLat(viewX, viewZ);
@@ -133,13 +155,14 @@ function _draw(playerX, playerZ, yaw) {
   const cx = _size / 2, cy = _size / 2;
   _ctx.clearRect(0, 0, _size, _size);
 
-  // Map is drawn north-up (unrotated). Only the player arrow below rotates.
   _ctx.save();
   _ctx.translate(cx, cy);
-
-  // Axis-aligned map: reach = enough tiles to cover half the canvas side,
-  // plus one for fractional offsets. No √2 slack needed without rotation.
-  const reach = Math.max(1, Math.ceil(_size / (2 * tileSize)) + 1);
+  // Heading-up: rotate the whole map by -yaw so the player's facing direction
+  // ends up at the top of the canvas. Rotated corners reach √2× further from
+  // centre, so widen the tile fetch radius by that factor.
+  if (_headingUp) _ctx.rotate(-yaw);
+  const reachMult = _headingUp ? Math.SQRT2 : 1;
+  const reach = Math.max(1, Math.ceil(_size * reachMult / (2 * tileSize)) + 1);
   for (let dy = -reach; dy <= reach; dy++) {
     for (let dx = -reach; dx <= reach; dx++) {
       const tx = Math.floor(ftx) + dx;
@@ -147,36 +170,50 @@ function _draw(playerX, playerZ, yaw) {
       if (tx < 0 || ty < 0 || tx > maxTile || ty > maxTile) continue;
       const img = getTile(zFloor, tx, ty);
       if (!img.complete || !img.naturalWidth) continue;
-      // Pixel offset of this tile's top-left from the view centre.
-      const drawX = (tx - ftx) * tileSize;
-      const drawY = (ty - fty) * tileSize;
-      _ctx.drawImage(img, drawX, drawY, tileSize, tileSize);
+      // Pixel-snap positions + 1px bleed: sub-pixel drawImage destinations
+      // anti-alias along tile seams, which shows up as faint grid lines on
+      // the canvas. Rounding + overdrawing a pixel kills the seams cleanly.
+      const drawX = Math.round((tx - ftx) * tileSize);
+      const drawY = Math.round((ty - fty) * tileSize);
+      const drawW = Math.ceil(tileSize) + 1;
+      const drawH = Math.ceil(tileSize) + 1;
+      _ctx.drawImage(img, drawX, drawY, drawW, drawH);
     }
   }
-
   _ctx.restore();
 
-  // Player marker — offset from the view centre by (player - view) in pixels.
-  // Rotates with yaw so the arrow tip tracks the player's heading on a
-  // north-up map. When pan is zero, the marker sits at canvas centre.
-  const markerX = cx + (pftx - ftx) * tileSize;
-  const markerY = cy + (pfty - fty) * tileSize;
+  // Player marker. Position: offset from view centre by (player − view), with
+  // that offset rotated by −yaw in heading-up mode so it lands on the right
+  // tile. Tip: points toward yaw in north-up, fixed up in heading-up.
+  const ox = (pftx - ftx) * tileSize;
+  const oy = (pfty - fty) * tileSize;
+  let markerX, markerY, markerAngle;
+  if (_headingUp) {
+    const c = Math.cos(yaw), s = Math.sin(yaw);
+    markerX = cx + ox * c + oy * s;
+    markerY = cy - ox * s + oy * c;
+    markerAngle = 0;
+  } else {
+    markerX = cx + ox;
+    markerY = cy + oy;
+    markerAngle = yaw;
+  }
   _ctx.save();
   _ctx.translate(markerX, markerY);
-  _ctx.rotate(yaw);
+  _ctx.rotate(markerAngle);
 
-  // Shadow triangle for contrast against any map colour.
+  // 4-sided chevron: tip at front, two side wings, concave notch at back.
   _ctx.beginPath();
-  _ctx.moveTo(0, -9); _ctx.lineTo(-6, 5); _ctx.lineTo(6, 5);
-  _ctx.closePath();
-  _ctx.fillStyle = 'rgba(0,0,0,0.5)';
-  _ctx.fill();
-
-  // Main red triangle — tip points in the direction the player is facing.
-  _ctx.beginPath();
-  _ctx.moveTo(0, -8); _ctx.lineTo(-5, 4); _ctx.lineTo(5, 4);
+  _ctx.moveTo(0, -9);   // tip (forward)
+  _ctx.lineTo(6, 5);    // right wing
+  _ctx.lineTo(0, 2);    // back notch (concave — makes it a 4-sided kite)
+  _ctx.lineTo(-6, 5);   // left wing
   _ctx.closePath();
   _ctx.fillStyle = '#ff2222';
   _ctx.fill();
+  _ctx.lineWidth = 1;
+  _ctx.lineJoin = 'round';
+  _ctx.strokeStyle = '#000';
+  _ctx.stroke();
   _ctx.restore();
 }

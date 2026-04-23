@@ -43,6 +43,7 @@ METERS_PER_LNG = 111320.0 * math.cos(math.radians(REF_LAT))  # ≈ 84 390
 
 CELL_SIZE     = 150   # must match TreeManager.js
 MIN_HEIGHT_DM =  40   # drop sub-4 m detections (shrubs / small ornamentals / LiDAR noise)
+MIN_CANOPY_R  = 2.0   # drop skinny-canopy trees — they render as floating sticks
 THIN_FRACTION = 0.5   # keep this fraction of survivors (cheap density control)
 THIN_SEED     = 42    # deterministic — same build always picks the same subset
 
@@ -252,6 +253,7 @@ def main():
     n_keep   = 0
     n_roof   = 0
     n_clip   = 0
+    n_small  = 0
 
     for boro in BOROUGHS:
         input_path = os.path.join(shp_dir, boro)
@@ -290,12 +292,16 @@ def main():
 
         boro_roof = 0
         boro_clip = 0
+        boro_small = 0
         for i in np.where(keep)[0]:
             x    = float(world_x[i])
             z    = float(world_z[i])
             h    = hs[i] / 10.0
             area = float(areas[i])
             rr   = math.sqrt(area / math.pi) if area > 0 else max(0.5, h * 0.3)
+            if rr < MIN_CANOPY_R:
+                boro_small += 1
+                continue
             y_abs = roof_y_at(x, z, roof_tris, roof_index)
             if y_abs > 0:
                 boro_roof += 1
@@ -312,7 +318,9 @@ def main():
             ])
         n_roof += boro_roof
         n_clip += boro_clip
-        print(f'  {boro_roof:,} of those landed on a rooftop; {boro_clip:,} dropped for wall clearance')
+        n_small += boro_small
+        print(f'  {boro_roof:,} of those landed on a rooftop; {boro_clip:,} dropped for wall clearance; '
+              f'{boro_small:,} dropped for skinny canopy')
 
     total_bytes = 0
     for (gx, gz), flat in cells.items():
@@ -321,8 +329,9 @@ def main():
             json.dump(flat, f, separators=(',', ':'))
         total_bytes += os.path.getsize(path)
 
-    print(f'Wrote {n_keep - n_clip:,} trees ({n_roof:,} rooftop, {n_clip:,} dropped for wall clearance) '
-          f'across {len(cells):,} tiles → {output_dir}/ ({total_bytes / 1_000_000:.1f} MB raw)')
+    print(f'Wrote {n_keep - n_clip - n_small:,} trees ({n_roof:,} rooftop, {n_clip:,} dropped for wall clearance, '
+          f'{n_small:,} dropped for skinny canopy) across {len(cells):,} tiles → {output_dir}/ '
+          f'({total_bytes / 1_000_000:.1f} MB raw)')
 
 
 if __name__ == '__main__':

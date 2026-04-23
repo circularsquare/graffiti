@@ -1,4 +1,6 @@
 const TILE_ENDPOINT     = import.meta.env.VITE_PAINT_ENDPOINT ?? '/api/paint';
+const BUCKET_ENDPOINT   = TILE_ENDPOINT.replace(/\/paint\/?$/, '/bucket');
+const REFILL_ENDPOINT   = TILE_ENDPOINT.replace(/\/paint\/?$/, '/refill');
 const SAVE_DEBOUNCE_MS   = 500;
 // Two-tier pull cadence: tiles the player is currently standing in or looking
 // at poll fast so newly-painted cells show up near-realtime; everything else
@@ -34,6 +36,12 @@ function loadOrCreateAuthorId() {
     return crypto.randomUUID();
   }
 }
+
+// Token bucket — mirrors server constants. The server is authoritative; these
+// are defaults/optimistic values used until the first response header sync.
+// One token per cell written (paint or erase); seeds are exempt.
+const BUCKET_CAPACITY  = 200;
+const BUCKET_REFILL_MS = 20_000;
 
 /**
  * Stores painted cell state, sliced per tile, backed by the paint endpoint
@@ -89,6 +97,8 @@ class PaintStore {
     this._seedCompleteTiles  = new Set();  // tileIds with the seed-complete sentinel on disk
 
     this._dirtyCells         = new Map();  // tileId → Map<cellKey, cellData|null>
+    this._seedDirtyByTile    = new Map();  // tileId → Set<cellKey> subset of dirty that came from seed()
+    this._undoDirtyByTile    = new Map();  // tileId → Set<cellKey> subset of dirty that came from undo/redo
     this._tileETags          = new Map();  // tileId → etag
     this._savesInFlight      = new Set();
     this._saveTimer          = null;
@@ -100,6 +110,19 @@ class PaintStore {
     this._paused             = false;      // set by setPaused — gates both pull loops
 
     this._authorId = (typeof window !== 'undefined') ? loadOrCreateAuthorId() : null;
+
+    // Token bucket: fractional tokens + baseline timestamp. getBucketState()
+    // extrapolates refill from (now - _bucketRefillAt). Every PATCH response
+    // header resyncs us to the server's authoritative value, and a GET on
+    // init (_syncBucketOnInit) seeds state before the first paint attempt so
+    // we don't lie about a full bucket. Painting is blocked until ready.
+    this._bucketTokens    = BUCKET_CAPACITY;
+    this._bucketRefillAt  = Date.now();
+    this._bucketCapacity  = BUCKET_CAPACITY;
+    this._bucketRefillMs  = BUCKET_REFILL_MS;
+    this._bucketReady     = false;
+    this._bucketListeners = new Set();
+    if (this._authorId) this._syncBucketOnInit();
 
     // Beforeunload: PATCH dirty cells with keepalive so writes survive page close.
     // visibilitychange: regular async flush is fine for tab-hide.
@@ -171,6 +194,7 @@ class PaintStore {
     if (this._seedCompleteTiles.has(tileId)) return;
     this._seedCompleteTiles.add(tileId);
     this._dirty(tileId).set(SEED_COMPLETE_KEY, { complete: true });
+    this._markSeedDirty(tileId, SEED_COMPLETE_KEY);
     this._scheduleSave();
   }
 
@@ -206,6 +230,8 @@ class PaintStore {
     this._loadedTiles.delete(tileId);
     this._seedCompleteTiles.delete(tileId);
     this._dirtyCells.delete(tileId);
+    this._seedDirtyByTile.delete(tileId);
+    this._undoDirtyByTile.delete(tileId);
     this._tileETags.delete(tileId);
     this._savesInFlight.delete(tileId);
     this._activeTiles.delete(tileId);
@@ -214,6 +240,7 @@ class PaintStore {
   // ── Writes ─────────────────────────────────────────────────────────────────
 
   paint(cellKey, cellData) {
+    if (!this._consumeBucket(1)) return;
     if (this._authorId) cellData.authorId = this._authorId;
     this.cells.set(cellKey, cellData);
     this._indexAdd(cellKey);
@@ -225,6 +252,7 @@ class PaintStore {
 
   /** Paint multiple cells with a single PATCH per affected tile. */
   paintBatch(entries) {
+    if (!this._consumeBucket(entries.length)) return;
     for (const [k, v] of entries) {
       if (this._authorId) v.authorId = this._authorId;
       this.cells.set(k, v);
@@ -238,6 +266,7 @@ class PaintStore {
 
   erase(cellKey) {
     if (!this.cells.has(cellKey)) return;
+    if (!this._consumeBucket(1)) return;
     this.cells.delete(cellKey);
     this._indexRemove(cellKey);
     this._untrackCellTile(cellKey);
@@ -249,6 +278,7 @@ class PaintStore {
   eraseBatch(keys) {
     const present = keys.filter(k => this.cells.has(k));
     if (!present.length) return;
+    if (!this._consumeBucket(present.length)) return;
     for (const k of present) {
       this.cells.delete(k);
       this._indexRemove(k);
@@ -257,6 +287,34 @@ class PaintStore {
     }
     this._scheduleSave();
     for (const k of present) for (const fn of this._cellListeners) fn(k, null);
+  }
+
+  /**
+   * Unmetered paint/erase: identical to paint()/erase() but skips the token
+   * bucket and tags the cell as undo/redo-origin. When a flush contains only
+   * undo-origin cells, the PATCH goes out with __undo:true and the server
+   * exempts it from the bucket — net result: ctrl+Z/ctrl+Y are free.
+   * Also usable when the bucket isn't ready yet (so a fast undo during init
+   * sync still works).
+   */
+  paintUnmetered(cellKey, cellData) {
+    if (this._authorId) cellData.authorId = this._authorId;
+    this.cells.set(cellKey, cellData);
+    this._indexAdd(cellKey);
+    this._trackCellTile(cellKey);
+    this._markDirtyUndo(cellKey, cellData);
+    this._scheduleSave();
+    for (const fn of this._cellListeners) fn(cellKey, cellData);
+  }
+
+  eraseUnmetered(cellKey) {
+    if (!this.cells.has(cellKey)) return;
+    this.cells.delete(cellKey);
+    this._indexRemove(cellKey);
+    this._untrackCellTile(cellKey);
+    this._markDirtyUndo(cellKey, null);
+    this._scheduleSave();
+    for (const fn of this._cellListeners) fn(cellKey, null);
   }
 
   /**
@@ -272,6 +330,10 @@ class PaintStore {
     this._indexAdd(cellKey);
     this._trackCellTile(cellKey);
     this._markDirty(cellKey, cellData);
+    // Mark this cell as seed-origin so _flushTile can tag the PATCH __seed:true
+    // and skip the bucket charge. _markDirty already un-marks on paint/erase.
+    const tileId = this._tileOfBuilding.get(this._buildingKeyOf(cellKey));
+    if (tileId) this._markSeedDirty(tileId, cellKey);
     // Intentionally no _scheduleSave() — markTileSeedComplete fires the save
     // after the full seed pass, so the sentinel travels on the same PATCH as
     // the seeds. A premature save without the sentinel could cause the tile
@@ -307,6 +369,125 @@ class PaintStore {
     return () => this._buildingListeners.delete(fn);
   }
 
+  // ── Token bucket ───────────────────────────────────────────────────────────
+
+  /**
+   * Current bucket state, extrapolated from the last known baseline.
+   *   tokens:           integer 0..capacity (floored — the user has at least this much)
+   *   fractionalTokens: precise float, for tight refill math
+   *   capacity:         server-advertised capacity (mirrors BUCKET_CAPACITY until first sync)
+   *   refillMs:         ms per token refill
+   *   msUntilNext:      0 when full, else ms until the next integer token lands
+   */
+  getBucketState(now = Date.now()) {
+    const elapsed = Math.max(0, now - this._bucketRefillAt);
+    const raw = Math.min(this._bucketCapacity, this._bucketTokens + elapsed / this._bucketRefillMs);
+    const frac = raw - Math.floor(raw);
+    return {
+      tokens:           Math.floor(raw),
+      fractionalTokens: raw,
+      capacity:         this._bucketCapacity,
+      refillMs:         this._bucketRefillMs,
+      msUntilNext:      raw >= this._bucketCapacity ? 0 : Math.ceil((1 - frac) * this._bucketRefillMs),
+      ready:            this._bucketReady,
+    };
+  }
+
+  /** Bucket-state change listener: fn(state). Fires on local consume, on
+   *  header sync from PATCH responses, and once per second via tick() from
+   *  the HUD loop (the HUD calls that itself — the store doesn't poll). */
+  subscribeBucket(fn) {
+    this._bucketListeners.add(fn);
+    return () => this._bucketListeners.delete(fn);
+  }
+
+  /** Manual re-render trigger for UI. Call once per second from the render
+   *  loop so the countdown advances — cheaper than a setInterval we'd have
+   *  to tear down on page close. */
+  tickBucket() {
+    this._notifyBucket();
+  }
+
+  _consumeBucket(n) {
+    if (n <= 0) return true;
+    // Block writes until the init sync lands — otherwise we'd let the user
+    // paint under the optimistic default 100/100 and only learn the real
+    // balance (possibly 0) after the first PATCH response.
+    if (!this._bucketReady) return false;
+    const state = this.getBucketState();
+    if (state.fractionalTokens < n) return false;
+    // Collapse to the live fractional balance so we don't double-credit refill
+    // the next time we read (refill resumes from `now`).
+    this._bucketTokens   = state.fractionalTokens - n;
+    this._bucketRefillAt = Date.now();
+    this._notifyBucket();
+    return true;
+  }
+
+  /**
+   * Fire-and-forget GET /bucket on startup so the HUD + paint gate know the
+   * real balance before the first cell write. Dev's tile plugin returns 204
+   * with no X-Paint-* headers — that no-ops the sync, which is correct
+   * (dev has no rate limit), and we still flip ready=true so painting works.
+   * Any failure also flips ready=true to avoid permanently blocking writes
+   * if the worker is down; the next real PATCH will either 429 or confirm.
+   */
+  async _syncBucketOnInit() {
+    try {
+      const res = await fetch(`${BUCKET_ENDPOINT}?author=${encodeURIComponent(this._authorId)}`);
+      if (res.ok) this._syncBucketFromResponse(res);
+    } catch (e) {
+      console.warn('paintStore: bucket sync failed:', e);
+    }
+    this._bucketReady = true;
+    this._notifyBucket();
+  }
+
+  /**
+   * Cheat-code refill. Server gates on a REFILL_SECRET env var; we send
+   * whatever the caller gives us as the `X-Refill-Secret` header. Returns
+   * 'ok' on success, 'forbidden' when the secret is wrong (caller can
+   * re-prompt), or 'error' for anything else.
+   */
+  async tryRefill(secret) {
+    if (!this._authorId) return 'error';
+    try {
+      const res = await fetch(`${REFILL_ENDPOINT}?author=${encodeURIComponent(this._authorId)}`, {
+        method:  'POST',
+        headers: { 'X-Refill-Secret': secret },
+      });
+      if (res.status === 403) return 'forbidden';
+      if (!res.ok) return 'error';
+      this._syncBucketFromResponse(res);
+      return 'ok';
+    } catch (e) {
+      console.warn('paintStore: refill failed:', e);
+      return 'error';
+    }
+  }
+
+  _syncBucketFromResponse(res) {
+    const t = res.headers.get('X-Paint-Tokens');
+    const r = res.headers.get('X-Paint-Refill-At');
+    if (t === null || r === null) return;
+    const tokens   = parseFloat(t);
+    const refillAt = parseFloat(r);
+    if (!Number.isFinite(tokens) || !Number.isFinite(refillAt)) return;
+    this._bucketTokens   = tokens;
+    this._bucketRefillAt = refillAt;
+    const cap  = parseFloat(res.headers.get('X-Paint-Capacity'));
+    const ms   = parseFloat(res.headers.get('X-Paint-Refill-Ms'));
+    if (Number.isFinite(cap) && cap > 0) this._bucketCapacity = cap;
+    if (Number.isFinite(ms)  && ms  > 0) this._bucketRefillMs = ms;
+    this._notifyBucket();
+  }
+
+  _notifyBucket() {
+    if (this._bucketListeners.size === 0) return;
+    const s = this.getBucketState();
+    for (const fn of this._bucketListeners) fn(s);
+  }
+
   // ── Tile ↔ cell tracking ───────────────────────────────────────────────────
 
   _buildingKeyOf(cellKey) {
@@ -338,6 +519,31 @@ class PaintStore {
     const tileId = this._tileOfBuilding.get(this._buildingKeyOf(cellKey));
     if (!tileId) return; // orphaned cell (building not registered) — can't attribute
     this._dirty(tileId).set(cellKey, valueOrNull);
+    // Paint/erase over a seeded or undo-origin cell promotes it to user
+    // origin — next flush should be charged for it.
+    const seedSet = this._seedDirtyByTile.get(tileId);
+    if (seedSet) seedSet.delete(cellKey);
+    const undoSet = this._undoDirtyByTile.get(tileId);
+    if (undoSet) undoSet.delete(cellKey);
+  }
+
+  _markDirtyUndo(cellKey, valueOrNull) {
+    const tileId = this._tileOfBuilding.get(this._buildingKeyOf(cellKey));
+    if (!tileId) return;
+    this._dirty(tileId).set(cellKey, valueOrNull);
+    // A recent undo over a seed still "replaces" that write; drop it from
+    // the seed set so the envelope correctly reports the last-writer origin.
+    const seedSet = this._seedDirtyByTile.get(tileId);
+    if (seedSet) seedSet.delete(cellKey);
+    let undoSet = this._undoDirtyByTile.get(tileId);
+    if (!undoSet) { undoSet = new Set(); this._undoDirtyByTile.set(tileId, undoSet); }
+    undoSet.add(cellKey);
+  }
+
+  _markSeedDirty(tileId, cellKey) {
+    let set = this._seedDirtyByTile.get(tileId);
+    if (!set) { set = new Set(); this._seedDirtyByTile.set(tileId, set); }
+    set.add(cellKey);
   }
 
   _dirty(tileId) {
@@ -400,8 +606,7 @@ class PaintStore {
     }
     for (const [tileId, dirty] of this._dirtyCells) {
       if (dirty.size === 0) continue;
-      const body = { __ts: Date.now(), __author: this._authorId };
-      for (const [k, v] of dirty) body[k] = v;
+      const body = this._buildPatchBody(tileId, dirty);
       try {
         fetch(`${TILE_ENDPOINT}/${encodeURIComponent(tileId)}`, {
           method: 'PATCH',
@@ -411,7 +616,27 @@ class PaintStore {
         });
       } catch {}
       dirty.clear();
+      this._seedDirtyByTile.delete(tileId);
+      this._undoDirtyByTile.delete(tileId);
     }
+  }
+
+  /** Build a PATCH body from the given dirty map. Stamps __seed:true or
+   *  __undo:true when every dirty entry shares that origin — the server
+   *  exempts those batches from the token bucket. Seed takes precedence
+   *  (can only ever be true for seed-batched flushes, never mixed). Mixed
+   *  flushes (user paint + undo in the same 500ms debounce window) get
+   *  neither flag and pay full price; that's rare enough to not matter. */
+  _buildPatchBody(tileId, dirty) {
+    const seedSet = this._seedDirtyByTile.get(tileId);
+    const undoSet = this._undoDirtyByTile.get(tileId);
+    const isSeedOnly = !!seedSet && seedSet.size === dirty.size;
+    const isUndoOnly = !isSeedOnly && !!undoSet && undoSet.size === dirty.size;
+    const body = { __ts: Date.now(), __author: this._authorId };
+    if (isSeedOnly) body.__seed = true;
+    if (isUndoOnly) body.__undo = true;
+    for (const [k, v] of dirty) body[k] = v;
+    return body;
   }
 
   async _flushTile(tileId) {
@@ -423,10 +648,10 @@ class PaintStore {
     // (with newer writes winning, since they're already in the fresh map).
     const snapshot = dirty;
     this._dirtyCells.set(tileId, new Map());
+    const body = this._buildPatchBody(tileId, snapshot);
+    this._seedDirtyByTile.delete(tileId);
+    this._undoDirtyByTile.delete(tileId);
     this._savesInFlight.add(tileId);
-
-    const body = { __ts: Date.now(), __author: this._authorId };
-    for (const [k, v] of snapshot) body[k] = v;
 
     const t = performance.now();
     try {
@@ -435,6 +660,14 @@ class PaintStore {
         body: JSON.stringify(body),
         headers: { 'content-type': 'application/json' },
       });
+      this._syncBucketFromResponse(res);
+      if (res.status === 429) {
+        // Server rejected the batch (rate-limited). Local bucket was just
+        // re-synced to the server's view; the optimistic paints we applied
+        // locally are now phantom — the next pull loop reconciles them.
+        // Don't re-queue.
+        return;
+      }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       const etag = res.headers.get('etag');
       if (etag) this._tileETags.set(tileId, etag);

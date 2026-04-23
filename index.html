@@ -2,9 +2,26 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <title>Graffiti NYC</title>
+  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <script>
+    // Chrome's device-emulator occasionally lays out the initial paint at
+    // desktop width before the viewport meta takes effect, leaving fixed
+    // elements anchored to a ~980 px viewport and visibly clipped. Touching
+    // the meta tag programmatically forces a layout re-evaluation at
+    // device-width. No-op on real browsers that already applied it.
+    (function () {
+      var m = document.querySelector('meta[name=viewport]');
+      if (m) m.setAttribute('content', m.getAttribute('content'));
+    })();
+  </script>
+  <link rel="icon" type="image/png" href="/favicon.png">
+  <link rel="preconnect" href="https://fonts.googleapis.com">
+  <link rel="preconnect" href="https://fonts.gstatic.com" crossorigin>
+  <link rel="stylesheet" href="https://fonts.googleapis.com/css2?family=Nunito:wght@400;700&family=Silkscreen&display=swap">
+  <title>graffiti nyc</title>
   <style>
     * { margin: 0; padding: 0; box-sizing: border-box; }
+    html, body { width: 100%; height: 100%; }
     body { overflow: hidden; background: #1a1a2e; }
     canvas { display: block; }
 
@@ -16,7 +33,7 @@
       align-items: center;
       justify-content: center;
       color: white;
-      font-family: monospace;
+      font-family: 'Nunito', system-ui, sans-serif;
       font-size: 20px;
       text-align: center;
       gap: 12px;
@@ -26,7 +43,6 @@
     #overlay.hidden { display: none; }
     #overlay.loading { cursor: default; }
     #overlay.loading #overlay-prompt { opacity: 0.35; }
-    #overlay.loading #overlay-controls { display: none; }
     #overlay.startup { background: rgba(0,0,0,1); }
 
     #overlay-main {
@@ -35,21 +51,37 @@
       align-items: center;
       gap: 12px;
     }
-    .overlay-title { font-size: 24px; letter-spacing: 0.04em; }
+    .overlay-title {
+      font-family: 'Silkscreen', monospace;
+      font-size: 36px;
+      font-weight: 400;
+      letter-spacing: 0;
+    }
     #overlay-prompt { font-size: 16px; opacity: 0.85; }
 
     #overlay-controls {
-      position: absolute;
-      bottom: 24px;
-      left: 24px;
+      position: fixed;
+      bottom: 80px;
+      right: 24px;
       display: flex;
-      gap: 36px;
-      font-family: monospace;
+      gap: 22px;
+      padding: 12px 16px;
+      font-family: 'Nunito', system-ui, sans-serif;
       font-size: 12px;
-      color: rgba(255,255,255,0.85);
+      color: #fff;
       text-align: left;
       pointer-events: none;
+      z-index: 10;
+      background: rgba(0,0,0,0.55);
+      border: 2px solid rgba(255,255,255,0.25);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.6);
     }
+    #overlay-controls.hidden { display: none; }
+    /* Loading overlays suppress the in-game hud entirely. */
+    #overlay.loading ~ #overlay-controls { display: none; }
+    /* Pause menu: controls should always show, even if the user X'd them
+       out during gameplay — higher specificity than .hidden above. */
+    #overlay:not(.hidden):not(.loading) ~ #overlay-controls { display: flex; }
     #overlay-controls .ctrl-col {
       display: flex;
       flex-direction: column;
@@ -94,16 +126,30 @@
     #minimap-wrap.big.dragging { cursor: grabbing; }
     #minimap-wrap.escaped:not(.big) { pointer-events: auto; cursor: pointer; }
     #minimap-wrap canvas { display: block; }
-    #minimap-teleport-hint {
-      display: none;
-      position: fixed;
-      right: 16px; width: 234px;
-      text-align: center;
-      font-family: monospace; font-size: 11px;
-      color: rgba(255,255,255,0.55);
-      pointer-events: none;
-      z-index: 10;
+
+    #compass {
+      position: absolute;
+      top: 6px;
+      left: 6px;
+      width: 28px;
+      height: 28px;
+      padding: 0;
+      border: 2px solid rgba(255,255,255,0.4);
+      border-radius: 50%;
+      background: rgba(0,0,0,0.55);
+      box-shadow: 0 1px 3px rgba(0,0,0,0.5);
+      cursor: pointer;
+      pointer-events: auto;  /* stays clickable even when minimap-wrap is pointer-events:none */
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 2;
+      /* Rotated in JS each frame: 0 in north-up mode, -yaw in heading-up mode
+         (so the red arrow always points toward true north on screen). */
+      transform: rotate(0deg);
     }
+    #compass:hover { border-color: rgba(255,255,255,0.7); }
+    #compass svg { display: block; width: 18px; height: 18px; }
     #minimap-attr {
       position: fixed;
       top: 16px; right: 16px;
@@ -111,36 +157,12 @@
       color: rgba(255,255,255,0.5);
       pointer-events: none; z-index: 10; text-align: right;
     }
-    #minimap-random {
-      position: fixed;
-      top: 268px; right: 16px;
-      width: 234px;
-      padding: 6px 8px;
-      font-family: monospace;
-      font-size: 12px;
-      color: rgba(255,255,255,0.9);
-      background: rgba(0,0,0,0.55);
-      border: 2px solid rgba(255,255,255,0.25);
-      box-shadow: 0 2px 8px rgba(0,0,0,0.6);
-      cursor: pointer;
-      pointer-events: auto;
-      z-index: 10;
-    }
-    #minimap-random:hover {
-      background: rgba(0,0,0,0.8);
-      border-color: rgba(255,255,255,0.5);
-    }
-    #minimap-random:disabled {
-      opacity: 0.35;
-      cursor: default;
-    }
-
     #render-distance {
       position: fixed;
-      top: 302px; right: 16px;
+      bottom: 16px; right: 168px;
       width: 234px;
       padding: 6px 8px;
-      font-family: monospace;
+      font-family: 'Nunito', system-ui, sans-serif;
       font-size: 11px;
       color: rgba(255,255,255,0.9);
       background: rgba(0,0,0,0.55);
@@ -148,26 +170,14 @@
       box-shadow: 0 2px 8px rgba(0,0,0,0.6);
       pointer-events: auto;
       z-index: 10;
-      display: flex;
+      display: none;  /* hidden during locked gameplay — you can't drag it anyway */
       flex-direction: column;
       gap: 4px;
     }
+    /* Reveal only when the overlay is up and not mid-load (pause menu / map mode). */
+    #overlay:not(.hidden):not(.loading) ~ #render-distance { display: flex; }
     #render-distance-label { display: flex; justify-content: space-between; }
     #render-distance input { width: 100%; cursor: pointer; accent-color: #fff; }
-
-    #esc-hint {
-      position: fixed;
-      top: 16px; left: 50%;
-      transform: translateX(-50%);
-      font-family: monospace;
-      font-size: 12px;
-      letter-spacing: 0.08em;
-      color: rgba(255,255,255,0.85);
-      -webkit-text-stroke: 2px rgba(0,0,0,0.9);
-      paint-order: stroke fill;
-      pointer-events: none;
-      z-index: 10;
-    }
 
     #crosshair {
       position: fixed;
@@ -181,12 +191,44 @@
     }
     #crosshair.visible { display: block; }
 
+    #paint-bank {
+      position: fixed;
+      bottom: 16px;
+      right: 16px;
+      padding: 6px 10px;
+      font-family: 'Nunito', system-ui, sans-serif;
+      font-size: 13px;
+      color: rgba(255,255,255,0.95);
+      background: rgba(0,0,0,0.55);
+      border: 2px solid rgba(255,255,255,0.25);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+      pointer-events: none;
+      z-index: 10;
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      align-items: flex-end;
+      min-width: 140px;
+    }
+    #paint-bank .bank-count { font-size: 14px; letter-spacing: 0.02em; }
+    #paint-bank .bank-refill {
+      font-size: 11px;
+      color: rgba(255,255,255,0.6);
+    }
+    #paint-bank.empty { border-color: rgba(255,120,100,0.8); }
+    #paint-bank.empty .bank-count { color: rgba(255,150,130,1); }
+    #paint-bank.flash { animation: paint-bank-flash 600ms ease-out; }
+    @keyframes paint-bank-flash {
+      0%   { border-color: rgba(140,255,170,1); background: rgba(60,140,80,0.75); }
+      100% { border-color: rgba(255,255,255,0.25); background: rgba(0,0,0,0.55); }
+    }
+
 #loading-indicator {
       position: fixed;
       bottom: 16px;
       left: 16px;
       color: #fff;
-      font-family: monospace;
+      font-family: 'Nunito', system-ui, sans-serif;
       font-size: 13px;
       pointer-events: none;
       z-index: 10;
@@ -247,59 +289,229 @@
       border: 2px solid #fff;
       box-shadow: 0 0 0 1px rgba(0,0,0,0.8), 0 1px 3px rgba(0,0,0,0.6);
     }
+
+    #info-btn {
+      position: fixed;
+      top: 28px;
+      /* Tracks the minimap's left edge: 16px gutter + minimap width + 10px gap.
+         --minimap-size is set by minimap.js#setMinimapSize on every resize,
+         so the button follows the map as it expands in map mode. */
+      right: calc(16px + var(--minimap-size, 234px) + 10px);
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.55);
+      border: 2px solid rgba(255,255,255,0.25);
+      border-radius: 4px;
+      cursor: pointer;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.6);
+      z-index: 10;
+      padding: 0;
+    }
+    #info-btn svg { display: block; }
+    #info-btn:hover { border-color: rgba(255,255,255,0.55); }
+
+    #info-modal {
+      position: fixed;
+      inset: 0;
+      background: rgba(0,0,0,0.6);
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      z-index: 50;
+      padding: 24px;
+    }
+    #info-modal.hidden { display: none; }
+    #info-modal .info-content {
+      position: relative;
+      max-width: 520px;
+      width: 100%;
+      max-height: calc(100vh - 48px);
+      overflow-y: auto;
+      padding: 28px 32px 24px;
+      font-family: 'Nunito', system-ui, sans-serif;
+      font-size: 13px;
+      line-height: 1.5;
+      color: rgba(255,255,255,0.92);
+      background: rgba(20,20,30,0.97);
+      border: 2px solid rgba(255,255,255,0.25);
+      box-shadow: 0 4px 18px rgba(0,0,0,0.7);
+    }
+    #info-modal h2 {
+      font-size: 18px;
+      letter-spacing: 0.04em;
+      margin-bottom: 12px;
+    }
+    #info-modal p { margin-bottom: 10px; }
+    #info-modal p:last-child { margin-bottom: 0; }
+    #info-modal ul {
+      list-style: disc;
+      padding-left: 20px;
+      margin-bottom: 10px;
+    }
+    #info-modal li { margin-bottom: 4px; }
+    #info-modal li::marker { color: rgba(255,255,255,0.4); }
+    #info-modal a {
+      color: #8ac6ff;
+      text-decoration: none;
+      border-bottom: 1px dotted rgba(138,198,255,0.5);
+    }
+    #info-modal a:hover {
+      color: #b8dcff;
+      border-bottom-color: rgba(184,220,255,0.9);
+    }
+    #info-modal .info-close {
+      position: absolute;
+      top: 8px;
+      right: 10px;
+      width: 28px;
+      height: 28px;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      font-family: 'Nunito', system-ui, sans-serif;
+      font-size: 20px;
+      color: rgba(255,255,255,0.7);
+      background: transparent;
+      border: none;
+      cursor: pointer;
+      padding: 0;
+      line-height: 1;
+    }
+    #info-modal .info-close:hover { color: #fff; }
+
+    #mobile-warning {
+      display: none;
+      position: fixed;
+      top: 16px;
+      left: 16px;
+      right: 16px;
+      padding: 14px 18px;
+      font-family: 'Nunito', system-ui, sans-serif;
+      font-size: 18px;
+      line-height: 1.35;
+      color: #fff;
+      background: rgba(0,0,0,0.85);
+      border: 3px solid rgba(255,120,100,0.85);
+      border-radius: 6px;
+      box-shadow: 0 2px 12px rgba(0,0,0,0.7);
+      pointer-events: none;
+      z-index: 100;
+      text-align: center;
+      overflow-wrap: anywhere;
+    }
+    /* Touch-primary devices (phones, most tablets) — the game needs a
+       keyboard + mouse + pointer lock, none of which work here. */
+    @media (hover: none) and (pointer: coarse) {
+      #mobile-warning { display: block; }
+    }
   </style>
 </head>
 <body>
+  <div id="mobile-warning">note: this website is not usable on mobile</div>
   <div id="overlay" class="loading startup">
     <div id="overlay-main">
-      <div class="overlay-title">Graffiti NYC</div>
-      <div id="overlay-prompt">Loading data...</div>
-    </div>
-    <div id="overlay-controls">
-      <div class="ctrl-col">
-        <div class="ctrl-heading">Move</div>
-        <div class="ctrl-row"><span class="ctrl-key">WASD</span><span>walk / fly</span></div>
-        <div class="ctrl-row"><span class="ctrl-key">mouse</span><span>look</span></div>
-        <div class="ctrl-row"><span class="ctrl-key">Q</span><span>sprint</span></div>
-        <div class="ctrl-row"><span class="ctrl-key">space</span><span>jump / up</span></div>
-        <div class="ctrl-row"><span class="ctrl-key">space &times;2</span><span>toggle fly</span></div>
-      </div>
-      <div class="ctrl-col">
-        <div class="ctrl-heading">Paint</div>
-        <div class="ctrl-row"><span class="ctrl-key">click</span><span>paint</span></div>
-        <div class="ctrl-row"><span class="ctrl-key">right-click</span><span>erase</span></div>
-        <div class="ctrl-row"><span class="ctrl-key">tab</span><span>cycle color</span></div>
-        <div class="ctrl-row"><span class="ctrl-key">C</span><span>color picker</span></div>
-        <div class="ctrl-row"><span class="ctrl-key">I</span><span>eyedrop</span></div>
-        <div class="ctrl-row"><span class="ctrl-key">ctrl+Z</span><span>undo</span></div>
-      </div>
-      <div class="ctrl-col">
-        <div class="ctrl-row"><span class="ctrl-key">ESC</span><span>pause</span></div>
-        <div class="ctrl-heading ctrl-heading-gap">Map</div>
-        <div class="ctrl-row"><span class="ctrl-key">M</span><span>toggle map</span></div>
-        <div class="ctrl-row"><span class="ctrl-key">click map</span><span>fast travel</span></div>
-      </div>
+      <div class="overlay-title">graffiti nyc</div>
+      <div id="overlay-prompt">loading data...</div>
     </div>
   </div>
-  <div id="esc-hint">ESC to escape</div>
+  <div id="overlay-controls">
+    <div class="ctrl-col">
+      <div class="ctrl-row"><span class="ctrl-key">ESC</span><span>escape</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">X</span><span>hide controls</span></div>
+      <div class="ctrl-heading ctrl-heading-gap">Move</div>
+      <div class="ctrl-row"><span class="ctrl-key">WASD</span><span>walk</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">mouse</span><span>look</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">Q</span><span>sprint</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">space</span><span>jump / up</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">shift</span><span>descend</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">space &times;2</span><span>fly</span></div>
+    </div>
+    <div class="ctrl-col">
+      <div class="ctrl-heading">Map</div>
+      <div class="ctrl-row"><span class="ctrl-key">M</span><span>map</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">click map</span><span>teleport</span></div>
+      <div class="ctrl-heading ctrl-heading-gap">Paint</div>
+      <div class="ctrl-row"><span class="ctrl-key">click</span><span>paint</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">r click</span><span>erase</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">tab</span><span>cycle color</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">C</span><span>color picker</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">I</span><span>eyedrop</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">ctrl+Z</span><span>undo</span></div>
+    </div>
+  </div>
   <div id="crosshair"></div>
   <div id="colorbar"></div>
 <div id="loading-indicator">
-    <div id="loading-buildings" class="hidden">Loading buildings...</div>
-    <div id="loading-osm" class="hidden">Loading OSM...</div>
-    <div id="loading-terrain" class="hidden">Loading terrain...</div>
-    <div id="loading-paint" class="hidden">Saving...</div>
+    <div id="loading-buildings" class="hidden">loading buildings...</div>
+    <div id="loading-osm" class="hidden">loading osm...</div>
+    <div id="loading-terrain" class="hidden">loading terrain...</div>
+    <div id="loading-paint" class="hidden">saving...</div>
+  </div>
+  <div id="paint-bank">
+    <div class="bank-count" id="paint-bank-count">paint: loading…</div>
+    <div class="bank-refill" id="paint-bank-refill"></div>
   </div>
   <div id="minimap-wrap">
     <canvas id="minimap" width="234" height="234"></canvas>
+    <button id="compass" aria-label="Toggle heading-up / north-up" title="Toggle heading-up / north-up">
+      <svg viewBox="0 0 24 24" aria-hidden="true" focusable="false">
+        <!-- north (red) + south (light) compass needle -->
+        <polygon points="12,2 8,13 12,11 16,13" fill="#ff3b3b"/>
+        <polygon points="12,22 8,11 12,13 16,11" fill="rgba(255,255,255,0.55)"/>
+      </svg>
+    </button>
   </div>
-  <div id="minimap-teleport-hint">click to teleport</div>
   <div id="minimap-attr">© OpenStreetMap contributors</div>
-  <button id="minimap-random" disabled style="display:none">Random location</button>
-  <div id="render-distance" style="display:none">
-    <div id="render-distance-label"><span>Render distance</span><span id="render-distance-val">1.00×</span></div>
+  <button id="info-btn" aria-label="About this project" title="About">
+    <svg viewBox="0 0 16 16" width="14" height="14" aria-hidden="true" focusable="false">
+      <circle cx="8" cy="3.5" r="1.4" fill="currentColor"/>
+      <rect x="6.6" y="6.4" width="2.8" height="7" rx="0.4" fill="currentColor"/>
+    </svg>
+  </button>
+  <div id="info-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="info-title">
+    <div class="info-content">
+      <button class="info-close" aria-label="Close">&times;</button>
+      <h2 id="info-title">Graffiti NYC</h2>
+      <p>Paint every surface in the city!</p>
+
+      <p>Data sources:</p>
+      <ul>
+        <li>Buildings: NYC DoITT 3D Building Model (2014) (<a href="https://www.nyc.gov/content/planning/pages/resources/datasets/nyc-3d-model" target="_blank" rel="noopener">CityGML</a>)</li>
+        <li>Terrain: <a href="https://www.usgs.gov/3d-elevation-program" target="_blank" rel="noopener">USGS 3DEP 1 m DEM</a></li>
+        <li>Street map: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> via Overpass</li>
+      </ul>
+
+      <p>Rendered in-browser with Three.js / WebGL. Each building face is split into 1m paintable cells. Other painters' strokes usually show up within a few seconds.</p>
+
+      <p>more projects: <a href="https://anita.garden/projects" target="_blank" rel="noopener">anita.garden/projects</a></p>
+    </div>
+  </div>
+  <div id="render-distance">
+    <div id="render-distance-label"><span>render distance</span><span id="render-distance-val">1.00×</span></div>
     <input id="render-distance-slider" type="range" min="0.5" max="1.6" step="0.05" value="1">
   </div>
+  <script>
+    (function () {
+      const btn = document.getElementById('info-btn');
+      const modal = document.getElementById('info-modal');
+      const closeBtn = modal.querySelector('.info-close');
+      const open = () => modal.classList.remove('hidden');
+      const close = () => modal.classList.add('hidden');
+      btn.addEventListener('click', (e) => { e.stopPropagation(); open(); });
+      closeBtn.addEventListener('click', close);
+      modal.addEventListener('click', (e) => { if (e.target === modal) close(); });
+      document.addEventListener('keydown', (e) => {
+        if (e.key === 'Escape' && !modal.classList.contains('hidden')) {
+          e.stopPropagation();
+          close();
+        }
+      }, true);
+    })();
+  </script>
   <script type="module" src="/src/main.js"></script>
 </body>
 </html>

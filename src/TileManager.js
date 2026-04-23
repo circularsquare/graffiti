@@ -60,6 +60,11 @@ export class TileManager {
    * @param {function}     deps.onTileCellData(meshes)   — fires when seed/cell data has been attached (phase 2)
    * @param {function}     deps.onTileUnloaded()         — fires after tile meshes are removed
    * @param {object}       deps.seedConfig               — { fraction, colors: number[] } forwarded to worker
+   * @param {function}     [deps.resolveTileInjection]   — optional (tileId) =>
+   *      null                                — load normally, no injection.
+   *      'pending'                           — defer this tile until next tick (e.g. landmark Y not yet resolved).
+   *      { injectedBuildings, hideBuildingIds } — load with this payload forwarded to the worker.
+   *      Used by the landmark override layer (see src/landmarks.js).
    */
   constructor(deps) {
     this._scene               = deps.scene;
@@ -77,6 +82,7 @@ export class TileManager {
     this._onTileCellData      = deps.onTileCellData;
     this._onTileUnloaded      = deps.onTileUnloaded;
     this._seedConfig          = deps.seedConfig;
+    this._resolveTileInjection = deps.resolveTileInjection ?? null;
 
     // Map<tileId, TileState>
     this._tiles = new Map();
@@ -209,7 +215,7 @@ export class TileManager {
     if (this._onTileCellData) this._onTileCellData(tile.meshes);
   }
 
-  _fetchTileViaWorker(tileId, file) {
+  _fetchTileViaWorker(tileId, file, injection) {
     return new Promise((resolve, reject) => {
       this._pendingLoads.set(tileId, { resolve, reject });
       let idx = 0;
@@ -218,7 +224,15 @@ export class TileManager {
       }
       this._workerLoad[idx]++;
       this._tileToWorker.set(tileId, idx);
-      this._workers[idx].postMessage({ type: 'load', tileId, file, seedConfig: this._seedConfig });
+      // Landmark tris ride as a structured clone (not transferred) so the
+      // landmarks.js cache stays intact across tile reload cycles. A landmark
+      // is a few hundred floats — the memcpy is in the noise.
+      this._workers[idx].postMessage({
+        type: 'load', tileId, file,
+        seedConfig:        this._seedConfig,
+        hideBuildingIds:   injection?.hideBuildingIds,
+        injectedBuildings: injection?.injectedBuildings,
+      });
     });
   }
 
@@ -428,6 +442,16 @@ export class TileManager {
       const { tile, d2 } = candidates[i];
       if (tile.status === 'unloaded') {
         if (tile.lastUnloadD2 != null && d2 >= tile.lastUnloadD2) continue;
+        // Resolve landmark injection before admitting. 'pending' means a
+        // landmark in this tile is still waiting on its terrain Y — defer
+        // the load and try again next tick. Skipping here is safer than
+        // racing the load against landmark prep.
+        let injection = null;
+        if (this._resolveTileInjection) {
+          injection = this._resolveTileInjection(tile.id);
+          if (injection === 'pending') continue;
+        }
+        tile._injection = injection;
         this._enqueueLoad(tile, d2);
       }
     }
@@ -535,7 +559,10 @@ export class TileManager {
       // already transferred in. All heavy math (UV, normals, bbox, Y-shift)
       // has already happened off-thread — we only need to wrap typed arrays
       // into a THREE.Mesh and add it to the scene.
-      const meshDataList = await this._fetchTileViaWorker(tile.id, tile.file);
+      // tile._injection (if any) was stashed by tick() at admit time — see
+      // the resolveTileInjection contract.
+      const meshDataList = await this._fetchTileViaWorker(tile.id, tile.file, tile._injection);
+      tile._injection = null;
       const tReceived = performance.now();
       performance.measure('tile:wait', { start: tLoad, end: tReceived });
 
