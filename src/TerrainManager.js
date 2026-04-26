@@ -3,6 +3,7 @@ import { paintStore } from './paintStore.js';
 import { LAND_COLOR } from './OsmManager.js';
 import { worldToGrid } from './geo.js';
 import { injectGridOverlay, enableGridExtensions, GRID_SHADER_CACHE_KEY } from './gridShader.js';
+import { netReady, reportNetFailure, reportNetSuccess } from './netHealth.js';
 
 // The 5 paintable face types exposed per block: the top quad plus the four
 // cardinal sides (only emitted by the worker when the block is taller than
@@ -142,7 +143,9 @@ export class TerrainManager {
         const pending = this._pendingLoads.get(msg.key);
         if (!pending) return;
         this._pendingLoads.delete(msg.key);
-        pending.reject(new Error(msg.error));
+        const err = new Error(msg.error);
+        if (msg.kind) err.kind = msg.kind;
+        pending.reject(err);
       }
     };
     this._worker.onerror = (e) => {
@@ -171,18 +174,24 @@ export class TerrainManager {
     const minGz = Math.floor((pv - loadR) / CELL_SIZE);
     const maxGz = Math.floor((pv + loadR) / CELL_SIZE);
 
+    // Circuit breaker open: skip enqueueing this tick. Failed loads delete
+    // the cell from `_cells`, so without this gate every tick re-enqueues
+    // ~6 cells that all fail — ~20 errors/sec while offline. Cells stay
+    // un-attempted; the next tick after the breaker closes picks them up.
     const toEnqueue = [];
-    for (let gx = minGx; gx <= maxGx; gx++) {
-      for (let gz = minGz; gz <= maxGz; gz++) {
-        const d2 = _cellDist2(pu, pv, gx, gz);
-        if (d2 >= loadR2) continue;
-        const key = `${gx},${gz}`;
-        if (this._cells.has(key)) continue;
-        toEnqueue.push({ gx, gz, key, d2 });
+    if (netReady()) {
+      for (let gx = minGx; gx <= maxGx; gx++) {
+        for (let gz = minGz; gz <= maxGz; gz++) {
+          const d2 = _cellDist2(pu, pv, gx, gz);
+          if (d2 >= loadR2) continue;
+          const key = `${gx},${gz}`;
+          if (this._cells.has(key)) continue;
+          toEnqueue.push({ gx, gz, key, d2 });
+        }
       }
+      toEnqueue.sort((a, b) => a.d2 - b.d2);
+      for (const { gx, gz, key } of toEnqueue) this._enqueueLoad(gx, gz, key);
     }
-    toEnqueue.sort((a, b) => a.d2 - b.d2);
-    for (const { gx, gz, key } of toEnqueue) this._enqueueLoad(gx, gz, key);
 
     if (this._loadQueue.length > 0) {
       for (let i = this._loadQueue.length - 1; i >= 0; i--) {
@@ -247,7 +256,18 @@ export class TerrainManager {
   async _doLoad(gx, gz, key) {
     this._activeLoads++;
     try {
+      // Breaker may have opened between enqueue and dispatch (a sibling
+      // cell in the same wave already failed). Bail before firing the
+      // worker fetch — deleting the cell lets tick re-enqueue on the next
+      // pass once netReady() returns.
+      if (!netReady()) {
+        this._cells.delete(key);
+        return;
+      }
       const built = await this._fetchCellViaWorker(gx, gz, key);
+      // Any response from the worker (including empty:true from 404/HTML)
+      // means the network is working — clear the breaker.
+      reportNetSuccess();
       if (built.empty) {
         this._cells.set(key, 'empty');
         return;
@@ -303,7 +323,15 @@ export class TerrainManager {
       }
 
     } catch (e) {
-      console.error(`TerrainManager: failed to load cell ${gx},${gz}:`, e);
+      if (e.kind === 'NETWORK') {
+        // Transport failure — route to the shared breaker (one log for the
+        // whole outage) so 20 concurrent cell loads don't 20x-amplify the
+        // console. Cell is deleted from `_cells`, and the tick's netReady()
+        // gate blocks re-enqueue until the breaker closes.
+        reportNetFailure('load terrain cell');
+      } else {
+        console.error(`TerrainManager: failed to load cell ${gx},${gz}:`, e);
+      }
       this._cells.delete(key);
     } finally {
       this._activeLoads--;

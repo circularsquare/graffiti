@@ -2,7 +2,7 @@
 <html lang="en">
 <head>
   <meta charset="UTF-8">
-  <meta name="viewport" content="width=device-width, initial-scale=1">
+  <meta name="viewport" content="width=device-width, initial-scale=1, maximum-scale=1, user-scalable=no, viewport-fit=cover">
   <script>
     // Chrome's device-emulator occasionally lays out the initial paint at
     // desktop width before the viewport meta takes effect, leaving fixed
@@ -157,13 +157,10 @@
     }
     #compass:hover { border-color: rgba(255,255,255,0.7); }
     #compass svg { display: block; width: 18px; height: 18px; }
-    #minimap-attr {
-      position: fixed;
-      top: 16px; right: 16px;
-      font-family: sans-serif; font-size: 9px;
-      color: rgba(255,255,255,0.5);
-      pointer-events: none; z-index: 10; text-align: right;
-    }
+    /* OSM attribution is satisfied by the credit in #info-modal (the about
+       panel). Per OSM attribution guidelines, crediting via an
+       "About / Info" surface is acceptable, so we don't need an overlay. */
+
     #render-distance {
       position: fixed;
       bottom: 16px;
@@ -261,7 +258,9 @@
       content: '';
       width: 10px; height: 10px;
       border-radius: 50%;
-      background: #ff4b3b;
+      /* Yellow pulse = "work in progress" (buildings / osm / terrain / paint).
+         Red (below, for #loading-net) is reserved for error states. */
+      background: #dca036;
       box-shadow: 0 0 4px rgba(0,0,0,0.7);
       flex-shrink: 0;
       animation: loading-pulse 1s ease-in-out infinite;
@@ -269,6 +268,13 @@
     @keyframes loading-pulse {
       0%, 100% { opacity: 1; }
       50%      { opacity: 0.65; }
+    }
+    /* Offline indicator: same stack as loading rows, but styled as a status
+       not a progress spinner. Red dot + steady (no pulse) so it reads as a
+       persistent error condition rather than "something is happening". */
+    #loading-net::before {
+      background: #ff4b3b !important;
+      animation: none !important;
     }
 
     #colorbar {
@@ -299,6 +305,7 @@
       grid-column: 1 / -1;
       width: auto;
     }
+    .color-swatch.erase svg { width: 14px; height: 14px; display: block; }
     .color-swatch.active {
       border: 2px solid #fff;
       box-shadow: 0 0 0 1px rgba(0,0,0,0.8), 0 1px 3px rgba(0,0,0,0.6);
@@ -403,36 +410,292 @@
       line-height: 1;
     }
     #info-modal .info-close:hover { color: #fff; }
+    #info-modal .info-close svg { width: 14px; height: 14px; display: block; }
 
-    #mobile-warning {
-      display: none;
+    /* ─── Mobile controls ───────────────────────────────────────────────── */
+    /* Created at runtime by src/mobileControls.js on touch-primary devices. */
+
+    #mobile-joystick {
       position: fixed;
-      top: 16px;
-      left: 16px;
-      right: 16px;
-      padding: 14px 18px;
-      font-family: 'Nunito', system-ui, sans-serif;
-      font-size: 18px;
-      line-height: 1.35;
-      color: #fff;
-      background: rgba(0,0,0,0.85);
-      border: 3px solid rgba(255,120,100,0.85);
-      border-radius: 6px;
-      box-shadow: 0 2px 12px rgba(0,0,0,0.7);
+      left: calc(12px + env(safe-area-inset-left, 0px));
+      bottom: calc(12px + env(safe-area-inset-bottom, 0px));
+      width: 132px;
+      height: 132px;
+      border-radius: 50%;
+      background: rgba(0,0,0,0.35);
+      border: 2px solid rgba(255,255,255,0.25);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      z-index: 12;
+    }
+    .mobile-joystick-knob {
+      position: absolute;
+      top: 50%;
+      left: 50%;
+      width: 58px;
+      height: 58px;
+      border-radius: 50%;
+      background: rgba(255,255,255,0.55);
+      border: 2px solid rgba(255,255,255,0.85);
+      transform: translate(-50%, -50%);
       pointer-events: none;
-      z-index: 100;
-      text-align: center;
-      overflow-wrap: anywhere;
     }
-    /* Touch-primary devices (phones, most tablets) — the game needs a
-       keyboard + mouse + pointer lock, none of which work here. */
+
+    .mobile-fly-btn {
+      position: fixed;
+      /* Stacked vertically immediately right of the joystick (joystick is
+         132 wide at left:12 → right edge 144; +8 px gap → buttons at 152). */
+      left: calc(152px + env(safe-area-inset-left, 0px));
+      width: 58px;
+      height: 58px;
+      padding: 0;
+      /* Flex-center so the inline <svg> child sits dead-centre instead of
+         flowing from the top-left (button default alignment). */
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      border-radius: 50%;
+      background: rgba(0,0,0,0.4);
+      border: 2px solid rgba(255,255,255,0.3);
+      color: rgba(255,255,255,0.9);
+      font-family: 'Nunito', system-ui, sans-serif;
+      font-size: 22px;
+      line-height: 1;
+      box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+      touch-action: none;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      z-index: 12;
+      cursor: pointer;
+    }
+    .mobile-fly-btn.pressed { background: rgba(255,255,255,0.25); }
+    /* Triangles sized explicitly — the inline <svg> has no intrinsic dims,
+       so without this it renders at the UA default (300×150) and clips. */
+    .mobile-fly-btn svg { width: 35px; height: 35px; display: block; }
+    #mobile-fly-up   { bottom: calc(76px + env(safe-area-inset-bottom, 0px)); }
+    #mobile-fly-down { bottom: calc(12px + env(safe-area-inset-bottom, 0px)); }
+
+    /* Walk/fly toggle: sits above the joystick, left-aligned with it.
+       Active state (flying) lights up. */
+    #mobile-fly-toggle {
+      position: fixed;
+      left: calc(12px + env(safe-area-inset-left, 0px));
+      bottom: calc(156px + env(safe-area-inset-bottom, 0px));
+      width: 58px;
+      height: 58px;
+      padding: 0;
+      border-radius: 50%;
+      background: rgba(0,0,0,0.4);
+      border: 2px solid rgba(255,255,255,0.3);
+      color: rgba(255,255,255,0.85);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.5);
+      touch-action: manipulation;
+      user-select: none;
+      -webkit-user-select: none;
+      -webkit-tap-highlight-color: transparent;
+      z-index: 12;
+      cursor: pointer;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+    }
+    #mobile-fly-toggle.active {
+      background: rgba(140,200,255,0.35);
+      border-color: rgba(200,230,255,0.85);
+      color: rgba(255,255,255,1);
+    }
+    /* Wing SVG uses a 32×20 viewBox so it reads wider than tall like a wing.
+       Max width set on the element lets it fill the button without stretching. */
+    #mobile-fly-toggle svg { width: 32px; height: 22px; display: block; }
+
+    /* Touch-primary devices (phones, most tablets). Hide the keyboard/mouse
+       cheatsheet and the render-distance slider (neither applies to touch),
+       and disable browser scroll/zoom gestures so a drag-look doesn't
+       pull-to-refresh the page. Duplicated across the media query AND an
+       explicit .mobile class because the media query misfires on
+       "Request desktop site" and some Android builds that report
+       pointer: fine on real touchscreens — the class is set by
+       src/mobileControls.js using touch-capability as a fallback signal. */
     @media (hover: none) and (pointer: coarse) {
-      #mobile-warning { display: block; }
+      html, body { touch-action: none; overscroll-behavior: none; }
+      canvas { touch-action: none; }
+      #overlay-controls { display: none !important; }
+      #render-distance { display: none !important; }
+      /* Small minimap on mobile — the 234 px default eats too much of a
+         phone viewport. Inline sizes (wrap width/height + --minimap-size)
+         are written by setMinimapSize on boot; JS picks the mobile value. */
+      #minimap-wrap { pointer-events: auto; touch-action: none; }
     }
+    html.mobile, html.mobile body { touch-action: none; overscroll-behavior: none; }
+    html.mobile canvas { touch-action: none; }
+    html.mobile #overlay-controls { display: none !important; }
+    html.mobile #render-distance { display: none !important; }
+    html.mobile #minimap-wrap { pointer-events: auto; touch-action: none; }
+
+    /* Tighter edge margins on mobile — the phone viewport is narrow enough
+       that the 16 px desktop gutters eat visible real estate. */
+    html.mobile #colorbar    { top: 10px; left: 10px; }
+    html.mobile #minimap-wrap{ top: 10px; right: 10px; }
+    /* Info + map buttons sit UNDER the minimap on mobile, right-aligned.
+       Tracking --minimap-size means they slide down when the map is
+       enlarged. Map button is rightmost (closer to map's right edge),
+       info button sits to its left. */
+    html.mobile #info-btn    {
+      top: calc(10px + var(--minimap-size, 234px) + 10px);
+      right: calc(10px + 30px + 6px);
+    }
+    html.mobile #map-btn     {
+      top: calc(10px + var(--minimap-size, 234px) + 10px);
+      right: 10px;
+    }
+    html.mobile #waypoints-btn {
+      top: calc(10px + var(--minimap-size, 234px) + 10px);
+      right: calc(10px + 30px + 6px + 30px + 6px);
+    }
+    html.mobile #waypoints-menu {
+      top: calc(10px + var(--minimap-size, 234px) + 10px + 30px + 6px);
+      right: 10px;
+    }
+    html.mobile #paint-bank  { bottom: 10px; right: 10px; }
+    /* Crosshair never applies on mobile — paint lands where the finger
+       tapped, not at the screen centre. Safety net in case some flow still
+       tries to add the .visible class. */
+    html.mobile #crosshair   { display: none !important; }
+    @media (hover: none) and (pointer: coarse) {
+      #colorbar    { top: 10px; left: 10px; }
+      #minimap-wrap{ top: 10px; right: 10px; }
+      #info-btn    {
+        top: calc(10px + var(--minimap-size, 234px) + 10px);
+        right: calc(10px + 30px + 6px);
+      }
+      #map-btn     {
+        top: calc(10px + var(--minimap-size, 234px) + 10px);
+        right: 10px;
+      }
+      #waypoints-btn {
+        top: calc(10px + var(--minimap-size, 234px) + 10px);
+        right: calc(10px + 30px + 6px + 30px + 6px);
+      }
+      #waypoints-menu {
+        top: calc(10px + var(--minimap-size, 234px) + 10px + 30px + 6px);
+        right: 10px;
+      }
+      #paint-bank  { bottom: 10px; right: 10px; }
+      #crosshair   { display: none !important; }
+    }
+
+    /* Map-toggle button. Desktop: sits immediately left of #info-btn, same
+       top offset. Mobile: see html.mobile / @media block below — slides
+       UNDER the minimap with #info-btn, right-aligned. Styling mirrors
+       #info-btn so the pair reads as a group. */
+    #map-btn {
+      position: fixed;
+      top: 26px;
+      /* Right of minimap left edge → calc(16 + size + 10), then account for
+         #info-btn width (30) + 6 px gap to land left of info-btn. */
+      right: calc(16px + var(--minimap-size, 234px) + 10px + 30px + 6px);
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.55);
+      border: 2px solid rgba(255,255,255,0.25);
+      border-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.6);
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      touch-action: manipulation;
+      z-index: 10;
+    }
+    #map-btn:hover { border-color: rgba(255,255,255,0.55); }
+    #map-btn.active {
+      background: rgba(140,200,255,0.35);
+      border-color: rgba(200,230,255,0.85);
+    }
+    #map-btn svg { width: 20px; height: 20px; display: block; }
+
+    /* Waypoints button — sits left of #map-btn. Mirrors the styling of
+       #info-btn / #map-btn so the three read as a group. Mobile placement
+       below puts it in the same row UNDER the minimap with the other two. */
+    #waypoints-btn {
+      position: fixed;
+      top: 26px;
+      /* Right of minimap left edge + #info-btn (30+6) + #map-btn (30+6). */
+      right: calc(16px + var(--minimap-size, 234px) + 10px + 30px + 6px + 30px + 6px);
+      width: 30px;
+      height: 30px;
+      padding: 0;
+      display: flex;
+      align-items: center;
+      justify-content: center;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.55);
+      border: 2px solid rgba(255,255,255,0.25);
+      border-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.6);
+      cursor: pointer;
+      -webkit-tap-highlight-color: transparent;
+      touch-action: manipulation;
+      z-index: 10;
+    }
+    #waypoints-btn:hover { border-color: rgba(255,255,255,0.55); }
+    #waypoints-btn.active {
+      background: rgba(140,200,255,0.35);
+      border-color: rgba(200,230,255,0.85);
+    }
+    #waypoints-btn svg { width: 18px; height: 18px; display: block; }
+
+    #waypoints-menu {
+      position: fixed;
+      /* Drops down under #waypoints-btn (top 26 + 30 height + 6 gap). */
+      top: 62px;
+      right: calc(16px + var(--minimap-size, 234px) + 10px + 30px + 6px + 30px + 6px);
+      display: flex;
+      flex-direction: column;
+      gap: 2px;
+      padding: 6px;
+      font-family: 'Nunito', system-ui, sans-serif;
+      font-size: 12px;
+      background: rgba(0,0,0,0.85);
+      border: 2px solid rgba(255,255,255,0.25);
+      box-shadow: 0 2px 8px rgba(0,0,0,0.6);
+      z-index: 11;
+      min-width: 160px;
+    }
+    #waypoints-menu.hidden { display: none; }
+    #waypoints-menu .waypoint-item {
+      padding: 6px 10px;
+      background: transparent;
+      border: 1px solid transparent;
+      color: rgba(255,255,255,0.92);
+      font: inherit;
+      text-align: left;
+      cursor: pointer;
+      white-space: nowrap;
+      border-radius: 3px;
+    }
+    #waypoints-menu .waypoint-item:hover {
+      background: rgba(255,255,255,0.1);
+      border-color: rgba(255,255,255,0.3);
+    }
+
+    /* Kill the default focus ring on the runtime-injected mobile controls.
+       Chrome's device emulator forwards keyboard tab events even on a
+       "mobile" preset, which surfaces the ring around the wing toggle
+       whenever the user types. No a11y cost on a real touch device. */
+    #mobile-joystick:focus,
+    #mobile-fly-toggle:focus,
+    .mobile-fly-btn:focus { outline: none; }
   </style>
 </head>
 <body>
-  <div id="mobile-warning">note: this website is not usable on mobile</div>
   <div id="overlay" class="loading startup">
     <div id="overlay-main">
       <div class="overlay-title" role="img" aria-label="graffiti nyc"></div>
@@ -467,6 +730,7 @@
   <div id="crosshair"></div>
   <div id="colorbar"></div>
 <div id="loading-indicator">
+    <div id="loading-net" class="hidden">offline — retrying</div>
     <div id="loading-buildings" class="hidden">loading buildings...</div>
     <div id="loading-osm" class="hidden">loading osm...</div>
     <div id="loading-terrain" class="hidden">loading terrain...</div>
@@ -486,22 +750,36 @@
       </svg>
     </button>
   </div>
-  <div id="minimap-attr">© OpenStreetMap contributors</div>
   <button id="info-btn" aria-label="About this project" title="About">
     <span class="info-i">i</span>
   </button>
+  <button id="map-btn" aria-label="Toggle map size" title="Toggle map size">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+      <path d="M3 6 L9 4 L15 6 L21 4 L21 18 L15 20 L9 18 L3 20 Z"/>
+      <path d="M9 4 L9 18"/>
+      <path d="M15 6 L15 20"/>
+    </svg>
+  </button>
+  <button id="waypoints-btn" aria-label="Waypoints" title="Waypoints">
+    <svg viewBox="0 0 24 24" fill="none" stroke="currentColor" stroke-width="2" stroke-linejoin="round" stroke-linecap="round" aria-hidden="true">
+      <path d="M12 22 C 12 22 19 14.5 19 9 a 7 7 0 1 0 -14 0 c 0 5.5 7 13 7 13 z"/>
+      <circle cx="12" cy="9" r="2.5"/>
+    </svg>
+  </button>
+  <div id="waypoints-menu" class="hidden" role="menu" aria-label="Waypoints"></div>
   <div id="info-modal" class="hidden" role="dialog" aria-modal="true" aria-labelledby="info-title">
     <div class="info-content">
-      <button class="info-close" aria-label="Close">&times;</button>
+      <button class="info-close" aria-label="Close"><svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" stroke-linecap="round" aria-hidden="true"><line x1="3" y1="3" x2="11" y2="11"/><line x1="11" y1="3" x2="3" y2="11"/></svg></button>
       <h2 id="info-title">graffiti nyc</h2>
       <p>Paint every surface in New York City!</p>
-      <p>Your paint will be visible for all to see. Unless someone paints over it. Please don't paint anything inappropriate or i will ban you!! &gt;_&lt; </p>
+      <p>Your paint will be visible for all to see. Unless someone paints over it. Please don't paint anything inappropriate!! &gt;_&lt; </p>
 
       <p>Data sources:</p>
       <ul>
         <li>Buildings: NYC DoITT 3D Building Model (2014) (<a href="https://www.nyc.gov/content/planning/pages/resources/datasets/nyc-3d-model" target="_blank" rel="noopener">CityGML</a>)</li>
         <li>Terrain: <a href="https://www.usgs.gov/3d-elevation-program" target="_blank" rel="noopener">USGS 3DEP 1 m DEM</a></li>
         <li>Street map: <a href="https://www.openstreetmap.org/copyright" target="_blank" rel="noopener">OpenStreetMap</a> via Overpass</li>
+        <li>Trees: NYC LiDAR tree dataset (Scientific Data, 2023)</li>
       </ul>
 
       <p>Rendered with Three.js and WebGL. Each building face is split into 1m paintable cells. The terrain is 2m cells. </p>

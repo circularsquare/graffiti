@@ -9,8 +9,8 @@ const AUDIT_TTL_SECONDS = 14 * 24 * 60 * 60;
 // write (paint or erase). Seeds are exempt (__seed flag). Bucket state lives
 // on the AUDIT KV under `bucket:<authorId>`; after BUCKET_TTL_SECONDS of
 // inactivity it vanishes and the user gets a fresh full bucket next visit.
-const BUCKET_CAPACITY = 200;
-const BUCKET_REFILL_MS = 20_000;
+const BUCKET_CAPACITY = 500;
+const BUCKET_REFILL_MS = 10_000;
 const BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
 const SEED_COMPLETE_KEY = '__seed_complete__';
 
@@ -23,6 +23,22 @@ const CORS = {
 
 export default {
   async fetch(request, env) {
+    try {
+      return await handle(request, env);
+    } catch (e) {
+      // Any uncaught throw (R2 hiccup, KV timeout, etc.) would otherwise
+      // surface as Cloudflare's CORS-less error page — which the browser
+      // mislabels as a CORS failure. Return a proper 500 with CORS so the
+      // client's circuit breaker sees a real HTTP error and retries cleanly.
+      return new Response(JSON.stringify({ error: 'internal', message: String(e?.message ?? e) }), {
+        status: 500,
+        headers: { ...CORS, 'Content-Type': 'application/json' },
+      });
+    }
+  },
+};
+
+async function handle(request, env) {
     const url   = new URL(request.url);
     const parts = url.pathname.replace(/^\//, '').split('/');
 
@@ -98,8 +114,11 @@ export default {
     if (request.method === 'GET') {
       const ifNoneMatch = request.headers.get('if-none-match')?.replace(/"/g, '') ?? null;
       const obj = await env.PAINT.get(key, ifNoneMatch ? { onlyIf: { etagDoesNotMatch: ifNoneMatch } } : undefined);
-      if (!obj && ifNoneMatch) {
-        return new Response(null, { status: 304, headers: { ...CORS, ETag: `"${ifNoneMatch}"` } });
+
+      // R2 precondition semantics: with etagDoesNotMatch, a match returns an
+      // R2Object (metadata only, no body / no .text()). Detect that and 304.
+      if (obj && ifNoneMatch && typeof obj.text !== 'function') {
+        return new Response(null, { status: 304, headers: { ...CORS, ETag: `"${obj.etag}"` } });
       }
       const etag = obj?.etag ?? null;
       const body = obj ? await obj.text() : '{}';
@@ -220,8 +239,7 @@ export default {
     }
 
     return new Response('method not allowed', { status: 405, headers: { ...CORS, Allow: 'GET, PATCH' } });
-  },
-};
+}
 
 // Read-only view of the current bucket. Returns full capacity when the AUDIT
 // binding is absent (no rate limit configured) or no row exists yet (fresh

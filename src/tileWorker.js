@@ -242,7 +242,12 @@ async function onLoadMessage(e) {
 
     self.postMessage({ type: 'cellData', tileId, cellData }, transferCells);
   } catch (err) {
-    self.postMessage({ type: 'error', tileId, error: err.message });
+    // Tag transport-level failures so the main thread can route them to the
+    // shared netHealth breaker instead of treating them as content errors.
+    // TypeError from fetch covers wifi drops, DNS failures, and CORS
+    // preflight rejections when no response came back.
+    const kind = err instanceof TypeError ? 'NETWORK' : 'OTHER';
+    self.postMessage({ type: 'error', tileId, error: err.message, kind });
   }
 }
 
@@ -486,67 +491,6 @@ function makeMeshData(flatVerts, id, floorY, horizU, meshType, shiftY) {
   verts = dedupTriangles(verts, id, meshType);
 
   const faceInfo = extractFaces(verts);
-
-  // ── DIAGNOSTIC — strip once we know ─────────────────────────────────────
-  // For each face, compute the spread of per-triangle planeD values
-  // (triangle centroid projected onto face's averaged normal). Any face
-  // whose spread exceeds 0.5 m contains triangles that shouldn't geometrically
-  // belong to it — a sign that greedy or post-merge glued distant geometry
-  // into one face.
-  {
-    const triCount = (verts.length / 9) | 0;
-    const perFace = faceInfo.faces.map(() => ({ count: 0, minPD: Infinity, maxPD: -Infinity }));
-    for (let ti = 0; ti < triCount; ti++) {
-      const fi = faceInfo.triFace[ti];
-      if (fi < 0) continue;
-      const f = faceInfo.faces[fi];
-      if (!f) continue;
-      const i0 = ti * 9;
-      const cx = (verts[i0]     + verts[i0 + 3] + verts[i0 + 6]) / 3;
-      const cy = (verts[i0 + 1] + verts[i0 + 4] + verts[i0 + 7]) / 3;
-      const cz = (verts[i0 + 2] + verts[i0 + 5] + verts[i0 + 8]) / 3;
-      const pd = f.normal[0] * cx + f.normal[1] * cy + f.normal[2] * cz;
-      const entry = perFace[fi];
-      entry.count++;
-      if (pd < entry.minPD) entry.minPD = pd;
-      if (pd > entry.maxPD) entry.maxPD = pd;
-    }
-    // Log high-spread faces as before.
-    for (let fi = 0; fi < perFace.length; fi++) {
-      const e = perFace[fi];
-      if (e.count < 1) continue;
-      const spread = e.maxPD - e.minPD;
-      if (spread > 0.5) {
-        const f = faceInfo.faces[fi];
-        console.warn(
-          `[faceSpread] ${id}:${meshType} face ${fi}: ` +
-          `tris=${e.count} spread=${spread.toFixed(2)}m ` +
-          `triPD∈[${e.minPD.toFixed(2)}, ${e.maxPD.toFixed(2)}] ` +
-          `facePD=${f.planeD.toFixed(2)} ` +
-          `normal=(${f.normal[0].toFixed(2)}, ${f.normal[1].toFixed(2)}, ${f.normal[2].toFixed(2)})`
-        );
-      }
-    }
-
-    // Extra: dump the full per-face summary for a specific suspect building.
-    // Lets us see whether this buildingId:meshType appears in multiple tiles
-    // (would show up as multiple dumps here) and every face's actual PD range.
-    if (id === 'gml_GPNX0C79ZX5WQHONUIVPFFNSA8HNVT5LF7V1' && meshType === 'wall') {
-      console.log(`[faceDump] ${id}:${meshType} totalFaces=${perFace.length} totalTris=${triCount}`);
-      for (let fi = 0; fi < perFace.length; fi++) {
-        const e = perFace[fi];
-        if (e.count < 1) continue;
-        const f = faceInfo.faces[fi];
-        console.log(
-          `  face ${fi}: tris=${e.count} ` +
-          `triPD∈[${e.minPD.toFixed(3)}, ${e.maxPD.toFixed(3)}] ` +
-          `facePD=${f.planeD.toFixed(3)} ` +
-          `normal=(${f.normal[0].toFixed(4)}, ${f.normal[1].toFixed(4)}, ${f.normal[2].toFixed(4)})`
-        );
-      }
-    }
-  }
-  // ────────────────────────────────────────────────────────────────────────
 
   const uv          = computeGridUVs(verts, GRID_SIZE, horizU, faceInfo);
   const normal      = computeFlatNormals(verts);

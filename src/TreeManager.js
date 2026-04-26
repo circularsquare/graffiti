@@ -1,4 +1,5 @@
 import * as THREE from 'three';
+import { netReady, reportNetFailure, reportNetSuccess } from './netHealth.js';
 
 const CELL_SIZE     = 150;  // world-space metres per tile — must match build_trees.py
 const LOAD_RADIUS   = 150;
@@ -115,25 +116,30 @@ export class TreeManager {
     const unloadR2 = (LOAD_RADIUS + UNLOAD_MARGIN) ** 2;
 
     // Collect new candidates with cached squared distance, then sort once.
-    const toEnqueue = [];
-    for (let dx = -r; dx <= r; dx++) {
-      for (let dz = -r; dz <= r; dz++) {
-        const gx = cx + dx;
-        const gz = cz + dz;
-        const wx = (gx + 0.5) * CELL_SIZE;
-        const wz = (gz + 0.5) * CELL_SIZE;
-        const d2 = (px - wx) ** 2 + (pz - wz) ** 2;
-        if (d2 > loadR2) continue;
-        const key = `${gx},${gz}`;
-        if (this._tiles.has(key) || this._emptyTiles.has(key)) continue;
-        if (this._enqueued.has(key)) continue;
-        toEnqueue.push({ gx, gz, key, d2 });
+    // Skip enqueueing entirely when the network breaker is open, otherwise
+    // we'd re-push the same unfetched cells every frame and _drain would
+    // immediately drop them — wasted churn.
+    if (netReady()) {
+      const toEnqueue = [];
+      for (let dx = -r; dx <= r; dx++) {
+        for (let dz = -r; dz <= r; dz++) {
+          const gx = cx + dx;
+          const gz = cz + dz;
+          const wx = (gx + 0.5) * CELL_SIZE;
+          const wz = (gz + 0.5) * CELL_SIZE;
+          const d2 = (px - wx) ** 2 + (pz - wz) ** 2;
+          if (d2 > loadR2) continue;
+          const key = `${gx},${gz}`;
+          if (this._tiles.has(key) || this._emptyTiles.has(key)) continue;
+          if (this._enqueued.has(key)) continue;
+          toEnqueue.push({ gx, gz, key, d2 });
+        }
       }
-    }
-    toEnqueue.sort((a, b) => a.d2 - b.d2);
-    for (const e of toEnqueue) {
-      this._loadQueue.push(e);
-      this._enqueued.add(e.key);
+      toEnqueue.sort((a, b) => a.d2 - b.d2);
+      for (const e of toEnqueue) {
+        this._loadQueue.push(e);
+        this._enqueued.add(e.key);
+      }
     }
 
     // Unload distant loaded tiles.
@@ -173,6 +179,10 @@ export class TreeManager {
         this._enqueued.delete(entry.key);
         continue;
       }
+      // Circuit breaker open: stop draining. The entry we just shifted
+      // stays out of _enqueued (tick will re-queue it) so recovery happens
+      // naturally once the breaker closes.
+      if (!netReady()) { this._enqueued.delete(entry.key); continue; }
       this._activeLoads++;
       // Keep the key in _enqueued until the fetch completes — otherwise
       // tick()s during the fetch window would see the tile as "not loaded,
@@ -191,7 +201,17 @@ export class TreeManager {
       const res = await fetch(`${import.meta.env.VITE_CDN_BASE ?? ''}/trees/cell_${gx}_${gz}.json`);
       if (!res.ok) { this._emptyTiles.add(key); return; }
       data = await res.json();
-    } catch {
+      reportNetSuccess();
+    } catch (e) {
+      if (e instanceof TypeError) {
+        // Transport failure — do NOT mark _emptyTiles (that would stick
+        // until reload). Route to the shared breaker; tick will re-enqueue
+        // this cell once the breaker closes.
+        reportNetFailure('load tree tile');
+        return;
+      }
+      // Anything else (bad JSON, etc.) is a real content error for this
+      // tile — treat as empty so we don't retry indefinitely.
       this._emptyTiles.add(key);
       return;
     }

@@ -109,7 +109,11 @@ self.onmessage = async (e) => {
       ],
     );
   } catch (err) {
-    self.postMessage({ type: 'error', key, error: err.message });
+    // Tag transport-level failures (TypeError from fetch: wifi drop, DNS,
+    // CORS with no response) so TerrainManager can route them to the
+    // shared netHealth breaker instead of treating them as content errors.
+    const kind = err instanceof TypeError ? 'NETWORK' : 'OTHER';
+    self.postMessage({ type: 'error', key, error: err.message, kind });
   }
 };
 

@@ -2,7 +2,7 @@ meoww!
 
 deploy (anita.garden):
   - code change (JS/HTML/CSS):   npm run deploy
-  - new/updated tiles (public/): rclone copy public/ r2:graffiti-static --progress --transfers 16 --checkers 32
+  - new/updated tiles (public/): rclone copy public/ r2:graffiti-static --progress --transfers 16 --checkers 32 --header-upload "Cache-Control: public, max-age=604800"
   - worker change (worker/):     cd worker && npx wrangler deploy
 
 
@@ -20,6 +20,7 @@ deploy (anita.garden):
 - mobile controls 
 - link pictures, title
 - online count
+- live see other people
 
 
 

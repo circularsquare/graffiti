@@ -120,6 +120,7 @@ function closestPointOnTriangle(p, a, b, c, out) {
 export function createPhysics({
   camera, controls, keys, terrain, floorY,
   initialFlying = false,
+  alwaysActive = false,  // mobile: physics runs even when pointer isn't locked (there's no lock)
   getNearColliders,      // () → [ground, ...buildings, ...terrainMeshes]
   getNearRayColliders,   // () → [ground, ...buildings]  (excludes terrain — see surfaceBelow)
   getNearBuildings,      // () → [...buildings]
@@ -143,6 +144,10 @@ export function createPhysics({
   // from input each frame so starting/stopping movement in the air ramps in
   // instead of snapping. Walk mode bypasses this and resets it to zero.
   const _flyVel = new THREE.Vector3();
+
+  // Mobile joystick: set each frame to scale horizontal speed by throw
+  // magnitude (1.0 = base, 1.2 at full throw). Desktop leaves this at 1.
+  let moveSpeedMult = 1;
 
   // ─── Scratch / temps ────────────────────────────────────────────────────────
   const snapRay = new THREE.Raycaster(); // reusable ray for safe-start checks
@@ -335,38 +340,36 @@ export function createPhysics({
     eyeVisualOffset *= Math.exp(-dt / EYE_STEP_SMOOTH_TAU);
     if (Math.abs(eyeVisualOffset) < 0.001) eyeVisualOffset = 0;
 
-    if (!controls.isLocked) return;
+    if (!alwaysActive && !controls.isLocked) return;
 
     // ── Horizontal ────────────────────────────────────────────────────────────
 
     const flyBoost = isFlying && keys['KeyQ'] ? 3 : 1;
-    const speed = isFlying
+    const baseSpeed = isFlying
       ? FLY_SPEED * flyBoost
       : (keys['KeyQ'] ? SPRINT_SPEED : WALK_SPEED);
+    const speed = baseSpeed * moveSpeedMult;
 
     camera.getWorldDirection(_fwd);
     _fwd.y = 0;
     _fwd.normalize();
-
-    // right = cross(fwd, up) = (-fwd.z, 0, fwd.x)
+    // right = cross(fwd, up) = (-fwd.z, 0, fwd.x).
     _right.set(-_fwd.z, 0, _fwd.x);
 
-    // Target horizontal velocity (m/s) from input.
-    let tvx = 0, tvz = 0;
-    if (keys['KeyW'] || keys['ArrowUp'])    { tvx += _fwd.x;   tvz += _fwd.z; }
-    if (keys['KeyS'] || keys['ArrowDown'])  { tvx -= _fwd.x;   tvz -= _fwd.z; }
+    let tvx = 0, tvy = 0, tvz = 0;
+    if (keys['KeyW'] || keys['ArrowUp'])    { tvx += _fwd.x;   tvz += _fwd.z;   }
+    if (keys['KeyS'] || keys['ArrowDown'])  { tvx -= _fwd.x;   tvz -= _fwd.z;   }
     if (keys['KeyA'] || keys['ArrowLeft'])  { tvx -= _right.x; tvz -= _right.z; }
     if (keys['KeyD'] || keys['ArrowRight']) { tvx += _right.x; tvz += _right.z; }
 
-    const hLen = Math.sqrt(tvx * tvx + tvz * tvz);
-    if (hLen > 0) {
-      tvx = (tvx / hLen) * speed;
-      tvz = (tvz / hLen) * speed;
+    // Cap horizontal at base speed so a W+A diagonal doesn't exceed it.
+    const len2 = Math.sqrt(tvx * tvx + tvz * tvz);
+    if (len2 > 0) {
+      tvx = (tvx / len2) * speed;
+      tvz = (tvz / len2) * speed;
     }
 
-    // Target vertical velocity (m/s). Walk mode handles gravity below; in fly
-    // mode Space/Shift are direct vertical input.
-    let tvy = 0;
+    // Fly-mode ascend/descend keys layer on top of horizontal motion.
     if (isFlying) {
       if (keys['Space'])                            tvy += FLY_VERT * flyBoost;
       if (keys['ShiftLeft'] || keys['ShiftRight'])  tvy -= FLY_VERT * flyBoost;
@@ -666,5 +669,13 @@ export function createPhysics({
     popOutOfBuildingCeiling,
     resetFallVelocity() { velY = 0; },
     handleSpaceTap,
+    setMoveSpeedMult(m) { moveSpeedMult = m; },
+    requestJump() { if (!isFlying) jumpRequested = true; },
+    toggleFly() {
+      isFlying = !isFlying;
+      if (!isFlying) velY = 0;  // clean fall on exit
+      jumpRequested = false;
+      return isFlying;
+    },
   };
 }

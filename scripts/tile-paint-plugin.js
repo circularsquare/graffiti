@@ -52,10 +52,10 @@ export function tilePaintPlugin() {
         // so the client's tryRefill() returns 'ok' and the HUD flashes.
         if (url.startsWith(REFILL_ROUTE) && req.method === 'POST') {
           res.statusCode = 204;
-          res.setHeader('x-paint-tokens',    '200');
+          res.setHeader('x-paint-tokens',    '500');
           res.setHeader('x-paint-refill-at', String(Date.now()));
-          res.setHeader('x-paint-capacity',  '200');
-          res.setHeader('x-paint-refill-ms', '20000');
+          res.setHeader('x-paint-capacity',  '500');
+          res.setHeader('x-paint-refill-ms', '10000');
           res.end();
           return;
         }

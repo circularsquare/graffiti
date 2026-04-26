@@ -22,6 +22,7 @@ import { GRID_SIZE } from './loadCityGML.js';
 import { BLOCK_SIZE } from './gridShader.js';
 import { worldToGrid, gridToWorld } from './geo.js';
 import { paintStore } from './paintStore.js';
+import { IS_MOBILE } from './mobileControls.js';
 
 // ─── Palette ──────────────────────────────────────────────────────────────────
 //
@@ -345,13 +346,22 @@ export function createPaintManager({
     el.title = c.name;
     el.style.background = c.css;
     if (c.isErase) {
-      el.textContent = '✕';
+      // SVG X, not unicode ✕ — iOS sometimes emoji-styles the heavy X.
+      el.innerHTML =
+        '<svg viewBox="0 0 14 14" fill="none" stroke="currentColor" stroke-width="2" ' +
+        'stroke-linecap="round" aria-hidden="true">' +
+        '<line x1="3" y1="3" x2="11" y2="11"/>' +
+        '<line x1="11" y1="3" x2="3" y2="11"/></svg>';
       el.classList.add('erase'); // spans both columns in the 2-col grid
     }
     el.addEventListener('click', () => {
       setActiveColor(i);
       colorPickMode = false;
-      controls.lock();
+      // Desktop: re-engage pointer lock after the swatch-click unlocks it.
+      // Mobile: there's no lock to re-engage, and requestPointerLock on a
+      // phone either silently fails or (on some Android builds) captures the
+      // canvas with no clear way to escape.
+      if (!IS_MOBILE) controls.lock();
     });
     colorbarEl.appendChild(el);
     return el;
@@ -383,7 +393,7 @@ export function createPaintManager({
 
   function openColorPicker() {
     colorPickMode = true;
-    controls.unlock();
+    if (!IS_MOBILE) controls.unlock();
   }
 
   function closeColorPicker() {
@@ -795,8 +805,12 @@ export function createPaintManager({
     return bestKey && bestDist <= 1 ? bestKey : tentative;
   }
 
-  function hitCell() {
-    paintRay.setFromCamera(new THREE.Vector2(0, 0), camera);
+  // Scratch NDC used when no explicit aim is given — hitCell defaults to
+  // screen-centre (crosshair aim). Mobile passes a per-tap NDC so paint lands
+  // where the finger tapped, not at the centre of the screen.
+  const _hitNdc = new THREE.Vector2();
+  function hitCell(ndc) {
+    paintRay.setFromCamera(ndc || _hitNdc.set(0, 0), camera);
     const terrainManager = getTerrainManager();
     const osmManager     = getOsmManager();
     // Terrain meshes are always raycast targets alongside the building near-set.
@@ -918,10 +932,10 @@ export function createPaintManager({
     return { cellU, cellV, normal, planeD, mesh, cellKey };
   }
 
-  function tryPaint() {
+  function tryPaint(ndc) {
     const activeColor = COLORS[activeColorIdx];
-    if (activeColor.isErase) { tryErase(); return; }
-    const h = hitCell();
+    if (activeColor.isErase) { tryErase(ndc); return; }
+    const h = hitCell(ndc);
     if (!h) return;
 
     // Dedupe: skip if the target cell is already this color. Keeps hold-to-paint
@@ -950,8 +964,8 @@ export function createPaintManager({
     }
   }
 
-  function tryErase() {
-    const h = hitCell();
+  function tryErase(ndc) {
+    const h = hitCell(ndc);
     if (!h) return;
 
     // Dedupe: skip if there's nothing painted at this cell.

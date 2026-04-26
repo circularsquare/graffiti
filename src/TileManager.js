@@ -1,6 +1,7 @@
 import * as THREE from 'three';
 import { wrapMeshData } from './loadCityGML.js';
 import { paintStore } from './paintStore.js';
+import { netReady, reportNetFailure, reportNetSuccess } from './netHealth.js';
 
 // Admit radius. Tiles are admitted when inside MIN and unloaded via sticky
 // hysteresis past (admit + UNLOAD_MARGIN), capped at MAX — so a tile you
@@ -155,7 +156,9 @@ export class TileManager {
       const pending = this._pendingLoads.get(msg.tileId);
       if (!pending) return;
       this._pendingLoads.delete(msg.tileId);
-      pending.reject(new Error(msg.error));
+      const err = new Error(msg.error);
+      if (msg.kind) err.kind = msg.kind;
+      pending.reject(err);
     }
   }
 
@@ -438,7 +441,12 @@ export class TileManager {
     // Sort nearest-first so the first MAX_CONCURRENT_LOADS slots go to the
     // closest tiles, not arbitrary ones from the spatial index bucket order.
     candidates.sort(_byDist2);
-    for (let i = 0; i < candidates.length; i++) {
+    // Circuit breaker open: skip enqueueing new loads this tick. Tiles stay
+    // `'unloaded'` so the next tick (after the pause expires) naturally
+    // re-admits them. Without this gate, every frame would queue ~4 fresh
+    // fetches that all fail immediately — ~15 errors/sec while offline.
+    const netOk = netReady();
+    for (let i = 0; netOk && i < candidates.length; i++) {
       const { tile, d2 } = candidates[i];
       if (tile.status === 'unloaded') {
         if (tile.lastUnloadD2 != null && d2 >= tile.lastUnloadD2) continue;
@@ -555,6 +563,13 @@ export class TileManager {
     this._activeLoads++;
     const tLoad = performance.now();
     try {
+      // Breaker may have opened between enqueue and dispatch (a sibling
+      // tile in the same wave already failed). Bail before issuing the
+      // fetch — `'unloaded'` lets tick re-admit once netReady() returns.
+      if (!netReady()) {
+        tile.status = 'unloaded';
+        return;
+      }
       // Worker returns an array of MeshData objects with Float32Array buffers
       // already transferred in. All heavy math (UV, normals, bbox, Y-shift)
       // has already happened off-thread — we only need to wrap typed arrays
@@ -613,6 +628,7 @@ export class TileManager {
       tile.status = 'loaded';
       tile.lastUnloadD2 = null;
       this._loadedTiles.add(tile);
+      reportNetSuccess();
 
       // Kick off the paint fetch in parallel with phase 2. _applyCellDataToTile
       // awaits this promise before calling onTileCellData, so seedTileCells
@@ -639,6 +655,12 @@ export class TileManager {
           this._warnedMissing.add(tile.id);
           console.warn(`TileManager: tile "${tile.id}" not built yet — skipping`);
         }
+      } else if (e.kind === 'NETWORK') {
+        // Transport failure — route to the shared breaker (one log for the
+        // whole outage) and mark 'unloaded' so tick() re-admits once the
+        // breaker closes. The tick's netReady() gate prevents immediate retry.
+        reportNetFailure('load building tile');
+        tile.status = 'unloaded';
       } else {
         console.error(`TileManager: failed to load tile "${tile.id}":`, e);
         tile.status = 'unloaded'; // allow retry on next tick

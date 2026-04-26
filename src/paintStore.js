@@ -1,3 +1,5 @@
+import { netReady, reportNetFailure, reportNetSuccess, netBackoffRemaining } from './netHealth.js';
+
 const TILE_ENDPOINT     = import.meta.env.VITE_PAINT_ENDPOINT ?? '/api/paint';
 const BUCKET_ENDPOINT   = TILE_ENDPOINT.replace(/\/paint\/?$/, '/bucket');
 const REFILL_ENDPOINT   = TILE_ENDPOINT.replace(/\/paint\/?$/, '/refill');
@@ -27,19 +29,26 @@ const AUTHOR_ID_KEY = 'graffiti_author_id';
 /** Retry a fetch on connection-level failures (DNS, TCP, TLS — surface as
  *  TypeError from fetch()). Non-ok responses pass through unchanged on the
  *  first try. Used for the startup paint + bucket GETs so a brief wifi blip
- *  doesn't lose paint data for 30s until the pull loop picks it up. */
-async function fetchWithRetry(url, init) {
+ *  doesn't lose paint data for 30s until the pull loop picks it up.
+ *  `shouldContinue` lets the caller bail out of remaining retries (e.g. once
+ *  the store's circuit breaker has opened on a parallel call) so a startup
+ *  storm doesn't amplify one outage into 3× the failed requests. */
+async function fetchWithRetry(url, init, shouldContinue = () => true) {
   const delays = [500, 2000];
   let lastErr;
   for (let i = 0; i <= delays.length; i++) {
     try { return await fetch(url, init); }
     catch (e) {
       lastErr = e;
-      if (i < delays.length) await new Promise(r => setTimeout(r, delays[i]));
+      if (i < delays.length) {
+        await new Promise(r => setTimeout(r, delays[i]));
+        if (!shouldContinue()) break;
+      }
     }
   }
   throw lastErr;
 }
+
 
 function loadOrCreateAuthorId() {
   try {
@@ -57,8 +66,8 @@ function loadOrCreateAuthorId() {
 // Token bucket — mirrors server constants. The server is authoritative; these
 // are defaults/optimistic values used until the first response header sync.
 // One token per cell written (paint or erase); seeds are exempt.
-const BUCKET_CAPACITY  = 200;
-const BUCKET_REFILL_MS = 20_000;
+const BUCKET_CAPACITY  = 500;
+const BUCKET_REFILL_MS = 10_000;
 
 /**
  * Stores painted cell state, sliced per tile, backed by the paint endpoint
@@ -126,6 +135,7 @@ class PaintStore {
     this._pullCursorIdle     = null;       // last-pulled idle tileId, for round-robin fairness
     this._paused             = false;      // set by setPaused — gates both pull loops
 
+
     this._authorId = (typeof window !== 'undefined') ? loadOrCreateAuthorId() : null;
 
     // Token bucket: fractional tokens + baseline timestamp. getBucketState()
@@ -167,14 +177,25 @@ class PaintStore {
     if (this._loadedTiles.has(tileId)) return;
     this._loadedTiles.add(tileId);
 
+    // Circuit breaker is open — skip the fetch. The pull loop picks this
+    // tile up once the network recovers (tile is marked loaded, so it
+    // enters the pull rotation regardless).
+    if (!netReady()) { this._startPullLoop(); return; }
+
     let payload, etag;
     try {
-      const res = await fetchWithRetry(`${TILE_ENDPOINT}/${encodeURIComponent(tileId)}`);
+      const res = await fetchWithRetry(
+        `${TILE_ENDPOINT}/${encodeURIComponent(tileId)}`,
+        undefined,
+        () => netReady(),
+      );
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
       etag    = res.headers.get('etag');
       payload = await res.json();
+      reportNetSuccess();
     } catch (e) {
-      console.warn(`paintStore: fetch tile ${tileId} failed:`, e);
+      if (e instanceof TypeError) reportNetFailure('load tile');
+      else console.warn(`paintStore: fetch tile ${tileId} failed:`, e);
       return;
     }
 
@@ -451,10 +472,18 @@ class PaintStore {
    */
   async _syncBucketOnInit() {
     try {
-      const res = await fetchWithRetry(`${BUCKET_ENDPOINT}?author=${encodeURIComponent(this._authorId)}`);
-      if (res.ok) this._syncBucketFromResponse(res);
+      const res = await fetchWithRetry(
+        `${BUCKET_ENDPOINT}?author=${encodeURIComponent(this._authorId)}`,
+        undefined,
+        () => netReady(),
+      );
+      if (res.ok) {
+        this._syncBucketFromResponse(res);
+        reportNetSuccess();
+      }
     } catch (e) {
-      console.warn('paintStore: bucket sync failed:', e);
+      if (e instanceof TypeError) reportNetFailure('bucket sync');
+      else console.warn('paintStore: bucket sync failed:', e);
     }
     this._bucketReady = true;
     this._notifyBucket();
@@ -594,10 +623,16 @@ class PaintStore {
 
   _scheduleSave() {
     if (this._saveTimer !== null) return;
+    // When the circuit breaker is open, defer the flush until the pause
+    // expires — otherwise a failed save re-schedules at SAVE_DEBOUNCE_MS
+    // (500 ms) and re-fails immediately, turning one outage into a console
+    // flood. Fresh paints during the pause still accumulate into the dirty
+    // map and ride out on the deferred flush.
+    const delay = Math.max(SAVE_DEBOUNCE_MS, netBackoffRemaining());
     this._saveTimer = setTimeout(() => {
       this._saveTimer = null;
       this._flushSaveAsync();
-    }, SAVE_DEBOUNCE_MS);
+    }, delay);
   }
 
   async _flushSaveAsync() {
@@ -683,13 +718,16 @@ class PaintStore {
         // re-synced to the server's view; the optimistic paints we applied
         // locally are now phantom — the next pull loop reconciles them.
         // Don't re-queue.
+        reportNetSuccess();
         return;
       }
       if (!res.ok) throw new Error(`HTTP ${res.status}`);
+      reportNetSuccess();
       const etag = res.headers.get('etag');
       if (etag) this._tileETags.set(tileId, etag);
     } catch (e) {
-      console.warn(`paintStore: save tile ${tileId} failed:`, e);
+      if (e instanceof TypeError) reportNetFailure('save tile');
+      else console.warn(`paintStore: save tile ${tileId} failed:`, e);
       const current = this._dirtyCells.get(tileId);
       for (const [k, v] of snapshot) if (!current.has(k)) current.set(k, v);
       this._scheduleSave();
@@ -757,6 +795,7 @@ class PaintStore {
 
   async _pullActive() {
     if (this._paused) return;
+    if (!netReady()) return;
     for (const t of this._activeTiles) {
       if (this._loadedTiles.has(t)) await this._pullTile(t);
     }
@@ -764,6 +803,7 @@ class PaintStore {
 
   async _pullIdle() {
     if (this._paused) return;
+    if (!netReady()) return;
     // Round-robin through non-active loaded tiles. With PULL_IDLE_MAX_TILES=20
     // and typical 25-tile load set, every idle tile is pulled within 1–2 ticks
     // (20–40 s). Excluding active tiles avoids double-polling the fast set.
@@ -794,7 +834,11 @@ class PaintStore {
       res = await fetch(`${TILE_ENDPOINT}/${encodeURIComponent(tileId)}`, {
         headers: etag ? { 'if-none-match': etag } : {},
       });
-    } catch { return; }
+      reportNetSuccess();
+    } catch (e) {
+      if (e instanceof TypeError) reportNetFailure('pull tile');
+      return;
+    }
 
     if (res.status === 304) return;
     if (!res.ok) return;

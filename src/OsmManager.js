@@ -4,6 +4,7 @@ import fontData from 'three/examples/fonts/helvetiker_bold.typeface.json';
 import { gridToWorld } from './geo.js';
 import { injectGridOverlay, enableGridExtensions, GRID_SHADER_CACHE_KEY } from './gridShader.js';
 import { emitStreetTrisXZ } from './streetGeometry.js';
+import { netReady, reportNetFailure, reportNetSuccess } from './netHealth.js';
 
 // OSM-specific load radius. Tight (150 m) because draped OSM geometry is
 // by far the heaviest per-tile payload in the client — ~3–20 MB of
@@ -181,7 +182,14 @@ const BIN_GRID_SIZE = 125;
 const BIN_INV_SCALE = 0.1;       // 1 decimetre → 1 metre
 
 async function _fetchOsmTile(fileUrl) {
-  const res = await fetch(fileUrl);
+  let res;
+  try { res = await fetch(fileUrl); }
+  catch (e) {
+    // Tag transport failures so _doLoad can route them to netHealth
+    // instead of counting them toward the 2-strike permanent-fail limit.
+    if (e instanceof TypeError) e.kind = 'NETWORK';
+    throw e;
+  }
   if (!res.ok) throw new Error(`HTTP ${res.status}`);
   // Pipe response bytes through the browser's gzip decompressor. Using the
   // streaming API avoids buffering the compressed blob separately.
@@ -601,7 +609,13 @@ export class OsmManager {
       }
     }
     toEnqueue.sort((a, b) => a.d2 - b.d2);
-    for (const { tile } of toEnqueue) this._enqueueLoad(tile);
+    // Circuit breaker open: hold new loads. Tiles stay 'unloaded' so the
+    // next tick (after the pause expires) naturally re-admits them. Without
+    // this, a player wandering during an outage would rapidly mark every
+    // newly-in-range tile as permanently 'failed' after 2 strikes.
+    if (netReady()) {
+      for (const { tile } of toEnqueue) this._enqueueLoad(tile);
+    }
   }
 
   _enqueueLoad(tile) {
@@ -613,7 +627,11 @@ export class OsmManager {
   async _doLoad(tile) {
     this._activeLoads++;
     try {
+      // Breaker may have opened between enqueue and dispatch. Bail before
+      // firing the fetch — 'unloaded' lets tick re-admit once netReady.
+      if (!netReady()) { tile.status = 'unloaded'; return; }
       const data = await _fetchOsmTile(tile.file);
+      reportNetSuccess();
       // Cache decoded source on the tile so `redrapeOverBounds` can rebuild
       // the drape meshes (not just re-sample Y) when a covering terrain
       // cell arrives after OSM — skirts are only emitted at build time, so
@@ -640,11 +658,20 @@ export class OsmManager {
       tile.status = 'loaded';
       if (this._onTileReady) this._onTileReady(tile);
     } catch (e) {
-      console.error(`OsmManager: failed to load ${tile.id}:`, e);
-      tile._failures = (tile._failures ?? 0) + 1;
-      // After 2 failures treat the tile as permanently absent so the
-      // startup/teleport gate can proceed rather than retrying forever.
-      tile.status = tile._failures >= 2 ? 'failed' : 'unloaded';
+      if (e.kind === 'NETWORK') {
+        // Transport failure — route to the shared breaker and leave the
+        // tile 'unloaded' for retry once the network recovers. Don't count
+        // toward _failures: 2-strike-permanent-fail is meant for tiles
+        // that genuinely don't exist on the server, not for outages.
+        reportNetFailure('load osm tile');
+        tile.status = 'unloaded';
+      } else {
+        console.error(`OsmManager: failed to load ${tile.id}:`, e);
+        tile._failures = (tile._failures ?? 0) + 1;
+        // After 2 failures treat the tile as permanently absent so the
+        // startup/teleport gate can proceed rather than retrying forever.
+        tile.status = tile._failures >= 2 ? 'failed' : 'unloaded';
+      }
     } finally {
       this._drainQueue();
     }

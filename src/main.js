@@ -6,10 +6,12 @@ import { TerrainManager } from './TerrainManager.js';
 import { TreeManager } from './TreeManager.js';
 import { PigeonManager } from './PigeonManager.js';
 import { paintStore } from './paintStore.js';
+import { subscribeNet } from './netHealth.js';
 import { gridToWorld, worldToGrid, MANHATTAN_GRID_DEG } from './geo.js';
 import { createPhysics, WALK_HEIGHT } from './physics.js';
 import { createPaintManager } from './paintManager.js';
 import { tilesWithLandmarks, prepareLandmarks, landmarksReady, tileInjection } from './landmarks.js';
+import { IS_MOBILE, initMobileControls } from './mobileControls.js';
 import {
   initMinimap, updateMinimap, setMinimapSize,
   adjustMinimapZoom, adjustMinimapPan, resetMinimapPan,
@@ -40,12 +42,12 @@ const camera = new THREE.PerspectiveCamera(100, window.innerWidth / window.inner
 const SPAWN_LOCATIONS = [
   // Times Square (42nd St & 7th Ave) — facing uptown along 7th Ave.
   { name: 'Times Square',       x: 2215, y:  1.70, z: -5928, yawDeg: MANHATTAN_GRID_DEG },
-  // Flatiron — north of the building looking back south at the prow.
-  { name: 'Flatiron',           x: 1903, y: 14.33, z: -4116, yawDeg: -174 },
+  // Madison Square — north of the Flatiron building looking back south at the prow.
+  { name: 'Madison Square',     x: 1903, y: 14.33, z: -4116, yawDeg: -174 },
   // Washington Sq Park — south of the fountain, facing the arch.
   { name: 'Washington Sq Park', x: 1196, y: 10.90, z: -2883, yawDeg:   29 },
   // Bowling Green — southern tip of Broadway, looking uptown.
-  { name: 'Bowling Green',      x: -166, y:  7.34, z:   -14, yawDeg:   16 },
+  { name: 'Bowling Green',      x: -160, y:  7.51, z:   -28, yawDeg:   30 },
 ];
 const _spawn = SPAWN_LOCATIONS[Math.floor(Math.random() * SPAWN_LOCATIONS.length)];
 camera.position.set(_spawn.x, _spawn.y, _spawn.z);
@@ -323,6 +325,7 @@ const overlayPrompt = document.getElementById('overlay-prompt');
 const crosshair     = document.getElementById('crosshair');
 const minimapWrap = document.getElementById('minimap-wrap');
 initMinimap();
+if (IS_MOBILE) setMinimapSize(165);  // mirrors MINIMAP_SIZE_SMALL below (declared further down for grouping)
 
 // Compass rose: click to toggle between north-up and heading-up minimap modes.
 // Rotated each frame below so the red arrow always points to true north on
@@ -338,14 +341,72 @@ compassEl.addEventListener('mousedown', (e) => { e.stopPropagation(); });
 // Small vs. big minimap. 234 px mirrors the initial HTML canvas size; big mode
 // fills half the shorter viewport axis (so it's ~a quarter of the screen's
 // area, always square, never overflows on portrait windows).
-const MINIMAP_SIZE_SMALL = 234;
+const MINIMAP_SIZE_SMALL = IS_MOBILE ? 165 : 234;
+const MAP_SIZE_LARGE     = Math.round(MINIMAP_SIZE_SMALL * 1.8);
 function minimapBigSize() {
   return Math.floor(Math.min(window.innerWidth, window.innerHeight) * 0.5);
 }
-let minimapBig = false;
+let minimapBig   = false;
+let mapEnlarged  = false;  // #map-btn toggle — grows the corner map +80%
 function applyMinimapLayout() {
-  setMinimapSize(minimapBig ? minimapBigSize() : MINIMAP_SIZE_SMALL);
+  let size;
+  if (minimapBig)       size = minimapBigSize();
+  else if (mapEnlarged) size = MAP_SIZE_LARGE;
+  else                  size = MINIMAP_SIZE_SMALL;
+  setMinimapSize(size);
 }
+// Wire the HTML-level #map-btn (desktop + mobile share the same toggle).
+const mapBtnEl = document.getElementById('map-btn');
+function setMapEnlarged(on) {
+  mapEnlarged = on;
+  mapBtnEl.classList.toggle('active', on);
+  applyMinimapLayout();
+}
+mapBtnEl.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setMapEnlarged(!mapEnlarged);
+});
+// Tap anywhere outside the map / map-btn → exit enlarged mode. Big mode
+// (M key / desktop pointer-lock flow) has its own exit path, so we only
+// collapse the enlarged state here.
+document.addEventListener('pointerdown', (e) => {
+  if (!mapEnlarged) return;
+  if (minimapWrap.contains(e.target)) return;
+  if (mapBtnEl.contains(e.target))    return;
+  setMapEnlarged(false);
+});
+
+// Waypoints button: dropdown listing SPAWN_LOCATIONS. Each item teleports to
+// that spawn including its compass heading (unlike map-click teleport, which
+// preserves the current yaw).
+const waypointsBtn  = document.getElementById('waypoints-btn');
+const waypointsMenu = document.getElementById('waypoints-menu');
+for (const loc of SPAWN_LOCATIONS) {
+  const item = document.createElement('button');
+  item.className = 'waypoint-item';
+  item.type = 'button';
+  item.textContent = loc.name;
+  item.addEventListener('click', (e) => {
+    e.stopPropagation();
+    setWaypointsOpen(false);
+    fastTravelTo(loc.x, loc.z, loc.yawDeg);
+  });
+  waypointsMenu.appendChild(item);
+}
+function setWaypointsOpen(on) {
+  waypointsMenu.classList.toggle('hidden', !on);
+  waypointsBtn.classList.toggle('active', on);
+}
+waypointsBtn.addEventListener('click', (e) => {
+  e.stopPropagation();
+  setWaypointsOpen(waypointsMenu.classList.contains('hidden'));
+});
+document.addEventListener('pointerdown', (e) => {
+  if (waypointsMenu.classList.contains('hidden')) return;
+  if (waypointsBtn.contains(e.target))  return;
+  if (waypointsMenu.contains(e.target)) return;
+  setWaypointsOpen(false);
+});
 function toggleMinimapBig() {
   minimapBig = !minimapBig;
   minimapWrap.classList.toggle('big', minimapBig);
@@ -390,7 +451,7 @@ let _teleportDestX = 0, _teleportDestZ = 0;
 // themselves underground (camera at MIN_EYE_Y ≈ -3, terrain usually +3 m).
 // sampleAsync triggers a priority fetch for the destination cell so we know
 // the ground height before revealing the view.
-async function fastTravelTo(x, z) {
+async function fastTravelTo(x, z, yawDeg) {
   if (!firstTileLoaded) return;
   // Intentionally not gated on `teleporting`: a fresh teleport preempts the
   // in-flight one. _teleportDestX/Z is updated here so gate checks always
@@ -426,9 +487,12 @@ async function fastTravelTo(x, z) {
 
   camera.position.set(x, spawnY, z);
   physics.resetFallVelocity();
-  // Keep the current yaw but pitch the view 20° above horizontal so the player
-  // lands looking at the skyline, not their feet. YXZ Euler + positive X = up.
+  // Pitch the view 20° above horizontal so the player lands looking at the
+  // skyline, not their feet. YXZ Euler + positive X = up. Yaw is taken from
+  // the spawn's compass heading when supplied (waypoints), otherwise the
+  // current yaw is preserved (map-click teleport).
   _teleportEuler.setFromQuaternion(camera.quaternion);
+  if (yawDeg !== undefined) _teleportEuler.y = -yawDeg * Math.PI / 180;
   _teleportEuler.x = Math.PI * 20 / 180;
   _teleportEuler.z = 0;
   camera.quaternion.setFromEuler(_teleportEuler);
@@ -519,6 +583,106 @@ minimapWrap.addEventListener('wheel', (e) => {
   adjustMinimapZoom(-e.deltaY * 0.005);
 }, { passive: false });
 
+// Mobile: double-tap-to-teleport + single-finger drag-to-pan + two-finger
+// pinch-zoom on the always-small minimap. Double-tap (vs. single) because a
+// lone finger-down-up can trigger during pan/pinch transitions and the
+// minimap is small enough that stray touches are easy. Pan resets whenever
+// the player moves (see the render loop).
+if (IS_MOBILE) {
+  const mapPtrs = new Map(); // id → { x, y, startX, startY, maxDist }
+  let pinchLastDist = 0;
+  const MAP_TAP_SLOP   = 8;    // px — per-tap motion slop
+  const DBL_TAP_MAX_MS = 300;  // max gap between the two taps
+  const DBL_TAP_SLOP   = 30;   // px — max distance between the two taps
+  let lastTapT = 0;
+  let lastTapX = 0, lastTapY = 0;
+
+  minimapWrap.addEventListener('pointerdown', (e) => {
+    if (e.pointerType !== 'touch') return;
+    e.preventDefault();   // suppress synthetic mouse events on this element
+    e.stopPropagation();
+    mapPtrs.set(e.pointerId, { x: e.clientX, y: e.clientY, startX: e.clientX, startY: e.clientY, maxDist: 0 });
+    minimapWrap.setPointerCapture(e.pointerId);
+    if (mapPtrs.size === 2) {
+      const [a, b] = [...mapPtrs.values()];
+      pinchLastDist = Math.hypot(a.x - b.x, a.y - b.y);
+    }
+  });
+
+  minimapWrap.addEventListener('pointermove', (e) => {
+    const p = mapPtrs.get(e.pointerId);
+    if (!p) return;
+    e.preventDefault();
+    e.stopPropagation();
+    const dxPx = e.clientX - p.x;
+    const dyPx = e.clientY - p.y;
+    p.x = e.clientX;
+    p.y = e.clientY;
+    const distFromStart = Math.hypot(e.clientX - p.startX, e.clientY - p.startY);
+    if (distFromStart > p.maxDist) p.maxDist = distFromStart;
+    if (mapPtrs.size === 2 && pinchLastDist > 0) {
+      const [a, b] = [...mapPtrs.values()];
+      const dist = Math.hypot(a.x - b.x, a.y - b.y);
+      // adjustMinimapZoom delta is log2-ish (0.5 delta ≈ 1.41×). Use the
+      // log of the distance ratio so pinch maps proportionally to zoom.
+      adjustMinimapZoom(Math.log2(dist / pinchLastDist));
+      pinchLastDist = dist;
+    } else if (mapPtrs.size === 1) {
+      // Single-finger drag = pan. Same world-delta math as desktop big-mode
+      // pan: screen delta → metres, flipped (drag right = view shifts left).
+      // In heading-up mode the canvas is rotated by −yaw so we rotate the
+      // screen-space delta back into world XZ before applying.
+      const m = minimapMetersPerPixel();
+      if (getMinimapHeadingUp()) {
+        const c = Math.cos(_lastMinimapYaw), s = Math.sin(_lastMinimapYaw);
+        const wdx = dxPx * c - dyPx * s;
+        const wdy = dxPx * s + dyPx * c;
+        adjustMinimapPan(-wdx * m, -wdy * m);
+      } else {
+        adjustMinimapPan(-dxPx * m, -dyPx * m);
+      }
+    }
+  });
+
+  const endMapPtr = (e) => {
+    const p = mapPtrs.get(e.pointerId);
+    if (!p) return;
+    e.preventDefault();
+    e.stopPropagation();
+    mapPtrs.delete(e.pointerId);
+    // A "tap" here is the arming half of a double-tap: single-finger, never
+    // hit the pinch path, and the finger never wandered beyond slop at any
+    // point (maxDist tracked in pointermove — end-point alone isn't enough
+    // since a drag-out-and-back could finish inside slop).
+    const wasTap = mapPtrs.size === 0 &&
+                   pinchLastDist === 0 &&
+                   p.maxDist <= MAP_TAP_SLOP;
+    if (mapPtrs.size < 2) pinchLastDist = 0;
+    if (!wasTap) return;
+    const now = performance.now();
+    const gapMs = now - lastTapT;
+    const gapPx = Math.hypot(p.x - lastTapX, p.y - lastTapY);
+    if (gapMs <= DBL_TAP_MAX_MS && gapPx <= DBL_TAP_SLOP) {
+      // Second tap of the pair — teleport to where it landed.
+      lastTapT = 0;
+      if (firstTileLoaded && !teleporting) {
+        const rect = minimapWrap.getBoundingClientRect();
+        const lx = p.x - rect.left;
+        const ly = p.y - rect.top;
+        const { x: wx, z: wz } = minimapPixelToWorld(lx, ly, camera.position.x, camera.position.z);
+        fastTravelTo(wx, wz);
+      }
+    } else {
+      // First tap — arm the double-tap window.
+      lastTapT = now;
+      lastTapX = p.x;
+      lastTapY = p.y;
+    }
+  };
+  minimapWrap.addEventListener('pointerup', endMapPtr);
+  minimapWrap.addEventListener('pointercancel', endMapPtr);
+}
+
 // -1 = idle; 0 = left held (paint); 2 = right held (erase). Checked each frame
 // in animate() so holding the mouse paints every new cell under the crosshair —
 // but only after HOLD_DRAG_MS, so a quick click paints exactly one cell.
@@ -532,19 +696,23 @@ function endPaintStroke() {
   paintHeldButton = -1;
 }
 
-renderer.domElement.addEventListener('mousedown', e => {
-  if (!controls.isLocked) { if (e.button === 0 && firstTileLoaded) { paint.closeColorPicker(); controls.lock(); } return; }
-  if (e.button === 0)      { paintHeldButton = 0; paintHeldAt = performance.now(); paint.beginStroke(); paint.tryPaint(); }
-  else if (e.button === 2) { paintHeldButton = 2; paintHeldAt = performance.now(); paint.beginStroke(); paint.tryErase(); }
-});
-// Listen on window so a mouseup outside the canvas (e.g. over the HUD) still ends the stroke.
-window.addEventListener('mouseup', e => {
-  if ((e.button === 0 && paintHeldButton === 0) || (e.button === 2 && paintHeldButton === 2)) {
-    endPaintStroke();
-  }
-});
-renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
-overlay.addEventListener('click', () => { if (firstTileLoaded && !teleporting) controls.lock(); });
+// Desktop-only: mouse-click paint flow expects pointer lock. Mobile uses
+// tap-to-paint via mobileControls.js, which drives paint.tryPaint directly.
+if (!IS_MOBILE) {
+  renderer.domElement.addEventListener('mousedown', e => {
+    if (!controls.isLocked) { if (e.button === 0 && firstTileLoaded) { paint.closeColorPicker(); controls.lock(); } return; }
+    if (e.button === 0)      { paintHeldButton = 0; paintHeldAt = performance.now(); paint.beginStroke(); paint.tryPaint(); }
+    else if (e.button === 2) { paintHeldButton = 2; paintHeldAt = performance.now(); paint.beginStroke(); paint.tryErase(); }
+  });
+  // Listen on window so a mouseup outside the canvas (e.g. over the HUD) still ends the stroke.
+  window.addEventListener('mouseup', e => {
+    if ((e.button === 0 && paintHeldButton === 0) || (e.button === 2 && paintHeldButton === 2)) {
+      endPaintStroke();
+    }
+  });
+  renderer.domElement.addEventListener('contextmenu', e => e.preventDefault());
+  overlay.addEventListener('click', () => { if (firstTileLoaded && !teleporting) controls.lock(); });
+}
 
 // After any pointer-lock exit, Chrome enforces a ~1.25s cooldown before
 // requestPointerLock() will succeed. During that window the "Click to explore"
@@ -990,6 +1158,12 @@ function tryFinishInitialLoad() {
   firstTileLoaded = true;
   overlay.classList.remove('loading'); // 'startup' already removed by _doStartupTerrainFirst
   overlayPrompt.textContent = 'click to explore';
+  if (IS_MOBILE) {
+    // No pointer-lock flow on touch — jump straight into gameplay instead of
+    // waiting for a click-to-explore tap. No crosshair either: mobile paints
+    // at the tap location, not at the screen centre.
+    overlay.classList.add('hidden');
+  }
   if (!_savedPlayer) physics.snapOutOfBuildingFootprint();
   physics.snapToSafeStart();
 }
@@ -1008,6 +1182,7 @@ function finishTeleportLoad() {
   teleporting = false;
   overlay.classList.remove('loading');
   overlayPrompt.textContent = 'click to explore';
+  if (IS_MOBILE) overlay.classList.add('hidden');
   physics.snapOutOfBuildingFootprint();
   physics.snapToSafeStart();
 }
@@ -1156,6 +1331,9 @@ if (TERRAIN_ENABLED) {
 // Dev-only: lets DevTools issue one-off paint wipes (e.g. after a landmark
 // topology change orphans cells under stale cellKeys).
 window.paintStore = paintStore;
+window.scene = scene;
+window.camera = camera;
+window.THREE = THREE;
 
 // Render-distance slider — scales building/OSM/terrain load radii together.
 // Building radius is adaptive (budget-driven) so the scale is applied to both
@@ -1185,15 +1363,31 @@ physics = createPhysics({
   terrain: terrainManager,
   floorY: FLOOR_Y,
   initialFlying: !!_savedPlayer?.flying,
+  alwaysActive: IS_MOBILE,  // no pointer lock on touch — physics runs unconditionally
   getNearColliders:    () => nearCollidables,
   getNearRayColliders: () => nearRayCollidables,
   getNearBuildings:    () => nearBuildingMeshes,
 });
 
+if (IS_MOBILE) {
+  initMobileControls({
+    canvas: renderer.domElement,
+    camera,
+    keys,
+    paint,
+    physics,
+    canInteract: () => firstTileLoaded && !teleporting,
+  });
+}
+
 // ─── Render loop ──────────────────────────────────────────────────────────────
 
 const _minimapDir = new THREE.Vector3();
 let _lastMinimapYaw = 0;
+// Mobile map-pan auto-recenter. Seed to Infinity so the first-frame diff is
+// "infinite" and the branch just snapshots the current position.
+let _mapRecenterLastX = Infinity;
+let _mapRecenterLastZ = Infinity;
 
 // Cap the render loop to 60 Hz even on high-refresh monitors. Browsers' RAF
 // fires at the monitor's refresh rate (often 120/144/165 Hz), doing work we
@@ -1216,6 +1410,14 @@ const _loadingRows = [
 const _paintSaveEl    = document.getElementById('loading-paint');
 let   _paintShowUntil = 0;
 const LOADING_MIN_VISIBLE_MS = 250;
+
+// Offline indicator — driven directly by paintStore's network-state listener,
+// no minimum-visible timer needed (transitions are already coarse-grained by
+// the circuit-breaker backoff window).
+const _netOfflineEl = document.getElementById('loading-net');
+subscribeNet((offline) => {
+  _netOfflineEl.classList.toggle('hidden', !offline);
+});
 
 // Paint-bank HUD: bottom-right token readout. `paintStore.tickBucket()` fires
 // our subscribeBucket listener each animation tick (~1 Hz via the
@@ -1323,6 +1525,18 @@ function animate(now) {
   ground.position.z = camera.position.z;
   camera.getWorldDirection(_minimapDir);
   _lastMinimapYaw = Math.atan2(_minimapDir.x, -_minimapDir.z);
+  // Mobile: recenter the minimap whenever the player's XZ changes (pan
+  // only persists while the player is stationary). Initialised to Infinity
+  // so the first frame just snapshots without doing anything visible.
+  if (IS_MOBILE) {
+    const dxR = camera.position.x - _mapRecenterLastX;
+    const dzR = camera.position.z - _mapRecenterLastZ;
+    if (dxR * dxR + dzR * dzR > 0.0025) {  // > 0.05 m
+      resetMinimapPan();
+      _mapRecenterLastX = camera.position.x;
+      _mapRecenterLastZ = camera.position.z;
+    }
+  }
   updateMinimap(camera.position.x, camera.position.z, _lastMinimapYaw);
   // North-up: compass arrow always points up. Heading-up: map was rotated
   // by −yaw, so screen-space north is at +yaw off vertical — rotate the
