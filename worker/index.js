@@ -1,6 +1,22 @@
-const TILE_ID_RE  = /^[A-Za-z0-9_-]+$/;
+// Only legitimate tile names from the client: cell_<gx>_<gz> for buildings,
+// terrain_<gx>_<gz> for terrain. Both gx/gz can be negative. Rejecting
+// anything else stops PATCHes that create top-level R2 blobs with arbitrary
+// names (e.g. /paint/<buildingId>), which legit clients never produce.
+const TILE_ID_RE  = /^(cell|terrain)_-?\d+_-?\d+$/;
 const AUTHOR_ID_RE = /^[A-Za-z0-9_-]{8,64}$/;
-const MAX_BODY   = 50 * 1024 * 1024;
+// CellKeys are colon-joined strings of alphanumerics, underscores, hyphens,
+// digits and minus signs. Capped at 200 chars — real keys top out around 60.
+const CELL_KEY_RE = /^[A-Za-z0-9_:\-]{1,200}$/;
+const MAX_BODY    = 1 * 1024 * 1024; // 1 MB — full-tile rewrites are ~hundreds of KB
+// Paint timestamps further than this in the future are rejected. Allows
+// modest client clock skew without giving attackers a way to perma-win merge
+// tiebreakers by claiming year 9999.
+const PAINTED_AT_FUTURE_TOLERANCE_MS = 60_000;
+// Max cell entries per PATCH. Sized so a user who painted offline for ~10
+// minutes (their full 500-token bucket plus refill) still fits, with margin.
+// Stops a single hand-crafted request from rewriting an entire tile in one
+// shot.
+const MAX_CELLS_PER_PATCH = 1200;
 const ORIGIN     = 'https://graffiti.anita.garden';
 const MAX_CAS_ATTEMPTS = 5;
 const AUDIT_TTL_SECONDS = 14 * 24 * 60 * 60;
@@ -100,6 +116,159 @@ async function handle(request, env) {
       });
     }
 
+    // POST /strip_orphan_blobs?dry_run=true&cursor=&limit=N — admin: walk R2
+    // and delete entire blobs whose key isn't a legitimate tileId. Catches the
+    // case where someone PATCHed `/paint/<arbitrary-id>` and the worker
+    // created a top-level blob with that name. The stricter TILE_ID_RE now
+    // prevents new ones, but old strays sit in R2 forever otherwise.
+    if (parts[0] === 'strip_orphan_blobs' && request.method === 'POST') {
+      const secret = request.headers.get('x-refill-secret');
+      if (!env.REFILL_SECRET || !secret || secret !== env.REFILL_SECRET) {
+        return new Response('forbidden', { status: 403, headers: CORS });
+      }
+      const dryRun = url.searchParams.get('dry_run') === 'true';
+      const cursor = url.searchParams.get('cursor') || undefined;
+      const limit  = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
+      const listed = await env.PAINT.list({ cursor, limit });
+      const orphans = [];
+      for (const meta of listed.objects) {
+        if (!meta.key.endsWith('.json')) continue;
+        const tileId = meta.key.replace(/\.json$/, '');
+        if (TILE_ID_RE.test(tileId)) continue;
+        orphans.push({ key: meta.key, size: meta.size });
+        if (!dryRun) await env.PAINT.delete(meta.key);
+      }
+      return new Response(JSON.stringify({
+        dryRun,
+        scanned:   listed.objects.length,
+        orphanCount: orphans.length,
+        orphans,
+        truncated: listed.truncated,
+        cursor:    listed.cursor || null,
+      }), { headers: { ...CORS, 'Content-Type': 'application/json' } });
+    }
+
+    // POST /backup_chunk?cursor=<r2-cursor>&limit=N — admin: paginated dump of
+    // every paint blob in R2 for offsite backup. Returns { tiles: {tileId:
+    // jsonContents}, cursor, truncated }. Gated on REFILL_SECRET.
+    //
+    // Pair with scripts/backup_paint.mjs which calls this in a loop and writes
+    // each tile to data/paint-backups/<timestamp>/<tileId>.json on disk.
+    if (parts[0] === 'backup_chunk' && request.method === 'POST') {
+      const secret = request.headers.get('x-refill-secret');
+      if (!env.REFILL_SECRET || !secret || secret !== env.REFILL_SECRET) {
+        return new Response('forbidden', { status: 403, headers: CORS });
+      }
+      const cursor = url.searchParams.get('cursor') || undefined;
+      const limit  = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 100);
+      const listed = await env.PAINT.list({ cursor, limit });
+      const tiles  = {};
+      for (const meta of listed.objects) {
+        if (!meta.key.endsWith('.json')) continue;
+        const tileId = meta.key.replace(/\.json$/, '');
+        if (!TILE_ID_RE.test(tileId)) continue;
+        const obj = await env.PAINT.get(meta.key);
+        if (!obj) continue;
+        try { tiles[tileId] = JSON.parse(await obj.text()); }
+        catch { /* skip malformed */ }
+      }
+      return new Response(JSON.stringify({
+        tiles,
+        cursor:    listed.cursor || null,
+        truncated: listed.truncated,
+        count:     Object.keys(tiles).length,
+      }), { headers: { ...CORS, 'Content-Type': 'application/json' } });
+    }
+
+    // POST /strip_strays?cursor=<r2-cursor>&limit=N — admin: walk R2 paint blobs
+    // and remove cellKeys that don't legitimately belong in that file. One-shot
+    // cleanup for cross-tile injection that landed before the PATCH validation
+    // was added. Gated on REFILL_SECRET.
+    //
+    // Stripping rules differ by tile type:
+    //   - Terrain tiles (`terrain_<gx>_<gz>`): cellKeys embed the tileId, so
+    //     anything not prefixed `${tileId}:` is a stray.
+    //   - Building tiles (`cell_<gx>_<gz>`): cellKeys are
+    //     `${buildingId}:${meshType}:…` — buildingId↔tileId mapping isn't
+    //     known server-side, so we can ONLY strip the obvious cross-pollution
+    //     case (a terrain key inside a building tile). Building↔building
+    //     mis-routing is invisible from here and stays.
+    //
+    // Paginated: a single call processes up to `limit` (default 50) blobs and
+    // returns {scanned, removed, truncated, cursor}; pass `cursor` back in to
+    // continue. Call repeatedly until truncated:false.
+    if (parts[0] === 'strip_strays' && request.method === 'POST') {
+      const secret = request.headers.get('x-refill-secret');
+      if (!env.REFILL_SECRET || !secret || secret !== env.REFILL_SECRET) {
+        return new Response('forbidden', { status: 403, headers: CORS });
+      }
+      const cursor = url.searchParams.get('cursor') || undefined;
+      const limit  = Math.min(parseInt(url.searchParams.get('limit') || '50', 10), 200);
+      // ?only=terrain | building — restrict cleanup to one tile type. Useful
+      // when you only trust the cleanup logic on terrain (cellKey embeds tileId)
+      // and want to skip building tiles this pass. Omit for both.
+      const onlyType = url.searchParams.get('only') || null;
+      if (onlyType && onlyType !== 'terrain' && onlyType !== 'building') {
+        return new Response('only must be "terrain" or "building"', { status: 400, headers: CORS });
+      }
+      // ?dry_run=true — preview only, no R2 writes. Returns the same {removed,
+      // sample, …} response so callers can verify counts before committing.
+      const dryRun = url.searchParams.get('dry_run') === 'true';
+      const listed = await env.PAINT.list({ cursor, limit });
+      let totalScanned = 0, totalRemoved = 0, filesTouched = 0, totalSkippedByFilter = 0;
+      const sample = []; // first few stray keys we saw, for audit
+      for (const meta of listed.objects) {
+        if (!meta.key.endsWith('.json')) continue;
+        const tileId = meta.key.replace(/\.json$/, '');
+        if (!TILE_ID_RE.test(tileId)) continue;
+        const isTerrainTile = tileId.startsWith('terrain_');
+        if (onlyType === 'terrain' && !isTerrainTile) { totalSkippedByFilter++; continue; }
+        if (onlyType === 'building' && isTerrainTile) { totalSkippedByFilter++; continue; }
+        const obj = await env.PAINT.get(meta.key);
+        if (!obj) continue;
+        let data;
+        try { data = JSON.parse(await obj.text()); } catch { continue; }
+        const expectedPrefix = `${tileId}:`;
+        const stripped = {};
+        let removed = 0;
+        for (const k in data) {
+          if (k === SEED_COMPLETE_KEY) {
+            stripped[k] = data[k];
+            continue;
+          }
+          const isStray = isTerrainTile
+            ? !k.startsWith(expectedPrefix)
+            : k.startsWith('terrain_'); // only strip cross-type pollution in building tiles
+          if (isStray) {
+            removed++;
+            if (sample.length < 10) sample.push({ tile: tileId, key: k });
+          } else {
+            stripped[k] = data[k];
+          }
+        }
+        if (removed > 0) {
+          if (!dryRun) {
+            await env.PAINT.put(meta.key, JSON.stringify(stripped), {
+              httpMetadata: { contentType: 'application/json' },
+            });
+          }
+          totalRemoved += removed;
+          filesTouched++;
+        }
+        totalScanned++;
+      }
+      return new Response(JSON.stringify({
+        dryRun,
+        scanned: totalScanned,
+        filesTouched,
+        removed: totalRemoved,
+        skippedByFilter: totalSkippedByFilter,
+        truncated: listed.truncated,
+        cursor: listed.cursor || null,
+        sample,
+      }), { headers: { ...CORS, 'Content-Type': 'application/json' } });
+    }
+
     if (parts[0] !== 'paint' || !parts[1]) {
       return new Response('not found', { status: 404 });
     }
@@ -159,6 +328,73 @@ async function handle(request, env) {
       const isUndoBatch = diff.__undo === true;
       delete diff.__seed;
       delete diff.__undo;
+
+      // Validate every diff entry. Normal browser clients can't produce
+      // any of these failure cases — these checks block direct API abuse:
+      //   - Cross-tile injection on terrain tiles (cellKey embeds the
+      //     terrain tileId, so we can verify it matches). For building
+      //     tiles the cellKey carries a buildingId, not the tileId, so we
+      //     can't do an exact-match check; we instead block obvious
+      //     mixing (terrain key into a building tile or vice versa).
+      //   - Malformed cellKey shape (junk that accumulates in R2 forever).
+      //   - Cells-per-PATCH cap.
+      //   - Future-stamped paintedAt that would lock cells against future
+      //     legitimate paints by always winning the merge tiebreaker.
+      //   - Malformed cellData (color out of range, normal not a 3-array,
+      //     planeD non-numeric).
+      const isTerrainTile = tileId.startsWith('terrain_');
+      const expectedPrefix = `${tileId}:`;
+      const serverNow = Date.now();
+      const maxPaintedAt = serverNow + PAINTED_AT_FUTURE_TOLERANCE_MS;
+      let cellCount = 0;
+      for (const k in diff) {
+        if (k === SEED_COMPLETE_KEY) continue;
+        cellCount++;
+        if (cellCount > MAX_CELLS_PER_PATCH) {
+          return new Response(`too many cells in PATCH (max ${MAX_CELLS_PER_PATCH})`, {
+            status: 413, headers: CORS,
+          });
+        }
+        if (!CELL_KEY_RE.test(k)) {
+          return new Response(`malformed cellKey: ${k.slice(0, 80)}`, { status: 400, headers: CORS });
+        }
+        if (isTerrainTile) {
+          // Terrain cellKeys embed the tileId — exact prefix match required.
+          if (!k.startsWith(expectedPrefix)) {
+            return new Response(`cellKey ${k} does not belong to tile ${tileId}`, {
+              status: 400, headers: CORS,
+            });
+          }
+        } else {
+          // Building tile — cellKey is `${buildingId}:${meshType}:…`. We
+          // can't exact-match because buildingId↔tileId mapping lives only
+          // on the client. Reject obvious cross-pollution (terrain key into
+          // a building tile).
+          if (k.startsWith('terrain_')) {
+            return new Response(`terrain cellKey ${k} not allowed in building tile ${tileId}`, {
+              status: 400, headers: CORS,
+            });
+          }
+        }
+        const v = diff[k];
+        if (v === null) continue; // erase tombstone — no body to validate
+        if (!v || typeof v !== 'object' || Array.isArray(v)) {
+          return new Response(`cellData for ${k} must be an object`, { status: 400, headers: CORS });
+        }
+        if (typeof v.color !== 'number' || !Number.isInteger(v.color) || v.color < 0 || v.color > 0xffffff) {
+          return new Response(`cellData.color for ${k} must be uint24 (0..0xffffff)`, { status: 400, headers: CORS });
+        }
+        if (typeof v.paintedAt !== 'number' || !Number.isFinite(v.paintedAt) || v.paintedAt > maxPaintedAt) {
+          return new Response(`cellData.paintedAt for ${k} is missing or too far in the future`, { status: 400, headers: CORS });
+        }
+        if (!Array.isArray(v.normal) || v.normal.length !== 3 ||
+            !v.normal.every(n => typeof n === 'number' && Number.isFinite(n))) {
+          return new Response(`cellData.normal for ${k} must be a 3-array of finite numbers`, { status: 400, headers: CORS });
+        }
+        if (typeof v.planeD !== 'number' || !Number.isFinite(v.planeD)) {
+          return new Response(`cellData.planeD for ${k} must be a finite number`, { status: 400, headers: CORS });
+        }
+      }
 
       // Cost = count of cell writes that aren't the seed-complete sentinel.
       // Paint and erase both count; sentinel + seed/undo-flagged batches are free.

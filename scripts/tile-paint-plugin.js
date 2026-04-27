@@ -21,7 +21,8 @@ import crypto from 'node:crypto';
 // Tile IDs are restricted to [A-Za-z0-9_-] so they can't escape DATA_DIR.
 
 const DATA_DIR    = 'data/paint';
-const TILE_ID_RE  = /^[A-Za-z0-9_-]+$/;
+// Match the worker (worker/index.js) — only cell_<gx>_<gz> and terrain_<gx>_<gz>.
+const TILE_ID_RE  = /^(cell|terrain)_-?\d+_-?\d+$/;
 const ROUTE       = '/api/paint/';
 const BUCKET_ROUTE = '/api/bucket';
 const REFILL_ROUTE = '/api/refill';

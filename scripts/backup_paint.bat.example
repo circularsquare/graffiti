@@ -1,0 +1,25 @@
+@echo off
+REM Daily backup runner for Windows Task Scheduler.
+REM
+REM Setup:
+REM   1. Copy this file to scripts\backup_paint.bat (the .bat is gitignored).
+REM   2. Replace YOUR_REFILL_SECRET below with the actual secret
+REM      (from `wrangler secret list` or your password manager).
+REM   3. In Task Scheduler:
+REM      - Create Basic Task → name "graffiti paint backup"
+REM      - Trigger: Daily, pick a time when the laptop is usually on
+REM      - Action: Start a program
+REM        Program/script: C:\Users\anita\projects\graffiti\scripts\backup_paint.bat
+REM        Start in:       C:\Users\anita\projects\graffiti
+REM      - Settings tab → check "Run task as soon as possible after a
+REM        scheduled start is missed" so a backup still runs if the laptop
+REM        was off at the scheduled time.
+REM
+REM Logs are written to data/paint-backups/<timestamp>/manifest.json — to
+REM verify it's been running, just check that folder periodically.
+
+setlocal
+cd /d "%~dp0\.."
+set REFILL_SECRET=YOUR_REFILL_SECRET
+call npm run backup-paint
+endlocal

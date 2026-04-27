@@ -312,12 +312,42 @@ export function createPaintManager({
   const buildingPaintMeshes         = new Map(); // "buildingId:meshType" → mesh
   const buildingPaintMeshByBuilding = new Map(); // "buildingId:meshType" → Set<mesh>
 
-  // Shared material for all paint overlays — vertex colors carry the hue so we
-  // never need per-mesh material instances. NEVER call .dispose() on this.
-  const PAINT_MAT = new THREE.MeshBasicMaterial({
+  // Shared materials for all paint overlays — vertex colors carry the hue so
+  // we never need per-mesh material instances. NEVER call .dispose() on these.
+  //
+  // Two materials, with different depth-bias tuning for each surface type:
+  //   - PAINT_MAT_BUILDING: gentle polygonOffset (factor -1, units -4) — just
+  //     enough to break the depth tie with the underlying building face. No
+  //     OSM overlap to beat on buildings, so the stronger bias only causes
+  //     paint to leak past adjacent perpendicular face corners.
+  //   - PAINT_MAT_TERRAIN: stronger polygonOffset (factor -4, units -24) to
+  //     stay ahead of OSM layers (-1/-6 .. -22) at grazing angles, plus a
+  //     clip-space z-bias for top-down views where dz/dx ≈ 0 makes
+  //     polygonOffset's factor term collapse. The NDC bias is slope-
+  //     independent and self-scales with view distance.
+  //
+  // Why only terrain gets the NDC bias: building faces are never viewed
+  // perfectly perpendicular the way ground is when you look down at it, and
+  // the bias has a downside — it makes paint at the edge of one face poke
+  // past the corner of an adjacent perpendicular face, which is more
+  // noticeable on buildings (lots of edges, small faces) than on terrain.
+  const PAINT_NDC_BIAS = 1e-4;
+  const PAINT_MAT_BUILDING = new THREE.MeshBasicMaterial({
+    vertexColors: true, side: THREE.DoubleSide,
+    polygonOffset: true, polygonOffsetFactor: -1, polygonOffsetUnits: -4,
+  });
+  const PAINT_MAT_TERRAIN = new THREE.MeshBasicMaterial({
     vertexColors: true, side: THREE.DoubleSide,
     polygonOffset: true, polygonOffsetFactor: -4, polygonOffsetUnits: -24,
   });
+  PAINT_MAT_TERRAIN.onBeforeCompile = (shader) => {
+    shader.vertexShader = shader.vertexShader.replace(
+      '#include <project_vertex>',
+      `#include <project_vertex>
+       gl_Position.z -= ${PAINT_NDC_BIAS.toExponential()} * gl_Position.w;`
+    );
+  };
+  PAINT_MAT_TERRAIN.customProgramCacheKey = () => 'graffiti-paint-ndcbias-v1';
   const _paintColor = new THREE.Color(); // scratch — reused per cell to avoid allocation
 
   const paintGroup = new THREE.Group();
@@ -591,7 +621,8 @@ export function createPaintManager({
     geo.setAttribute('position', new THREE.Float32BufferAttribute(allPos, 3));
     geo.setAttribute('color',    new THREE.Float32BufferAttribute(allColor, 3));
     // polygonOffset beats any OSM layer's (-1/-6) so paint wins the depth test vs draped OSM at grazing angles.
-    const mesh = new THREE.Mesh(geo, PAINT_MAT);
+    // Terrain paint additionally gets a clip-space z-bias to handle top-down views (see PAINT_MAT_TERRAIN above).
+    const mesh = new THREE.Mesh(geo, terrainState ? PAINT_MAT_TERRAIN : PAINT_MAT_BUILDING);
     mesh.visible = srcMesh.visible;
     mesh.userData.paintMeshKey = buildingKey; // stashed so TileManager._unload can delete by lookup
     paintGroup.add(mesh);

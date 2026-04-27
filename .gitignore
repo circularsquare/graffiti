@@ -2,6 +2,8 @@ node_modules/
 dist/
 __pycache__/
 *.pyc
+VULNERABILITIES.md
+scripts/backup_paint.bat
 
 # Large data files — regenerate with npm run build-tiles / build-osm / bake-terrain
 data/

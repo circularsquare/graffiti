@@ -7,9 +7,12 @@
     "dev:flat": "vite --mode flat",
     "build":    "vite build",
     "deploy":   "vite build && rm -rf dist/tiles dist/osm dist/terrain dist/trees dist/trees.json && npx wrangler pages deploy dist --project-name graffiti --commit-dirty=true",
-    "build-tiles": "python scripts/build_tiles.py",
-    "build-osm":   "python scripts/fetch_osm_features.py",
-    "bake-seeds":  "node scripts/bake_seeds.js"
+    "build-tiles":  "python scripts/build_tiles.py",
+    "build-osm":    "python scripts/fetch_osm_features.py",
+    "bake-seeds":   "node scripts/bake_seeds.js",
+    "backup-paint": "node scripts/backup_paint.mjs",
+    "restore-paint":"node scripts/restore_paint.mjs",
+    "use-backup":   "node scripts/use_backup_for_dev.mjs"
   },
   "dependencies": {
     "three": "^0.172.0"

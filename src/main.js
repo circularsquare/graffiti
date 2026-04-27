@@ -1331,9 +1331,6 @@ if (TERRAIN_ENABLED) {
 // Dev-only: lets DevTools issue one-off paint wipes (e.g. after a landmark
 // topology change orphans cells under stale cellKeys).
 window.paintStore = paintStore;
-window.scene = scene;
-window.camera = camera;
-window.THREE = THREE;
 
 // Render-distance slider — scales building/OSM/terrain load radii together.
 // Building radius is adaptive (budget-driven) so the scale is applied to both
