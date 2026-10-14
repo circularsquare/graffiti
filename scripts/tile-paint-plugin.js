@@ -24,8 +24,10 @@ const DATA_DIR    = 'data/paint';
 // Match the worker (worker/index.js) — only cell_<gx>_<gz> and terrain_<gx>_<gz>.
 const TILE_ID_RE  = /^(cell|terrain)_-?\d+_-?\d+$/;
 const ROUTE       = '/api/paint/';
+const HEAT_ROUTE  = '/api/paint_heat';
 const BUCKET_ROUTE = '/api/bucket';
 const REFILL_ROUTE = '/api/refill';
+const HEAT_MIN_BYTES = 40; // match worker: drop `{}` / sentinel-only blobs
 const MAX_BODY    = 50 * 1024 * 1024;
 
 // tileId → Promise — tail of this tile's serialized operations.
@@ -61,6 +63,13 @@ export function tilePaintPlugin() {
           return;
         }
 
+        // Dev mirror of the worker's GET /paint_heat. Stats every paint JSON
+        // in DATA_DIR and returns [ [gx, gz, isTerrain, sizeBytes], ... ].
+        if (url.startsWith(HEAT_ROUTE) && req.method === 'GET') {
+          await handleHeat(res);
+          return;
+        }
+
         if (!url.startsWith(ROUTE)) return next();
 
         const tileId = url.slice(ROUTE.length).split('?')[0];
@@ -90,6 +99,30 @@ export function tilePaintPlugin() {
       });
     },
   };
+}
+
+async function handleHeat(res) {
+  const tiles = [];
+  let names = [];
+  try {
+    names = await fs.readdir(DATA_DIR);
+  } catch (e) {
+    if (e.code !== 'ENOENT') throw e; // no paint yet → empty list
+  }
+  for (const name of names) {
+    if (!name.endsWith('.json')) continue;
+    const tileId = name.slice(0, -5);
+    const m = /^(cell|terrain)_(-?\d+)_(-?\d+)$/.exec(tileId);
+    if (!m) continue;
+    let size;
+    try { size = (await fs.stat(path.join(DATA_DIR, name))).size; }
+    catch { continue; }
+    if (size <= HEAT_MIN_BYTES) continue;
+    tiles.push([Number(m[2]), Number(m[3]), m[1] === 'terrain' ? 1 : 0, size]);
+  }
+  res.setHeader('content-type', 'application/json');
+  res.setHeader('cache-control', 'no-store');
+  res.end(JSON.stringify({ tiles }));
 }
 
 async function handleGet(file, req, res) {

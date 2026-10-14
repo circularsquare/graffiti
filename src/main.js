@@ -17,7 +17,9 @@ import {
   adjustMinimapZoom, adjustMinimapPan, resetMinimapPan,
   minimapMetersPerPixel, minimapPixelToWorld,
   toggleMinimapHeadingUp, getMinimapHeadingUp,
+  getHeatVisible, setHeatVisible,
 } from './minimap.js';
+import { loadPaintHeat, getPaintHeat } from './paintHeat.js';
 
 // ─── Scene ───────────────────────────────────────────────────────────────────
 
@@ -338,6 +340,30 @@ compassEl.addEventListener('click', (e) => {
 // Prevent mousedown from starting a pan drag when the compass is hit in big mode.
 compassEl.addEventListener('mousedown', (e) => { e.stopPropagation(); });
 
+// Paint-heatmap toggle (button in big-map mode + the H key). The tile list is
+// fetched lazily on first enable and cached for the session (see paintHeat.js),
+// so toggling off/on later is free.
+const heatBtnEl = document.getElementById('heat-btn');
+function setHeatLayer(on) {
+  setHeatVisible(on);
+  heatBtnEl.classList.toggle('active', on);
+  if (!on) { heatBtnEl.textContent = 'show paint'; return; }
+  // Fetch-once (cached). Reflect progress on the button so an empty or
+  // still-loading overlay isn't mistaken for a broken toggle.
+  if (getPaintHeat()) { heatBtnEl.textContent = 'hide paint'; return; }
+  heatBtnEl.textContent = 'loading…';
+  loadPaintHeat().then((heat) => {
+    if (!getHeatVisible()) return;              // toggled back off while loading
+    heatBtnEl.textContent = (heat && heat.length) ? 'hide paint' : 'no paint found';
+  });
+}
+function toggleHeatLayer() { setHeatLayer(!getHeatVisible()); }
+heatBtnEl.addEventListener('click', (e) => {
+  e.stopPropagation(); // don't fall through to minimap-click teleport
+  toggleHeatLayer();
+});
+heatBtnEl.addEventListener('mousedown', (e) => { e.stopPropagation(); });
+
 // Small vs. big minimap. 234 px mirrors the initial HTML canvas size; big mode
 // fills half the shorter viewport axis (so it's ~a quarter of the screen's
 // area, always square, never overflows on portrait windows).
@@ -419,6 +445,9 @@ function toggleMinimapBig() {
     // Pan is a map-mode-local view adjustment — snap back to player-centred
     // so the small map always tracks the player.
     resetMinimapPan();
+    // Heat overlay state persists across map-mode toggles — if it was on, it
+    // keeps drawing on the corner minimap too. (The #heat-btn is hidden outside
+    // big mode, so it's toggled back off via H or by re-entering the map.)
     // Exiting map mode also exits escape mode — re-lock into first-person.
     // Guarded like the overlay's click-to-lock so we don't try to lock during
     // initial load or mid-teleport.
@@ -815,6 +844,13 @@ document.addEventListener('keydown', e => {
     toggleMinimapBig();
   }
 
+  // H toggles the paint heatmap. Works anywhere — the layer persists across
+  // map-mode toggles and draws on the corner minimap too, so H is the way to
+  // turn it off again once you've left big-map mode (where the #heat-btn hides).
+  if (e.code === 'KeyH' && !e.repeat) {
+    toggleHeatLayer();
+  }
+
   if (e.code === 'KeyX' && !e.repeat) {
     // Toggle the in-game controls hud. Pause-menu CSS forces it visible
     // regardless, so the toggle only takes effect once gameplay resumes.
@@ -1166,6 +1202,14 @@ function tryFinishInitialLoad() {
   }
   if (!_savedPlayer) physics.snapOutOfBuildingFootprint();
   physics.snapToSafeStart();
+
+  // Warm the paint-heat snapshot in the background once spawn has settled, so
+  // the first "show paint" toggle is instant. requestIdleCallback keeps it off
+  // the critical spawn-load burst; loadPaintHeat() is idempotent, so a later
+  // toggle just reuses this cached result.
+  const warmHeat = () => loadPaintHeat();
+  if (typeof requestIdleCallback === 'function') requestIdleCallback(warmHeat, { timeout: 5000 });
+  else setTimeout(warmHeat, 2000);
 }
 
 // Gate check for teleport. Uses the stored destination, not camera.position —

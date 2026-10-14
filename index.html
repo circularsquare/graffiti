@@ -157,6 +157,38 @@
     }
     #compass:hover { border-color: rgba(255,255,255,0.7); }
     #compass svg { display: block; width: 18px; height: 18px; }
+
+    /* Paint-heatmap toggle. Shown whenever the map is interactive — big-map
+       mode (M) or escape/pause mode — same visibility as the render-distance
+       slider. Hidden during locked first-person (can't click it anyway).
+       Bottom-left so it clears the compass (top-left) and player marker. */
+    #heat-btn {
+      position: absolute;
+      left: 6px;
+      bottom: 6px;
+      display: none;            /* shown via .big / .escaped rules below */
+      align-items: center;
+      padding: 4px 9px;
+      font-family: 'Nunito', system-ui, sans-serif;
+      font-size: 12px;
+      font-weight: 700;
+      color: rgba(255,255,255,0.9);
+      background: rgba(0,0,0,0.6);
+      border: 2px solid rgba(255,255,255,0.25);
+      border-radius: 4px;
+      box-shadow: 0 1px 3px rgba(0,0,0,0.6);
+      cursor: pointer;
+      pointer-events: auto;
+      z-index: 3;
+      -webkit-tap-highlight-color: transparent;
+    }
+    #minimap-wrap.big #heat-btn,
+    #minimap-wrap.escaped #heat-btn { display: flex; }
+    #heat-btn:hover { border-color: rgba(255,255,255,0.55); }
+    #heat-btn.active {
+      background: rgba(255,60,60,0.32);
+      border-color: rgba(255,150,150,0.85);
+    }
     /* OSM attribution is satisfied by the credit in #info-modal (the about
        panel). Per OSM attribution guidelines, crediting via an
        "About / Info" surface is acceptable, so we don't need an overlay. */
@@ -718,6 +750,7 @@
       <div class="ctrl-heading">Map</div>
       <div class="ctrl-row"><span class="ctrl-key">M</span><span>map</span></div>
       <div class="ctrl-row"><span class="ctrl-key">click map</span><span>teleport</span></div>
+      <div class="ctrl-row"><span class="ctrl-key">H</span><span>show paint</span></div>
       <div class="ctrl-heading ctrl-heading-gap">Paint</div>
       <div class="ctrl-row"><span class="ctrl-key">click</span><span>paint</span></div>
       <div class="ctrl-row"><span class="ctrl-key">r click</span><span>erase</span></div>
@@ -749,6 +782,7 @@
         <polygon points="12,22 8,11 12,13 16,11" fill="rgba(255,255,255,0.55)"/>
       </svg>
     </button>
+    <button id="heat-btn" aria-label="Toggle paint heatmap" title="Show painted areas (H)">show paint</button>
   </div>
   <button id="info-btn" aria-label="About this project" title="About">
     <span class="info-i">i</span>
@@ -790,7 +824,6 @@
 
       <p>made by <a href="https://anita.garden/projects" target="_blank" rel="noopener">anita</a>!</p>
 
-      <p>note: on 4/26 evening i was trying to undo a hack and accidentally wiped some of the building data, i am devastated and i will take the most care i can to avoid something like this in the future. &gt;_&lt; &lt;3 </p>
     </div>
   </div>
   <div id="render-distance">

@@ -2,6 +2,9 @@ meoww!
 
 daily backup!!!!!!
 
+test:
+npm run dev
+localhost:5173
 
 deploy (anita.garden):
   - code change (JS/HTML/CSS):   npm run deploy

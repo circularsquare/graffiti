@@ -62,6 +62,36 @@ async function handle(request, env) {
       return new Response(null, { status: 204, headers: { ...CORS, 'Access-Control-Max-Age': '86400' } });
     }
 
+    // GET /paint_heat — public, unauthenticated. One R2 list() sweep over the
+    // paint blobs, returning a compact heat list for the map overlay:
+    //   { tiles: [ [gx, gz, isTerrain(0|1), sizeBytes], ... ] }
+    // We use each blob's stored byte size (free from list(), no per-blob reads)
+    // as a paint-amount proxy — erasing deletes cell keys, so size tracks live
+    // paint, not cumulative activity. Empty/sentinel-only blobs (a fully-erased
+    // tile leaves `{}` or just __seed_complete__) sit below HEAT_MIN_BYTES and
+    // are dropped so they don't show as phantom dots. Cached a few minutes so
+    // repeated map-opens across clients don't re-sweep R2 every time.
+    if (parts[0] === 'paint_heat' && request.method === 'GET') {
+      const HEAT_MIN_BYTES = 40; // `{}`=2, sentinel-only ≈ 30; one real cell ≈ 150+
+      const tiles = [];
+      let cursor;
+      do {
+        const listed = await env.PAINT.list({ cursor, limit: 1000 });
+        for (const meta of listed.objects) {
+          if (!meta.key.endsWith('.json')) continue;
+          if (meta.size <= HEAT_MIN_BYTES) continue;
+          const tileId = meta.key.replace(/\.json$/, '');
+          const m = /^(cell|terrain)_(-?\d+)_(-?\d+)$/.exec(tileId);
+          if (!m) continue;
+          tiles.push([Number(m[2]), Number(m[3]), m[1] === 'terrain' ? 1 : 0, meta.size]);
+        }
+        cursor = listed.truncated ? listed.cursor : undefined;
+      } while (cursor);
+      return new Response(JSON.stringify({ tiles }), {
+        headers: { ...CORS, 'Content-Type': 'application/json', 'Cache-Control': 'public, max-age=180' },
+      });
+    }
+
     // GET /bucket?author=<uuid> — read-only peek at the token bucket.
     // Client hits this on init so the HUD never lies about the starting
     // balance. One KV read, no writes.

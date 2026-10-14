@@ -73,8 +73,14 @@ NYC DoITT CityGML (EPSG:2263, feet)   ×20 DA files
         ↓
   src/TileManager.js
     - loads manifest on startup
-    - fetches binary tile files as player approaches (within 200 m of AABB edge)
-    - unloads tiles when player moves away (beyond ~275 m, sticky-margin)
+    - fetches binary tile files as player approaches (within 150 m of AABB edge)
+    - unloads tiles when player moves away, with per-tile sticky hysteresis:
+      a tile holds until the player passes max(admit-distance, MIN) +
+      UNLOAD_MARGIN from its AABB edge (capped at MAX). Flooring the admit
+      distance at MIN guarantees a tile that loaded while the player was
+      already close to it still gets the full retention band, instead of
+      inheriting a tiny eviction ceiling and dropping while the player is
+      still standing next to it.
     - delegates fetch + decode to src/tileWorker.js so the main thread
       is never blocked on network or parse work
         ↓
@@ -402,6 +408,7 @@ labels are dropped if the street segment is too short to fit them.
 | Q (while flying) | 3× speed boost (horizontal + vertical) |
 | Click "Random location" (unlocked) | Teleport to a random point on an OSM street, constrained to within 50 m of a building tile AABB so the player never lands inside a building interior, in open water, or out on the FDR. Falls back to a random tile XZ if the OSM manifest is unavailable. Before moving the camera, a priority `TerrainManager.sampleAsync` fetch resolves the destination cell's DEM height so the player doesn't briefly see themselves underground through the 40%-opaque loading overlay. Re-enters the initial "Loading tiles…" overlay until every tile in load range of the new position is loaded, then user clicks to enter |
 | M | Toggle **map mode** — expands the top-right minimap to a square half the shorter viewport axis (≈ a quarter of the screen) and releases the pointer. In map mode the map is interactive: **drag** to pan, **scroll** to zoom, **click** to fast-travel to that location (same flow as the Random location button). Zoom persists when leaving map mode; pan snaps back to player-centred. Map is north-up; player arrow rotates with heading |
+| H | Toggle the **paint heatmap** overlay (also the `#heat-btn` chip, bottom-left of the big map — chip is big-map-only, but H works anywhere). Soft red glows mark tiles that currently hold paint, intensity log-scaled by the tile's stored byte size (a paint-amount proxy). Fetched once per session from the server's `GET /paint_heat` sweep and cached. State persists across map-mode toggles and draws on the corner minimap too. See "Paint heatmap" below |
 | F3 | Toggle the debug HUD — top-left overlay showing what the crosshair is hitting: building id, hit world XYZ (useful for sourcing landmark positions), mesh, triangle index, face id, cell coords, canonical cellKey, cache hit/miss + area, paint state, planeD (with tri-vs-face mismatch warning), normal, distance |
 | Ctrl+R / F5 | Soft reload preserves player position, rotation, and fly state via `localStorage` (`graffiti_player_state_v1`) |
 | Ctrl+Shift+R | Hard reload — keydown handler flips a `sessionStorage` flag before the browser reloads; on next load that flag clears the saved state so the player respawns at the default (Times Square) |
@@ -591,6 +598,12 @@ per-buildingKey loop `TileManager._unload` uses, then calls
 
 No seeding on terrain — terrain covers ~10× the footprint of buildings and
 random seed patches would visually dilute rather than densify the graffiti.
+
+### Paint heatmap (map overlay)
+
+`GET /paint_heat` (worker + dev plugin) does one `PAINT.list()` sweep and returns `{ tiles: [[gx, gz, isTerrain, sizeBytes], ...] }` — each painted blob's **stored byte size** as a paint-amount proxy. No per-blob reads: `list()` carries sizes for free. Because erasing **deletes** cell keys (the worker `delete existing[k]`s on a null diff — no persisted tombstone), size tracks *live* paint, not cumulative activity; a fully-erased tile shrinks back to a `{}`/sentinel-only blob and is dropped below `HEAT_MIN_BYTES` (40 B) so it doesn't show as a phantom dot.
+
+`src/paintHeat.js` fetches this once per session (lazily, on first enable; cached), converts each tile's grid coord to a world centre — **buildings** are axis-aligned 100 m cells `((gx+½)·100, (gz+½)·100)`; **terrain** are 125 m cells in the 29°-rotated grid, un-rotated via `gridToWorld` — and maps size → heat ∈ [0,1] on a **fixed-anchor log scale** (`sizeToHeat`: log between `HEAT_MIN_BYTES` ≈ one cell and `HEAT_FULL_BYTES` ≈ 150 KB / ~1000 cells, clamped). Anchors are absolute, not per-fetch, so a tile's colour is stable session-to-session and as the city fills in; a lone giant tile saturates rather than crushing everyone else to the faint end. Log (not linear/sqrt) because blob sizes span 1000×+. `src/minimap.js` draws a soft red radial glow at each tile centre inside the same transform as the OSM tiles (so it's correct in north-up *and* heading-up), `globalCompositeOperation = 'lighter'` so clustered paint intensifies. Toggled by `H` (anywhere) / the `#heat-btn` chip on the map (shown in big-map mode *and* escape/pause mode, like the render-distance slider); state persists across map-mode toggles and renders on the corner minimap when on. The snapshot is warmed in the background at spawn (`requestIdleCallback` in `tryFinishInitialLoad`) so the first toggle is instant. Snapshot-on-open: it won't reflect paint added after the session's first fetch (call `invalidatePaintHeat()` to force a re-fetch if that's ever wanted).
 
 ### Multiplayer path
 

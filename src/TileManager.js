@@ -418,7 +418,7 @@ export class TileManager {
       for (let i = this._loadQueue.length - 1; i >= 0; i--) {
         const tile = this._loadQueue[i];
         const qd2 = _closestDist2(px, pz, tile.bounds);
-        if (qd2 > _stickyUnloadR2(tile, scaledMax)) {
+        if (qd2 > _stickyUnloadR2(tile, scaledMin, scaledMax)) {
           tile.status = 'unloaded';
           tile.admittedAtD2 = 0;
           tile.lastUnloadD2 = qd2;
@@ -469,7 +469,7 @@ export class TileManager {
     // still get evicted.
     for (const tile of this._loadedTiles) {
       const d2 = _closestDist2(px, pz, tile.bounds);
-      if (d2 > _stickyUnloadR2(tile, scaledMax)) this._unload(tile);
+      if (d2 > _stickyUnloadR2(tile, scaledMin, scaledMax)) this._unload(tile);
     }
 
     // Publish the effective radius AFTER unload decisions, extended to cover
@@ -586,8 +586,9 @@ export class TileManager {
       // Bail before touching the scene; the pass-2 re-admit gate (lastUnloadD2)
       // then keeps us from re-queuing this tile while still flying away.
       const d2Now = _closestDist2(this._lastPx, this._lastPz, tile.bounds);
+      const scaledMin = MIN_LOAD_RADIUS * this._radiusScale;
       const scaledMax = MAX_LOAD_RADIUS * this._radiusScale;
-      if (d2Now > _stickyUnloadR2(tile, scaledMax)) {
+      if (d2Now > _stickyUnloadR2(tile, scaledMin, scaledMax)) {
         tile.status = 'unloaded';
         tile.admittedAtD2 = 0;
         tile.lastUnloadD2 = d2Now;
@@ -781,11 +782,21 @@ function _byDist2(a, b) { return a.d2 - b.d2; }
  * already-loaded far tiles: their historical admit distance would keep the
  * threshold inflated indefinitely.
  *
- * Tiles that were never admitted (admittedAtD2 is 0/undefined) fall back to
- * UNLOAD_MARGIN², which matches the prior behaviour at the inner edge.
+ * The admit radius is floored at the scaled MIN_LOAD_RADIUS so a tile that
+ * happened to load while the player was already close to it (spawned nearby,
+ * came round a corner, or re-admitted after a brief drop) still gets the full
+ * MIN+UNLOAD_MARGIN retention. Without this floor, such a tile inherits a tiny
+ * eviction ceiling and evicts the moment the player crosses to the far side of
+ * its own ~100 m block — even while standing right next to its buildings —
+ * whereas neighbours admitted from farther out survive. MIN means "tiles this
+ * close are unconditionally wanted", so the sticky band must only ever *extend*
+ * retention past MIN, never shrink it below.
+ *
+ * Tiles that were never admitted (admittedAtD2 is 0/undefined) therefore fall
+ * back to (MIN + UNLOAD_MARGIN)² rather than UNLOAD_MARGIN².
  */
-function _stickyUnloadR2(tile, maxR) {
+function _stickyUnloadR2(tile, minR, maxR) {
   const admittedR = Math.min(Math.sqrt(tile.admittedAtD2 || 0), maxR);
-  const r = admittedR + UNLOAD_MARGIN;
+  const r = Math.max(admittedR, minR) + UNLOAD_MARGIN;
   return r * r;
 }
