@@ -13,10 +13,10 @@ const MAX_BODY    = 1 * 1024 * 1024; // 1 MB — full-tile rewrites are ~hundred
 // tiebreakers by claiming year 9999.
 const PAINTED_AT_FUTURE_TOLERANCE_MS = 60_000;
 // Max cell entries per PATCH. Sized so a user who painted offline for ~10
-// minutes (their full 500-token bucket plus refill) still fits, with margin.
-// Stops a single hand-crafted request from rewriting an entire tile in one
-// shot.
-const MAX_CELLS_PER_PATCH = 1200;
+// minutes (their full 1000-token bucket plus 200 refilled) still fits, with
+// margin. Stops a single hand-crafted request from rewriting an entire tile in
+// one shot.
+const MAX_CELLS_PER_PATCH = 2000;
 const ORIGIN     = 'https://graffiti.anita.garden';
 const MAX_CAS_ATTEMPTS = 5;
 const AUDIT_TTL_SECONDS = 14 * 24 * 60 * 60;
@@ -25,8 +25,8 @@ const AUDIT_TTL_SECONDS = 14 * 24 * 60 * 60;
 // write (paint or erase). Seeds are exempt (__seed flag). Bucket state lives
 // on the AUDIT KV under `bucket:<authorId>`; after BUCKET_TTL_SECONDS of
 // inactivity it vanishes and the user gets a fresh full bucket next visit.
-const BUCKET_CAPACITY = 500;
-const BUCKET_REFILL_MS = 10_000;
+const BUCKET_CAPACITY = 1000;
+const BUCKET_REFILL_MS = 3_000;
 const BUCKET_TTL_SECONDS = 7 * 24 * 60 * 60;
 const SEED_COMPLETE_KEY = '__seed_complete__';
 

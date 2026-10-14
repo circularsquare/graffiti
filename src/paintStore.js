@@ -67,8 +67,8 @@ function loadOrCreateAuthorId() {
 // Token bucket — mirrors server constants. The server is authoritative; these
 // are defaults/optimistic values used until the first response header sync.
 // One token per cell written (paint or erase); seeds are exempt.
-const BUCKET_CAPACITY  = 500;
-const BUCKET_REFILL_MS = 10_000;
+const BUCKET_CAPACITY  = 1000;
+const BUCKET_REFILL_MS = 3_000;
 
 /**
  * Stores painted cell state, sliced per tile, backed by the paint endpoint
