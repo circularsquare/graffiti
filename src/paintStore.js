@@ -11,6 +11,7 @@ const SAVE_DEBOUNCE_MS   = 500;
 const PULL_ACTIVE_MS     = 6_000;
 const PULL_IDLE_MS       = 30_000;
 const PULL_IDLE_MAX_TILES = 20; // safety cap on tiles pulled per idle tick
+const RESUME_PULL_MIN_MS = 10_000; // min gap between immediate pulls on unpause
 
 // Sentinel cellKey written to a tile's paint JSON once seedTileCells has
 // applied every mesh's seeds without being abandoned mid-way. Presence of
@@ -132,6 +133,7 @@ class PaintStore {
     this._activeTiles        = new Set();  // tileIds polled on the fast loop (set by setActiveTiles)
     this._pullTimerActive    = null;
     this._pullTimerIdle      = null;
+    this._lastResumePull     = 0;
     this._pullCursorIdle     = null;       // last-pulled idle tileId, for round-robin fairness
     this._paused             = false;      // set by setPaused — gates both pull loops
 
@@ -760,33 +762,39 @@ class PaintStore {
     paused = !!paused;
     if (this._paused === paused) return;
     this._paused = paused;
-    if (!paused && this._loadedTiles.size > 0) {
+    // Rate-limit the resume kick so a client flapping between locked and
+    // unlocked can't fire a full sweep every second.
+    const now = Date.now();
+    if (!paused && this._loadedTiles.size > 0 && now - this._lastResumePull >= RESUME_PULL_MIN_MS) {
+      this._lastResumePull = now;
       this._pullActive();
       this._pullIdle();
     }
   }
 
   _startPullLoop() {
+    // The timer handle stays set (to the already-fired id) while a tick awaits
+    // its fetches. Nulling it first let a tile load mid-pull start a second
+    // chain, and chains piled up over a long session (one client reached
+    // ~5 req/s for a day).
     if (!this._pullTimerActive) {
       const tick = async () => {
-        this._pullTimerActive = null;
         try { await this._pullActive(); }
         finally {
-          if (this._loadedTiles.size > 0) {
-            this._pullTimerActive = setTimeout(tick, PULL_ACTIVE_MS);
-          }
+          this._pullTimerActive = this._loadedTiles.size > 0
+            ? setTimeout(tick, PULL_ACTIVE_MS)
+            : null;
         }
       };
       this._pullTimerActive = setTimeout(tick, PULL_ACTIVE_MS);
     }
     if (!this._pullTimerIdle) {
       const tick = async () => {
-        this._pullTimerIdle = null;
         try { await this._pullIdle(); }
         finally {
-          if (this._loadedTiles.size > 0) {
-            this._pullTimerIdle = setTimeout(tick, PULL_IDLE_MS);
-          }
+          this._pullTimerIdle = this._loadedTiles.size > 0
+            ? setTimeout(tick, PULL_IDLE_MS)
+            : null;
         }
       };
       this._pullTimerIdle = setTimeout(tick, PULL_IDLE_MS);
